@@ -43,10 +43,12 @@
 // =====================================================
 
 #define SIZE_SESSION_INNER  12
-#define SIZE_VOICE_INNER    96
+#define SIZE_VOICE_INNER   176
+#define SIZE_FEC_INNER     184
 
 #define SIZE_SESSION_RELAY  16
-#define SIZE_VOICE_RELAY   100
+#define SIZE_VOICE_RELAY   180
+#define SIZE_FEC_RELAY     188
 #define SIZE_END_RELAY       5
 
 
@@ -134,12 +136,15 @@ void KhoiTao_LoRa_RX()
 //   4B wrapper + 12B packet gốc = 16B
 //
 // rBS VOICE:
-//   4B wrapper + 96B packet gốc = 100B
+//   4B wrapper + 176B packet gốc = 180B
+//
+// rBS FEC:
+//   4B wrapper + 184B packet gốc = 188B
 //
 // rBS END_AUDIO:
 //   4B header + 1B payload = 5B
 //
-// Packet SU trực tiếp 12B / 96B sẽ bị bỏ.
+// Packet SU trực tiếp 12B / 176B / 184B sẽ bị bỏ.
 // =====================================================
 
 bool Nhan_GoiTin_LoRa(
@@ -188,7 +193,7 @@ bool Nhan_GoiTin_LoRa(
     // ĐỌC TRỌN PACKET RA BUFFER TẠM
     // =================================================
 
-    uint8_t raw_packet[128];
+    uint8_t raw_packet[256];
 
     size_t raw_len =
         0;
@@ -235,6 +240,8 @@ bool Nhan_GoiTin_LoRa(
         packetSize == SIZE_SESSION_INNER
         ||
         packetSize == SIZE_VOICE_INNER
+        ||
+        packetSize == SIZE_FEC_INNER
     )
     {
         return false;
@@ -270,7 +277,7 @@ bool Nhan_GoiTin_LoRa(
             memset(
                 buffer,
                 0,
-                SIZE_VOICE_INNER
+                SIZE_FEC_INNER
             );
 
 
@@ -301,13 +308,15 @@ bool Nhan_GoiTin_LoRa(
 
 
     // =================================================
-    // CHỈ CHẤP NHẬN WRAPPER 16B / 100B
+    // CHỈ CHẤP NHẬN WRAPPER 16B / 180B / 188B
     // =================================================
 
     if (
         packetSize != SIZE_SESSION_RELAY
         &&
         packetSize != SIZE_VOICE_RELAY
+        &&
+        packetSize != SIZE_FEC_RELAY
     )
     {
         return false;
@@ -347,6 +356,8 @@ bool Nhan_GoiTin_LoRa(
         inner_len != SIZE_SESSION_INNER
         &&
         inner_len != SIZE_VOICE_INNER
+        &&
+        inner_len != SIZE_FEC_INNER
     )
     {
         return false;
@@ -386,14 +397,14 @@ bool Nhan_GoiTin_LoRa(
     // UNWRAP
     //
     // Copy packet SU nguyên vẹn về buffer main.cpp.
-    // AES-GCM nhìn nguyên packet 96B bên trong wrapper.
+    // Main nhận nguyên VOICE 176B hoặc FEC 184B bên trong wrapper.
     // AAD vẫn là 8 byte header gốc của SU.
     // =================================================
 
     memset(
         buffer,
         0,
-        SIZE_VOICE_INNER
+        SIZE_FEC_INNER
     );
 
 

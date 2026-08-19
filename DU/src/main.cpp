@@ -92,25 +92,283 @@ bool da_co_seq = false;
 
 #define TYPE_VOICE          0x01
 #define TYPE_SESSION_START  0x02
-
-// Control nội bộ do nhan_lora.cpp tạo khi nhận
-// TYPE_RELAY_END từ rBS.
 #define TYPE_AUDIO_END      0x04
+#define TYPE_FEC            0x05
 
-#define SIZE_VOICE_PACKET   96
+#define TYPE_MASK           0x0F
+#define FLAG_LAST_AUDIO     0x10
+#define COUNT_SHIFT         5
+
+#define SIZE_VOICE_PACKET   176
+#define SIZE_FEC_PACKET     184
+#define SIZE_MAX_PACKET     184
 #define SIZE_SESSION_PACKET 12
 #define SIZE_AUDIO_END_PACKET 4
 
-// Byte 3 của VOICE:
-//   bit 7    = LAST_AUDIO
-//   bit 0..6 = LENGTH = 88
+#define VOICE_LENGTH        168
+#define VOICE_PAYLOAD_BYTES   160
+#define VOICE_GCM_TAG_BYTES      8
+#define VOICE_PROTECTED_BYTES  168
+#define MAX_FRAME_PACKET      8
+#define FEC_DATA_PER_GROUP    8
+
+#define ID_TRAM_SU_PROTO      0x01
+#define ID_TRAM_DU_PROTO      0x02
+
+// Hàm PLC mới được thêm trong giai_ma_speex.cpp.
+extern void GiaiMa_KhungMat(
+    uint8_t *pcm_ra_320b
+);
+
+
+// =====================================================
+// FEC GROUP STATE
 //
-// Chỉ mask khi KIỂM TRA LENGTH.
-// Khi GCM authenticate, header vẫn giữ nguyên byte3 để
-// LAST_AUDIO được xác thực như một phần của AAD.
-#define VOICE_LENGTH_DU       88
-#define FLAG_LAST_AUDIO_DU  0x80
-#define VOICE_LENGTH_MASK   0x7F
+// DU không decode Speex ngay khi VOICE đến.
+// Nó giữ plaintext 160B trong group tối đa 8 packet.
+// Khi FEC tới:
+//   - 0 packet mất: decode bình thường.
+//   - đúng 1 packet mất: XOR parity để khôi phục.
+//   - >1 packet mất: dùng Speex PLC cho phần không cứu được.
+//
+// Vì toàn hệ thống đang theo kiến trúc whole-utterance,
+// việc chờ parity không làm thay đổi nguyên tắc phát audio:
+// END_AUDIO -> toàn bộ PCM đã sẵn sàng -> PLAY.
+// =====================================================
+
+struct FECGroupState
+{
+    bool active;
+    uint32_t start_seq;
+
+    bool present[FEC_DATA_PER_GROUP];
+
+    // Ciphertext160 + original VOICE tag8.
+    // Cần giữ để XOR recover packet bị mất.
+    uint8_t protected_block[
+        FEC_DATA_PER_GROUP
+    ][VOICE_PROTECTED_BYTES];
+
+    // Plaintext chỉ được lưu sau khi VOICE GCM PASS
+    // hoặc recovered VOICE GCM PASS.
+    uint8_t payload[
+        FEC_DATA_PER_GROUP
+    ][VOICE_PAYLOAD_BYTES];
+
+    uint8_t frame_count[
+        FEC_DATA_PER_GROUP
+    ];
+
+    uint8_t expected_count;
+
+    bool has_last;
+    uint8_t final_frames;
+};
+
+
+static FECGroupState fec_group;
+
+
+static void Reset_FEC_Group()
+{
+    memset(
+        &fec_group,
+        0,
+        sizeof(fec_group)
+    );
+}
+
+
+static void Start_FEC_Group(
+    uint32_t start_seq)
+{
+    Reset_FEC_Group();
+
+    fec_group.active =
+        true;
+
+    fec_group.start_seq =
+        start_seq;
+}
+
+
+// =====================================================
+// ĐẨY 1 FRAME PCM VÀO AUDIO BUFFER
+// =====================================================
+
+static void Day_PCM_Vao_Buffer(
+    const int16_t pcm[160])
+{
+    if (
+        xRingbufferSend(
+            Audio_Buffer,
+            (void *)pcm,
+            320,
+            pdMS_TO_TICKS(10)
+        )
+        != pdTRUE
+    )
+    {
+        Serial.println(
+            "[DU ERROR] Audio Buffer day!"
+        );
+    }
+}
+
+
+// =====================================================
+// DECODE 1 DATA PACKET HOẶC PLC CHO PACKET MẤT
+// =====================================================
+
+static void Decode_Data_Slot(
+    uint8_t slot,
+    uint8_t so_frame)
+{
+    int16_t pcm[160];
+
+    if (
+        so_frame < 1
+        ||
+        so_frame > MAX_FRAME_PACKET
+    )
+    {
+        so_frame =
+            MAX_FRAME_PACKET;
+    }
+
+    if (fec_group.present[slot])
+    {
+        for (
+            uint8_t f = 0;
+            f < so_frame;
+            f++
+        )
+        {
+            uint8_t voice_frame[20];
+
+            memcpy(
+                voice_frame,
+                &fec_group.payload[slot][f * 20],
+                20
+            );
+
+            GiaiMa_KhungThoai(
+                voice_frame,
+                (uint8_t *)pcm
+            );
+
+            Day_PCM_Vao_Buffer(
+                pcm
+            );
+        }
+    }
+    else
+    {
+        // FEC không cứu được -> Speex PLC 20ms/frame.
+        for (
+            uint8_t f = 0;
+            f < so_frame;
+            f++
+        )
+        {
+            GiaiMa_KhungMat(
+                (uint8_t *)pcm
+            );
+
+            Day_PCM_Vao_Buffer(
+                pcm
+            );
+        }
+    }
+}
+
+
+// =====================================================
+// FLUSH GROUP THEO THỨ TỰ SEQ
+// =====================================================
+
+static void Flush_FEC_Group(
+    const char *ly_do)
+{
+    if (!fec_group.active)
+    {
+        return;
+    }
+
+    uint8_t count =
+        fec_group.expected_count;
+
+    if (
+        count < 1
+        ||
+        count > FEC_DATA_PER_GROUP
+    )
+    {
+        count =
+            FEC_DATA_PER_GROUP;
+    }
+
+    uint8_t missing =
+        0;
+
+    for (
+        uint8_t i = 0;
+        i < count;
+        i++
+    )
+    {
+        if (!fec_group.present[i])
+        {
+            missing++;
+        }
+    }
+
+    Serial.printf(
+        "[DU FEC] FLUSH GROUP=%u | DATA=%u | MISSING=%u | REASON=%s\n",
+        fec_group.start_seq,
+        count,
+        missing,
+        ly_do
+    );
+
+    for (
+        uint8_t i = 0;
+        i < count;
+        i++
+    )
+    {
+        uint8_t frames =
+            MAX_FRAME_PACKET;
+
+        if (
+            fec_group.has_last
+            &&
+            i == count - 1
+        )
+        {
+            frames =
+                fec_group.final_frames;
+        }
+        else if (
+            fec_group.present[i]
+            &&
+            fec_group.frame_count[i] >= 1
+            &&
+            fec_group.frame_count[i] <= MAX_FRAME_PACKET
+        )
+        {
+            frames =
+                fec_group.frame_count[i];
+        }
+
+        Decode_Data_Slot(
+            i,
+            frames
+        );
+    }
+
+    Reset_FEC_Group();
+}
 
 
 // =====================================================
@@ -120,40 +378,38 @@ bool da_co_seq = false;
 
 void TacVu_LoRaRX(void *thamSo)
 {
-    uint8_t goi_tin[SIZE_VOICE_PACKET];
+    uint8_t goi_tin[SIZE_MAX_PACKET];
 
     size_t do_dai = 0;
 
     while (1)
     {
-        // Xóa buffer để packet SESSION 12 byte
-        // không còn dữ liệu dư của packet trước
         memset(
             goi_tin,
             0,
             sizeof(goi_tin)
         );
 
-
-        if (Nhan_GoiTin_LoRa(
+        if (
+            Nhan_GoiTin_LoRa(
                 goi_tin,
-                do_dai))
+                do_dai
+            )
+        )
         {
-            // =================================================
-            // XÁC ĐỊNH LOẠI PACKET
-            // =================================================
-
             uint8_t packet_type =
-                goi_tin[2] & 0x3F;
+                goi_tin[2]
+                & TYPE_MASK;
 
-
-            // =================================================
-            // SESSION_START
-            // =================================================
-
-            if (packet_type == TYPE_SESSION_START)
+            if (
+                packet_type
+                == TYPE_SESSION_START
+            )
             {
-                if (do_dai != SIZE_SESSION_PACKET)
+                if (
+                    do_dai
+                    != SIZE_SESSION_PACKET
+                )
                 {
                     Serial.println(
                         "[DU DROP] SESSION sai kich thuoc!"
@@ -162,34 +418,42 @@ void TacVu_LoRaRX(void *thamSo)
                     continue;
                 }
 
-
                 Serial.println(
                     "[DU RX] SESSION_START"
                 );
             }
-
-
-            // =================================================
-            // VOICE
-            // =================================================
-
-            else if (packet_type == TYPE_VOICE)
+            else if (
+                packet_type
+                    == TYPE_VOICE
+                ||
+                packet_type
+                    == TYPE_FEC
+            )
             {
-                if (do_dai != SIZE_VOICE_PACKET)
+                if (
+                    (
+                        packet_type == TYPE_VOICE
+                        &&
+                        do_dai != SIZE_VOICE_PACKET
+                    )
+                    ||
+                    (
+                        packet_type == TYPE_FEC
+                        &&
+                        do_dai != SIZE_FEC_PACKET
+                    )
+                )
                 {
-                    Serial.println(
-                        "[DU DROP] VOICE sai kich thuoc!"
+                    Serial.printf(
+                        "[DU DROP] SIZE DATA sai | TYPE=0x%02X | LEN=%u\n",
+                        packet_type,
+                        (unsigned int)do_dai
                     );
 
                     continue;
                 }
 
-
-                // =============================================
-                // SEQ32
-                // =============================================
-
-                uint32_t seq_num_rx =
+                uint32_t seq_or_group =
                     ((uint32_t)goi_tin[4] << 24)
                     |
                     ((uint32_t)goi_tin[5] << 16)
@@ -198,31 +462,56 @@ void TacVu_LoRaRX(void *thamSo)
                     |
                     ((uint32_t)goi_tin[7]);
 
+                if (packet_type == TYPE_VOICE)
+                {
+                    uint8_t frames =
+                        ((goi_tin[2] >> COUNT_SHIFT) & 0x07)
+                        + 1;
 
-                Serial.print(
-                    "[DU RX] VOICE SEQ = "
-                );
+                    bool last_audio =
+                        (
+                            goi_tin[2]
+                            & FLAG_LAST_AUDIO
+                        )
+                        != 0;
 
-                Serial.println(
-                    seq_num_rx
-                );
+                    Serial.printf(
+                        "[DU RX] VOICE | SEQ=%u | FRAME=%u | LAST=%u\n",
+                        seq_or_group,
+                        frames,
+                        last_audio ? 1 : 0
+                    );
+                }
+                else
+                {
+                    uint8_t data_count =
+                        ((goi_tin[2] >> COUNT_SHIFT) & 0x07)
+                        + 1;
 
+                    bool has_last =
+                        (
+                            goi_tin[2]
+                            & FLAG_LAST_AUDIO
+                        )
+                        != 0;
 
-                // =============================================
-                // KHÔNG cập nhật OLED trong đường RX thời gian thực.
-                // Việc cập nhật OLED/I2C giữa các packet có thể
-                // làm DU quay lại RX chậm và mất packet kế tiếp.
-                // =============================================
+                    Serial.printf(
+                        "[DU RX] FEC | GROUP_START=%u | DATA=%u | HAS_LAST=%u\n",
+                        seq_or_group,
+                        data_count,
+                        has_last ? 1 : 0
+                    );
+                }
             }
-
-
-            // =================================================
-            // END AUDIO TỪ rBS
-            // =================================================
-
-            else if (packet_type == TYPE_AUDIO_END)
+            else if (
+                packet_type
+                == TYPE_AUDIO_END
+            )
             {
-                if (do_dai != SIZE_AUDIO_END_PACKET)
+                if (
+                    do_dai
+                    != SIZE_AUDIO_END_PACKET
+                )
                 {
                     Serial.println(
                         "[DU DROP] END_AUDIO sai kich thuoc!"
@@ -231,17 +520,10 @@ void TacVu_LoRaRX(void *thamSo)
                     continue;
                 }
 
-
                 Serial.println(
                     "[DU RX] END_AUDIO FROM rBS"
                 );
             }
-
-
-            // =================================================
-            // PACKET LẠ
-            // =================================================
-
             else
             {
                 Serial.printf(
@@ -252,35 +534,20 @@ void TacVu_LoRaRX(void *thamSo)
                 continue;
             }
 
-
-            // =================================================
-            // ĐƯA PACKET VÀO QUEUE
-            //
-            // Queue luôn có item 96 byte.
-            // SESSION chỉ dùng 12 byte đầu.
-            // Phần còn lại đã memset = 0.
-            // =================================================
-
             if (
                 xQueueSend(
                     HangDoi_GoiTinNhan,
                     goi_tin,
                     pdMS_TO_TICKS(10)
                 )
-                == pdTRUE
+                != pdTRUE
             )
-            {
-                // Không cần in QUEUE OK từng packet
-                // vì sẽ làm Serial rất nhiều
-            }
-            else
             {
                 Serial.println(
                     "[DU ERROR] QUEUE FULL -> MAT PACKET!"
                 );
             }
         }
-
 
         vTaskDelay(
             pdMS_TO_TICKS(1)
@@ -296,10 +563,9 @@ void TacVu_LoRaRX(void *thamSo)
 
 void TacVu_GiaiMa(void *thamSo)
 {
-    uint8_t goi_tin[SIZE_VOICE_PACKET];
+    uint8_t goi_tin[SIZE_MAX_PACKET];
 
-    int16_t pcm_frames[4][160];
-
+    Reset_FEC_Group();
 
     while (1)
     {
@@ -309,173 +575,168 @@ void TacVu_GiaiMa(void *thamSo)
                 goi_tin,
                 portMAX_DELAY
             )
-            == pdTRUE
+            != pdTRUE
         )
         {
-            // =================================================
-            // 1. XÁC ĐỊNH LOẠI PACKET
-            // =================================================
+            continue;
+        }
 
-            uint8_t packet_type =
-                goi_tin[2] & 0x3F;
+        uint8_t packet_type =
+            goi_tin[2]
+            & TYPE_MASK;
 
 
-            // =================================================
-            // END AUDIO
-            //
-            // END nằm sau toàn bộ VOICE trong cùng Queue.
-            // Vì vậy khi tới đây, PCM của câu hiện tại đã được
-            // giải mã và nằm trong Audio_Buffer.
-            // =================================================
+        // =================================================
+        // END AUDIO
+        // =================================================
 
-            if (
-                packet_type
-                == TYPE_AUDIO_END
-            )
+        if (
+            packet_type
+            == TYPE_AUDIO_END
+        )
+        {
+            if (!cho_phep_phat_audio)
             {
-                // rBS có thể gửi END_AUDIO lặp để tăng độ tin cậy.
-                // Chỉ END đầu tiên mới được phép mở cổng phát.
-                if (!cho_phep_phat_audio)
-                {
-                    Serial.println(
-                        "[DU AUDIO] DA NHAN DU CAU -> BAT DAU PHAT"
-                    );
+                // Nếu final parity bị mất, vẫn flush group.
+                // Missing slot không cứu được sẽ dùng Speex PLC.
+                Flush_FEC_Group(
+                    "END_AUDIO"
+                );
 
-                    cho_phep_phat_audio =
-                        true;
-                }
-                else
-                {
-                    Serial.println(
-                        "[DU AUDIO] END_AUDIO LAP LAI -> BO QUA"
-                    );
-                }
+                Serial.println(
+                    "[DU AUDIO] DA NHAN DU CAU -> BAT DAU PHAT"
+                );
 
-
-                continue;
-            }
-
-
-            // =================================================
-            // 2. SESSION_START
-            //
-            // Byte:
-            //
-            // 0      DST
-            // 1      SRC
-            // 2      TYPE = 0x02
-            // 3      LENGTH = 8
-            // 4-11   SESSION_ID 64-bit
-            // =================================================
-
-            if (
-                packet_type
-                == TYPE_SESSION_START
-            )
-            {
-                uint64_t session_moi =
-                    ((uint64_t)goi_tin[4] << 56)
-                    |
-                    ((uint64_t)goi_tin[5] << 48)
-                    |
-                    ((uint64_t)goi_tin[6] << 40)
-                    |
-                    ((uint64_t)goi_tin[7] << 32)
-                    |
-                    ((uint64_t)goi_tin[8] << 24)
-                    |
-                    ((uint64_t)goi_tin[9] << 16)
-                    |
-                    ((uint64_t)goi_tin[10] << 8)
-                    |
-                    ((uint64_t)goi_tin[11]);
-
-                if (session_moi == 0)
-                {
-                    Serial.println(
-                        "[DU DROP] SESSION_ID = 0!"
-                    );
-                    continue;
-                }
-
-                if (
-                    da_co_session
-                    &&
-                    session_moi == session_id_hien_tai
-                )
-                {
-                    Serial.printf(
-                        "[DU] SESSION LAP LAI = %016llX\n",
-                        (unsigned long long)session_moi
-                    );
-                    continue;
-                }
-
-                session_id_hien_tai =
-                    session_moi;
-
-                da_co_session =
-                    true;
-
-
-                // Session mới: chỉ buffer, chưa phát.
                 cho_phep_phat_audio =
-                    false;
+                    true;
+            }
+            else
+            {
+                Serial.println(
+                    "[DU AUDIO] END_AUDIO LAP LAI -> BO QUA"
+                );
+            }
+
+            continue;
+        }
 
 
-                da_co_seq =
-                    false;
+        // =================================================
+        // SESSION_START
+        // =================================================
 
-                seq_cuoi_da_xu_ly =
-                    0;
+        if (
+            packet_type
+            == TYPE_SESSION_START
+        )
+        {
+            uint64_t session_moi =
+                ((uint64_t)goi_tin[4] << 56)
+                |
+                ((uint64_t)goi_tin[5] << 48)
+                |
+                ((uint64_t)goi_tin[6] << 40)
+                |
+                ((uint64_t)goi_tin[7] << 32)
+                |
+                ((uint64_t)goi_tin[8] << 24)
+                |
+                ((uint64_t)goi_tin[9] << 16)
+                |
+                ((uint64_t)goi_tin[10] << 8)
+                |
+                ((uint64_t)goi_tin[11]);
 
-                Serial.printf(
-                    "[DU] NEW SESSION = %016llX\n",
-                    (unsigned long long)session_id_hien_tai
+            if (session_moi == 0)
+            {
+                Serial.println(
+                    "[DU DROP] SESSION_ID = 0!"
                 );
 
                 continue;
             }
-
-
-            // =================================================
-            // 3. CHỈ CHO VOICE ĐI TIẾP
-            // =================================================
 
             if (
-                packet_type
-                != TYPE_VOICE
+                da_co_session
+                &&
+                session_moi
+                    == session_id_hien_tai
             )
             {
-                Serial.println(
-                    "[DU DROP] Khong phai VOICE!"
+                Serial.printf(
+                    "[DU] SESSION LAP LAI = %016llX\n",
+                    (unsigned long long)session_moi
                 );
 
                 continue;
             }
 
+            // Nếu vì lỗi control session cũ còn group,
+            // flush bằng PLC trước khi reset.
+            Flush_FEC_Group(
+                "NEW_SESSION"
+            );
 
-            // =================================================
-            // 4. CHƯA CÓ SESSION THÌ KHÔNG GIẢI MÃ VOICE
-            // =================================================
+            session_id_hien_tai =
+                session_moi;
 
-            if (!da_co_session)
-            {
-                Serial.println(
-                    "[DU DROP] VOICE chua co SESSION_ID!"
-                );
+            da_co_session =
+                true;
 
-                continue;
-            }
+            cho_phep_phat_audio =
+                false;
+
+            da_co_seq =
+                false;
+
+            seq_cuoi_da_xu_ly =
+                0;
+
+            Reset_FEC_Group();
+
+            Serial.printf(
+                "[DU] NEW SESSION = %016llX\n",
+                (unsigned long long)session_id_hien_tai
+            );
+
+            continue;
+        }
 
 
-            // =================================================
-            // 5. ĐỌC SEQ32
-            //
-            // Byte 4-7
-            // =================================================
+        if (!da_co_session)
+        {
+            Serial.println(
+                "[DU DROP] DATA chua co SESSION_ID!"
+            );
 
-            uint32_t so_thu_tu =
+            continue;
+        }
+
+
+        // =================================================
+        // FEC PACKET — PARITY TRÊN CIPHERTEXT + ORIGINAL TAG
+        // =================================================
+
+        if (
+            packet_type
+            == TYPE_FEC
+        )
+        {
+            uint8_t data_count =
+                ((goi_tin[2] >> COUNT_SHIFT) & 0x07)
+                + 1;
+
+            bool has_last =
+                (
+                    goi_tin[2]
+                    & FLAG_LAST_AUDIO
+                )
+                != 0;
+
+            uint8_t final_frames =
+                goi_tin[3];
+
+            uint32_t group_start =
                 ((uint32_t)goi_tin[4] << 24)
                 |
                 ((uint32_t)goi_tin[5] << 16)
@@ -484,191 +745,502 @@ void TacVu_GiaiMa(void *thamSo)
                 |
                 ((uint32_t)goi_tin[7]);
 
+            if (
+                data_count < 1
+                ||
+                data_count > FEC_DATA_PER_GROUP
+            )
+            {
+                Serial.println(
+                    "[DU DROP] FEC data_count sai!"
+                );
 
-            // =================================================
-            // 6. LOẠI PACKET TRÙNG
-            //
-            // Nếu cùng SESSION_ID + cùng SEQ thì chỉ xử lý 1 lần.
-            // =================================================
+                continue;
+            }
 
             if (
-                da_co_seq
+                has_last
                 &&
-                so_thu_tu <= seq_cuoi_da_xu_ly
+                (
+                    final_frames < 1
+                    ||
+                    final_frames > MAX_FRAME_PACKET
+                )
             )
             {
-                Serial.printf(
-                    "[DU DROP DUP/OLD] SEQ = %u | LAST = %u\n",
-                    so_thu_tu,
-                    seq_cuoi_da_xu_ly
+                Serial.println(
+                    "[DU DROP] FEC final_frame sai!"
                 );
 
                 continue;
             }
 
+            // =============================================
+            // FEC packet tự có GCM riêng:
+            // encrypted parity = 168B
+            // FEC tag          = 8B tại byte176..183
+            // =============================================
 
-            // =================================================
-            // CHƯA CẬP NHẬT LAST_SEQ Ở ĐÂY
-            //
-            // Chỉ cập nhật sau khi AES-GCM xác thực thành công.
-            // Nếu packet bị lỗi AES, DU vẫn cho phép một bản
-            // cùng SEQ hợp lệ đến sau được xử lý.
-            // =================================================
+            uint8_t parity_protected[
+                VOICE_PROTECTED_BYTES
+            ];
 
-
-            // =================================================
-            // 7. XÁC ĐỊNH SỐ FRAME SPEEX
-            //
-            // Byte 2:
-            //   bit 0..5 = TYPE
-            //   bit 6..7 = frame_count - 1
-            //
-            // => hỗ trợ 1..4 frame.
-            // =================================================
-
-            uint8_t so_frame =
-                ((goi_tin[2] >> 6) & 0x03)
-                + 1;
-
-
-            // =================================================
-            // 8. FORMAT VOICE PACKET 96 BYTE
-            //
-            // Byte 0-7    HEADER / AAD
-            // Byte 8-87   Ciphertext 80B
-            // Byte 88-95  GCM Tag 8B
-            // =================================================
-
-            uint8_t voice_length =
-                goi_tin[3]
-                & VOICE_LENGTH_MASK;
+            uint32_t fec_nonce =
+                FEC_IV_DOMAIN
+                |
+                group_start;
 
             if (
-                voice_length
-                != VOICE_LENGTH_DU
-            )
-            {
-                Serial.printf(
-                    "[DU DROP] LENGTH VOICE sai: %u\n",
-                    voice_length
-                );
-
-                continue;
-            }
-
-
-            uint8_t *header =
-                &goi_tin[0];
-
-            uint8_t *payload_ma_hoa =
-                &goi_tin[8];
-
-            uint8_t *auth_tag =
-                &goi_tin[88];
-
-            uint8_t payload_sach[80];
-
-
-            // =================================================
-            // 9. AES-GCM AUTHENTICATE + DECRYPT
-            //
-            // IV:
-            // SESSION_ID 64-bit || SEQ32
-            //
-            // AAD vẫn giữ 8 byte header.
-            // =================================================
-
-            if (
-                GiaiMa_GCM(
-                    header,
-                    payload_ma_hoa,
-                    payload_sach,
-                    auth_tag,
+                !GiaiMa_GCM_FEC(
+                    &goi_tin[0],
+                    &goi_tin[8],
+                    parity_protected,
+                    &goi_tin[176],
                     session_id_hien_tai,
-                    so_thu_tu
+                    fec_nonce
                 )
             )
             {
-                // =============================================
-                // AES THÀNH CÔNG
-                //
-                // CHỈ cập nhật LAST_SEQ sau auth thành công.
-                // =============================================
+                Serial.printf(
+                    "[DU FEC GCM FAIL] GROUP=%u\n",
+                    group_start
+                );
 
-                seq_cuoi_da_xu_ly =
-                    so_thu_tu;
+                // Không dùng parity không xác thực.
+                continue;
+            }
 
-                da_co_seq =
-                    true;
+            if (
+                !fec_group.active
+            )
+            {
+                Start_FEC_Group(
+                    group_start
+                );
+            }
+            else if (
+                fec_group.start_seq
+                != group_start
+            )
+            {
+                Flush_FEC_Group(
+                    "FEC_GROUP_SWITCH"
+                );
 
+                Start_FEC_Group(
+                    group_start
+                );
+            }
 
-                // =============================================
-                // GIẢI MÃ LẦN LƯỢT 1..4 FRAME
-                //
-                // Speex decoder state được giữ đúng thứ tự.
-                // Mỗi frame PCM = 160 sample = 320 byte.
-                // =============================================
+            fec_group.expected_count =
+                data_count;
 
-                for (
-                    uint8_t frame_index = 0;
-                    frame_index < so_frame;
-                    frame_index++
-                )
+            fec_group.has_last =
+                has_last;
+
+            fec_group.final_frames =
+                has_last
+                ? final_frames
+                : 0;
+
+            uint8_t missing_count =
+                0;
+
+            int missing_slot =
+                -1;
+
+            for (
+                uint8_t i = 0;
+                i < data_count;
+                i++
+            )
+            {
+                if (!fec_group.present[i])
                 {
-                    uint8_t voice_frame[20];
+                    missing_count++;
 
-
-                    memcpy(
-                        voice_frame,
-                        &payload_sach[
-                            frame_index * 20
-                        ],
-                        20
-                    );
-
-
-                    GiaiMa_KhungThoai(
-                        voice_frame,
-                        (uint8_t *)
-                        pcm_frames[
-                            frame_index
-                        ]
-                    );
-
-
-                    if (
-                        xRingbufferSend(
-                            Audio_Buffer,
-                            pcm_frames[
-                                frame_index
-                            ],
-                            320,
-                            pdMS_TO_TICKS(10)
-                        )
-                        != pdTRUE
-                    )
-                    {
-                        Serial.printf(
-                            "[DU ERROR] Audio Buffer day - FRAME %u!\n",
-                            frame_index + 1
-                        );
-                    }
+                    missing_slot =
+                        i;
                 }
             }
 
+            if (missing_count == 1)
+            {
+                // =========================================
+                // 1) KHÔI PHỤC 168B:
+                //    ciphertext160 + original VOICE tag8
+                // =========================================
 
-            // =================================================
-            // AES-GCM AUTH FAIL
-            // =================================================
+                uint8_t recovered_protected[
+                    VOICE_PROTECTED_BYTES
+                ];
 
+                memcpy(
+                    recovered_protected,
+                    parity_protected,
+                    sizeof(recovered_protected)
+                );
+
+                for (
+                    uint8_t i = 0;
+                    i < data_count;
+                    i++
+                )
+                {
+                    if (
+                        i
+                        ==
+                        (uint8_t)missing_slot
+                    )
+                    {
+                        continue;
+                    }
+
+                    if (!fec_group.present[i])
+                    {
+                        continue;
+                    }
+
+                    for (
+                        size_t b = 0;
+                        b < VOICE_PROTECTED_BYTES;
+                        b++
+                    )
+                    {
+                        recovered_protected[b] ^=
+                            fec_group.protected_block[i][b];
+                    }
+                }
+
+                // =========================================
+                // 2) DỰNG LẠI HEADER VOICE 8B
+                //
+                // Packet bình thường luôn 8 frame.
+                // Chỉ packet cuối có thể 1..8 frame.
+                // FEC header mang has_last + final_frames.
+                // =========================================
+
+                uint32_t recovered_seq =
+                    group_start
+                    +
+                    (uint32_t)missing_slot;
+
+                bool recovered_last =
+                    has_last
+                    &&
+                    missing_slot
+                        == data_count - 1;
+
+                uint8_t recovered_frames =
+                    recovered_last
+                    ? final_frames
+                    : MAX_FRAME_PACKET;
+
+                uint8_t recovered_header[8];
+
+                recovered_header[0] =
+                    ID_TRAM_DU_PROTO;
+
+                recovered_header[1] =
+                    ID_TRAM_SU_PROTO;
+
+                recovered_header[2] =
+                    TYPE_VOICE
+                    |
+                    ((recovered_frames - 1) << COUNT_SHIFT)
+                    |
+                    (recovered_last ? FLAG_LAST_AUDIO : 0x00);
+
+                recovered_header[3] =
+                    VOICE_LENGTH;
+
+                recovered_header[4] =
+                    (recovered_seq >> 24) & 0xFF;
+
+                recovered_header[5] =
+                    (recovered_seq >> 16) & 0xFF;
+
+                recovered_header[6] =
+                    (recovered_seq >> 8) & 0xFF;
+
+                recovered_header[7] =
+                    recovered_seq & 0xFF;
+
+                // =========================================
+                // 3) VERIFY ORIGINAL VOICE GCM TAG
+                //
+                // recovered_protected[0..159] = ciphertext
+                // recovered_protected[160..167] = original tag
+                //
+                // Đây là bước bắt buộc:
+                // FEC recover xong chưa được tin ngay.
+                // =========================================
+
+                uint8_t recovered_plain[
+                    VOICE_PAYLOAD_BYTES
+                ];
+
+                bool recovered_gcm_ok =
+                    GiaiMa_GCM(
+                        recovered_header,
+                        &recovered_protected[0],
+                        recovered_plain,
+                        &recovered_protected[VOICE_PAYLOAD_BYTES],
+                        session_id_hien_tai,
+                        recovered_seq
+                    );
+
+                if (recovered_gcm_ok)
+                {
+                    memcpy(
+                        fec_group.protected_block[
+                            missing_slot
+                        ],
+                        recovered_protected,
+                        sizeof(recovered_protected)
+                    );
+
+                    memcpy(
+                        fec_group.payload[
+                            missing_slot
+                        ],
+                        recovered_plain,
+                        sizeof(recovered_plain)
+                    );
+
+                    fec_group.present[
+                        missing_slot
+                    ] =
+                        true;
+
+                    fec_group.frame_count[
+                        missing_slot
+                    ] =
+                        recovered_frames;
+
+                    Serial.printf(
+                        "[DU FEC RECOVER + VOICE GCM OK] SEQ=%u | SLOT=%d\n",
+                        recovered_seq,
+                        missing_slot
+                    );
+                }
+                else
+                {
+                    Serial.printf(
+                        "[DU FEC RECOVER BUT VOICE GCM FAIL] SEQ=%u | SLOT=%d\n",
+                        recovered_seq,
+                        missing_slot
+                    );
+                }
+            }
+            else if (
+                missing_count > 1
+            )
+            {
+                Serial.printf(
+                    "[DU FEC] KHONG CUU DUOC | GROUP=%u | MISSING=%u\n",
+                    group_start,
+                    missing_count
+                );
+            }
             else
             {
                 Serial.printf(
-                    "[DU AES FAIL] SEQ = %u\n",
-                    so_thu_tu
+                    "[DU FEC] GROUP=%u | KHONG MAT DATA\n",
+                    group_start
                 );
             }
+
+            Flush_FEC_Group(
+                "FEC_READY"
+            );
+
+            continue;
         }
+
+
+        // =================================================
+        // VOICE PACKET
+        // =================================================
+
+        if (
+            packet_type
+            != TYPE_VOICE
+        )
+        {
+            Serial.println(
+                "[DU DROP] Khong phai VOICE/FEC!"
+            );
+
+            continue;
+        }
+
+        uint8_t so_frame =
+            ((goi_tin[2] >> COUNT_SHIFT) & 0x07)
+            + 1;
+
+        bool last_audio =
+            (
+                goi_tin[2]
+                & FLAG_LAST_AUDIO
+            )
+            != 0;
+
+        if (
+            so_frame < 1
+            ||
+            so_frame > MAX_FRAME_PACKET
+        )
+        {
+            Serial.println(
+                "[DU DROP] FRAME_COUNT sai!"
+            );
+
+            continue;
+        }
+
+        if (
+            goi_tin[3]
+            != VOICE_LENGTH
+        )
+        {
+            Serial.printf(
+                "[DU DROP] LENGTH VOICE sai: %u\n",
+                goi_tin[3]
+            );
+
+            continue;
+        }
+
+        uint32_t seq =
+            ((uint32_t)goi_tin[4] << 24)
+            |
+            ((uint32_t)goi_tin[5] << 16)
+            |
+            ((uint32_t)goi_tin[6] << 8)
+            |
+            ((uint32_t)goi_tin[7]);
+
+        if (seq & 0x80000000UL)
+        {
+            Serial.println(
+                "[DU DROP] VOICE SEQ vao FEC nonce domain!"
+            );
+
+            continue;
+        }
+
+        // =================================================
+        // AUTHENTICATE TRƯỚC KHI TIN HEADER/GROUP STATE
+        // =================================================
+
+        uint8_t payload_sach[
+            VOICE_PAYLOAD_BYTES
+        ];
+
+        if (
+            !GiaiMa_GCM(
+                &goi_tin[0],
+                &goi_tin[8],
+                payload_sach,
+                &goi_tin[168],
+                session_id_hien_tai,
+                seq
+            )
+        )
+        {
+            Serial.printf(
+                "[DU VOICE GCM FAIL -> XEM NHU MISSING] SEQ=%u\n",
+                seq
+            );
+
+            // Không dùng LAST/frame/group metadata từ packet GCM fail.
+            // FEC packet đã authenticated sẽ cung cấp metadata group/final.
+            continue;
+        }
+
+        uint32_t group_start =
+            seq
+            -
+            (
+                seq
+                % FEC_DATA_PER_GROUP
+            );
+
+        uint8_t slot =
+            (uint8_t)(
+                seq - group_start
+            );
+
+        if (!fec_group.active)
+        {
+            Start_FEC_Group(
+                group_start
+            );
+        }
+        else if (
+            fec_group.start_seq
+            != group_start
+        )
+        {
+            // Parity group trước bị mất.
+            // Nếu đủ data vẫn decode; thiếu thì PLC.
+            Flush_FEC_Group(
+                "NEW_DATA_GROUP"
+            );
+
+            Start_FEC_Group(
+                group_start
+            );
+        }
+
+        if (fec_group.present[slot])
+        {
+            Serial.printf(
+                "[DU DROP DUP] VOICE SEQ=%u\n",
+                seq
+            );
+
+            continue;
+        }
+
+        // Lưu protected block đúng như trên sóng:
+        // ciphertext160 + original GCM tag8.
+        memcpy(
+            fec_group.protected_block[slot],
+            &goi_tin[8],
+            VOICE_PROTECTED_BYTES
+        );
+
+        memcpy(
+            fec_group.payload[slot],
+            payload_sach,
+            sizeof(payload_sach)
+        );
+
+        fec_group.present[slot] =
+            true;
+
+        fec_group.frame_count[slot] =
+            so_frame;
+
+        if (last_audio)
+        {
+            fec_group.has_last =
+                true;
+
+            fec_group.expected_count =
+                slot + 1;
+
+            fec_group.final_frames =
+                so_frame;
+        }
+
+        Serial.printf(
+            "[DU VOICE GCM OK] SEQ=%u | SLOT=%u\n",
+            seq,
+            slot
+        );
     }
 }
 
@@ -943,7 +1515,7 @@ void setup()
     // =================================================
     // QUEUE
     //
-    // Mỗi item = 96 byte
+    // Mỗi item = 184 byte (max VOICE/FEC)
     //
     // SESSION chỉ dùng 12 byte đầu.
     // =================================================
@@ -951,7 +1523,7 @@ void setup()
     HangDoi_GoiTinNhan =
         xQueueCreate(
             50,
-            SIZE_VOICE_PACKET
+            SIZE_MAX_PACKET
         );
 
 

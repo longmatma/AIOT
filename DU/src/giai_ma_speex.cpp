@@ -31,3 +31,30 @@ void GiaiMa_KhungThoai(uint8_t* khung_vao_20b, uint8_t* pcm_ra_320b) {
     
     memcpy(pcm_ra_320b, am_thanh_giai_ma, 320);
 }
+
+// =====================================================
+// PACKET LOSS CONCEALMENT (PLC)
+//
+// Khi packet-level FEC không cứu được (mất >1 data hoặc parity mất),
+// gọi Speex decoder với bits = NULL để decoder sinh 20ms concealment.
+// Quan trọng hơn việc chèn zero PCM: decoder state vẫn được tiến
+// theo đúng số frame bị mất.
+// =====================================================
+
+void GiaiMa_KhungMat(
+    uint8_t* pcm_ra_320b)
+{
+    spx_int16_t am_thanh_giai_ma[160];
+
+    speex_decode_int(
+        trang_thai_giai_ma,
+        NULL,
+        am_thanh_giai_ma
+    );
+
+    memcpy(
+        pcm_ra_320b,
+        am_thanh_giai_ma,
+        320
+    );
+}

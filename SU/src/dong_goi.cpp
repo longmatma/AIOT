@@ -1,19 +1,18 @@
 #include "dong_goi.h"
 #include "ma_hoa.h"
 #include "esp_system.h"
-
+#include <string.h>
 
 // =====================================================
-// SESSION + SEQUENCE
+// SESSION + VOICE SEQUENCE
 // =====================================================
 
 uint32_t so_thu_tu_goi = 0;
-
 uint64_t session_id_hien_tai = 0;
 
 
 // =====================================================
-// TẠO SESSION MỚI
+// SESSION MỚI
 // =====================================================
 
 uint64_t Tao_Session_Moi()
@@ -27,27 +26,17 @@ uint64_t Tao_Session_Moi()
     session_id_hien_tai =
         phan_cao | phan_thap;
 
-
-    if (
-        session_id_hien_tai
-        == 0
-    )
+    if (session_id_hien_tai == 0)
     {
-        session_id_hien_tai =
-            1;
+        session_id_hien_tai = 1;
     }
 
-
-    so_thu_tu_goi =
-        0;
-
+    so_thu_tu_goi = 0;
 
     Serial.printf(
         "[SU] NEW SESSION = %016llX\n",
-        (unsigned long long)
-        session_id_hien_tai
+        (unsigned long long)session_id_hien_tai
     );
-
 
     return session_id_hien_tai;
 }
@@ -60,97 +49,67 @@ uint64_t Tao_Session_Moi()
 void Tao_GoiTin_SessionStart(
     uint8_t *goi_tin_ra)
 {
-    goi_tin_ra[0] =
-        ID_TRAM_DU;
+    goi_tin_ra[0] = ID_TRAM_DU;
+    goi_tin_ra[1] = ID_TRAM_SU;
+    goi_tin_ra[2] = 0x02;
+    goi_tin_ra[3] = 8;
 
-    goi_tin_ra[1] =
-        ID_TRAM_SU;
-
-    goi_tin_ra[2] =
-        0x02;
-
-    goi_tin_ra[3] =
-        8;
-
-
-    goi_tin_ra[4] =
-        (session_id_hien_tai >> 56) & 0xFF;
-
-    goi_tin_ra[5] =
-        (session_id_hien_tai >> 48) & 0xFF;
-
-    goi_tin_ra[6] =
-        (session_id_hien_tai >> 40) & 0xFF;
-
-    goi_tin_ra[7] =
-        (session_id_hien_tai >> 32) & 0xFF;
-
-    goi_tin_ra[8] =
-        (session_id_hien_tai >> 24) & 0xFF;
-
-    goi_tin_ra[9] =
-        (session_id_hien_tai >> 16) & 0xFF;
-
-    goi_tin_ra[10] =
-        (session_id_hien_tai >> 8) & 0xFF;
-
-    goi_tin_ra[11] =
-        session_id_hien_tai & 0xFF;
+    goi_tin_ra[4]  = (session_id_hien_tai >> 56) & 0xFF;
+    goi_tin_ra[5]  = (session_id_hien_tai >> 48) & 0xFF;
+    goi_tin_ra[6]  = (session_id_hien_tai >> 40) & 0xFF;
+    goi_tin_ra[7]  = (session_id_hien_tai >> 32) & 0xFF;
+    goi_tin_ra[8]  = (session_id_hien_tai >> 24) & 0xFF;
+    goi_tin_ra[9]  = (session_id_hien_tai >> 16) & 0xFF;
+    goi_tin_ra[10] = (session_id_hien_tai >> 8)  & 0xFF;
+    goi_tin_ra[11] =  session_id_hien_tai        & 0xFF;
 }
 
 
 // =====================================================
-// VOICE = 96 BYTE
+// VOICE = 176 BYTE
 //
 // Byte 0      DST
 // Byte 1      SRC
 //
 // Byte 2:
-//   bit 0..5  TYPE_VOICE = 0x01
-//   bit 6..7  frame_count - 1
+//   bit 7..5 = frame_count - 1 (0..7 => 1..8 frame)
+//   bit 4    = LAST_AUDIO
+//   bit 3..0 = TYPE_VOICE = 0x01
 //
-// Byte 3:
-//   bit 7      LAST_AUDIO
-//   bit 0..6   LENGTH = 88
-//              = ciphertext 80B + tag 8B
-//
-// LAST_AUDIO nằm trong AAD nên được AES-GCM xác thực.
-//
-// Byte 4..7   SEQ32 big-endian
-// Byte 8..87  ciphertext 80B
-// Byte 88..95 GCM tag 8B
+// Byte 3      LENGTH = 168
+// Byte 4..7   SEQ32
+// Byte 8..167 ciphertext 160B
+// Byte 168..175 GCM tag 8B
 //
 // AAD = byte 0..7
 // IV  = SESSION_ID64 || SEQ32
 // =====================================================
 
-void Tao_GoiTin_LoRa(
-    uint8_t *khung_1,
-    uint8_t *khung_2,
-    uint8_t *khung_3,
-    uint8_t *khung_4,
+void Tao_GoiTin_Voice(
+    const uint8_t payload_160[VOICE_PLAINTEXT_BYTES],
     uint8_t so_frame,
     bool la_packet_cuoi,
     uint8_t *goi_tin_ra)
 {
-    if (
-        so_frame < 1
-        ||
-        so_frame > 4
-    )
+    if (so_frame < 1 || so_frame > MAX_FRAME_PER_PACKET)
     {
-        so_frame =
-            1;
+        so_frame = 1;
     }
 
+    // High bit của SEQ dành làm domain FEC.
+    // Với MAX_KHUNG_THOAI hiện tại (~375 packet/session)
+    // sẽ không bao giờ chạm giới hạn này.
+    if (so_thu_tu_goi & 0x80000000UL)
+    {
+        Serial.println(
+            "[SU FATAL] VOICE SEQ vuot mien nonce cho phep!"
+        );
+
+        so_thu_tu_goi = 0;
+    }
 
     uint32_t seq =
         so_thu_tu_goi++;
-
-
-    // =================================================
-    // HEADER 8 BYTE
-    // =================================================
 
     goi_tin_ra[0] =
         ID_TRAM_DU;
@@ -158,33 +117,15 @@ void Tao_GoiTin_LoRa(
     goi_tin_ra[1] =
         ID_TRAM_SU;
 
-
-    // Low 6 bit = TYPE.
-    // High 2 bit = frame_count - 1.
     goi_tin_ra[2] =
-        0x01
+        TYPE_VOICE_SU
         |
-        ((so_frame - 1) << 6);
+        ((so_frame - 1) << COUNT_SHIFT_SU)
+        |
+        (la_packet_cuoi ? FLAG_LAST_SU : 0x00);
 
-
-    // =================================================
-    // BYTE 3 = LENGTH + LAST_AUDIO
-    //
-    // bit 7    = 1 nếu đây là packet cuối của cả câu
-    // bit 0..6 = LENGTH = 88
-    //
-    // Byte 3 thuộc AAD (header 0..7), vì vậy cờ LAST_AUDIO
-    // cũng được AES-GCM xác thực tại DU.
-    // =================================================
     goi_tin_ra[3] =
-        VOICE_LENGTH_SU
-        |
-        (
-            la_packet_cuoi
-            ? FLAG_LAST_AUDIO_SU
-            : 0x00
-        );
-
+        VOICE_LENGTH_SU;
 
     goi_tin_ra[4] =
         (seq >> 24) & 0xFF;
@@ -198,68 +139,110 @@ void Tao_GoiTin_LoRa(
     goi_tin_ra[7] =
         seq & 0xFF;
 
-
-    // =================================================
-    // PLAINTEXT 80 BYTE
-    //
-    // Packet cuối có thể chỉ có 1/2/3 frame.
-    // Phần frame không sử dụng được zero-pad.
-    // GCM vẫn mã hóa đủ 80B để packet luôn cố định 96B.
-    // =================================================
-
-    uint8_t payload_tho[80];
-
-    memset(
-        payload_tho,
-        0,
-        sizeof(payload_tho)
-    );
-
-
-    uint8_t *cac_khung[4] =
-    {
-        khung_1,
-        khung_2,
-        khung_3,
-        khung_4
-    };
-
-
-    for (
-        uint8_t i = 0;
-        i < so_frame;
-        i++
-    )
-    {
-        if (
-            cac_khung[i]
-            != nullptr
-        )
-        {
-            memcpy(
-                &payload_tho[i * 20],
-                cac_khung[i],
-                20
-            );
-        }
-    }
-
-
-    // =================================================
-    // AES-GCM
-    // =================================================
-
     MaHoa_GCM(
         goi_tin_ra,
-
-        payload_tho,
-
+        payload_160,
         &goi_tin_ra[8],
-
-        &goi_tin_ra[88],
-
+        &goi_tin_ra[168],
         session_id_hien_tai,
-
         seq
+    );
+}
+
+
+// =====================================================
+// FEC = 184 BYTE
+//
+// KHÔNG XOR PLAINTEXT.
+//
+// Mỗi VOICE có protected block 168B:
+//   byte 8..167   = ciphertext 160B
+//   byte 168..175 = ORIGINAL VOICE GCM TAG 8B
+//
+// parity_168 = XOR protected block của tối đa 8 VOICE.
+//
+// Sau đó parity_168 tự được AES-GCM bảo vệ:
+//
+// Byte 0..7    FEC header / AAD
+// Byte 8..175  encrypted parity 168B
+// Byte 176..183 FEC GCM tag 8B
+//
+// Khi DU khôi phục 1 VOICE:
+//   recover ciphertext + original VOICE tag
+//   -> dựng lại VOICE header
+//   -> chạy GCM verify của chính VOICE đó
+//   -> chỉ PASS mới decode Speex.
+//
+// IV FEC:
+// SESSION_ID64 || (0x80000000 | group_start_seq)
+// =====================================================
+
+void Tao_GoiTin_FEC(
+    const uint8_t parity_168[FEC_PARITY_BYTES],
+    uint32_t group_start_seq,
+    uint8_t data_count,
+    bool group_has_last,
+    uint8_t final_frame_count,
+    uint8_t *goi_tin_ra)
+{
+    if (data_count < 1 || data_count > FEC_DATA_PER_GROUP)
+    {
+        data_count = 1;
+    }
+
+    if (!group_has_last)
+    {
+        final_frame_count = 0;
+    }
+    else if (
+        final_frame_count < 1
+        ||
+        final_frame_count > MAX_FRAME_PER_PACKET
+    )
+    {
+        final_frame_count =
+            MAX_FRAME_PER_PACKET;
+    }
+
+    goi_tin_ra[0] =
+        ID_TRAM_DU;
+
+    goi_tin_ra[1] =
+        ID_TRAM_SU;
+
+    goi_tin_ra[2] =
+        TYPE_FEC_SU
+        |
+        ((data_count - 1) << COUNT_SHIFT_SU)
+        |
+        (group_has_last ? FLAG_LAST_SU : 0x00);
+
+    goi_tin_ra[3] =
+        final_frame_count;
+
+    goi_tin_ra[4] =
+        (group_start_seq >> 24) & 0xFF;
+
+    goi_tin_ra[5] =
+        (group_start_seq >> 16) & 0xFF;
+
+    goi_tin_ra[6] =
+        (group_start_seq >> 8) & 0xFF;
+
+    goi_tin_ra[7] =
+        group_start_seq & 0xFF;
+
+    uint32_t fec_nonce =
+        FEC_IV_DOMAIN
+        |
+        group_start_seq;
+
+    MaHoa_GCM_FEC(
+        goi_tin_ra,
+        parity_168,
+        &goi_tin_ra[8],
+        &goi_tin_ra[176],
+        session_id_hien_tai,
+        fec_nonce
     );
 }

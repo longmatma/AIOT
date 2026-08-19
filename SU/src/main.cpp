@@ -23,32 +23,37 @@ extern U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2;
 
 
 // ========================================================
-// BURST TDD
+// PROTOCOL NATIVE 8-FRAME + ARQ + PACKET-FEC
 //
-// 1 packet = tối đa 4 frame = 96 byte
-//            = tối đa 80 ms audio.
+// 1 VOICE packet = tối đa 8 frame = 160 ms audio.
+// VOICE inner     = 176 byte.
 //
-// Dùng 2 packet / burst:
-// 2 x 4 frame = 8 frame = khoảng 160 ms audio.
+// rBS relay NGAY từng packet (BURST_SIZE logic cũ bỏ).
 //
-// Như vậy lượng audio mỗi burst gần như giữ bằng trước,
-// nhưng số packet / burst giảm từ 4 xuống 2.
+// First hop SU->rBS:
+//   stop-and-wait ACK có KIND + SEQ.
+//   Nếu ACK mất / packet mất: retransmit chính packet đã mã hóa.
+//
+// End-to-end packet FEC:
+//   8 DATA + 1 PARITY.
+//   Parity XOR trên plaintext block 160B rồi parity được AES-GCM.
+//   DU có thể khôi phục 1 VOICE mất trong mỗi group.
+//
+// CR LoRa vẫn = 4/5.
 // ========================================================
 
-#define BURST_SIZE 2
-
-#define READY_TIMEOUT_MS 3000
+#define READY_TIMEOUT_MS 350
+#define MAX_TX_RETRY        2
 
 // ========================================================
 // CONTROL SU -> rBS
 //
 // Không còn gửi BURST_END riêng.
-// Packet VOICE cuối mang cờ LAST_AUDIO ngay trong byte 3/AAD.
+// Packet VOICE cuối mang cờ LAST_AUDIO trong byte 2/AAD.
 //
 // TYPE_AUDIO_END_SU vẫn được giữ:
-//   - gửi sau READY của burst cuối;
-//   - đóng vai trò fallback/confirmation cho END_AUDIO sớm
-//     mà rBS đã gửi tới DU.
+//   - gửi sau ACK của final FEC;
+//   - là tín hiệu explicit để rBS đóng session và gửi END x3 tới DU.
 // ========================================================
 
 #define TYPE_AUDIO_END_SU 0x04
@@ -85,6 +90,64 @@ enum TrangThaiHeThong
 
 TrangThaiHeThong trang_thai =
     NGHI_NGOI;
+
+
+// ========================================================
+// GỬI 1 PACKET + CHỜ ACK CÓ KIND/SEQ
+//
+// MAX_TX_RETRY = số lần phát lại SAU lần đầu.
+// Retransmit dùng nguyên packet ciphertext/tag cũ;
+// không mã hóa lại với cùng IV.
+// ========================================================
+
+static bool Gui_Packet_Co_ACK(
+    uint8_t *packet,
+    size_t packet_len,
+    uint8_t ack_kind,
+    uint32_t ack_seq)
+{
+    for (
+        uint8_t lan = 0;
+        lan <= MAX_TX_RETRY;
+        lan++
+    )
+    {
+        if (lan > 0)
+        {
+            Serial.printf(
+                "[SU ARQ] RETRY %u/%u | KIND=0x%02X | SEQ=%u\n",
+                lan,
+                MAX_TX_RETRY,
+                ack_kind,
+                ack_seq
+            );
+        }
+
+        Phat_GoiTin_LoRa(
+            packet,
+            packet_len
+        );
+
+        if (
+            Cho_READY_RBS(
+                READY_TIMEOUT_MS,
+                ack_kind,
+                ack_seq
+            )
+        )
+        {
+            return true;
+        }
+    }
+
+    Serial.printf(
+        "[SU ARQ FAIL] KIND=0x%02X | SEQ=%u\n",
+        ack_kind,
+        ack_seq
+    );
+
+    return false;
+}
 
 
 // ========================================================
@@ -447,44 +510,40 @@ void loop()
 
 
         // =================================================
-        // BUFFER PACKET
+        // NATIVE 8-FRAME / 176B + ARQ + FEC 8+1
         // =================================================
 
-        uint8_t goi_tin_hoan_chinh[96];
+        uint8_t goi_voice[SIZE_VOICE_PACKET_SU];
+        uint8_t goi_fec[SIZE_FEC_PACKET_SU];
+
+        uint8_t parity_group[FEC_PARITY_BYTES];
+
+        memset(
+            parity_group,
+            0,
+            sizeof(parity_group)
+        );
+
+        uint8_t data_count_group = 0;
+        uint32_t group_start_seq = 0;
+
+        bool group_has_last = false;
+        uint8_t final_frame_count = 0;
+
+        bool gui_that_bai = false;
 
 
         // =================================================
-        // TẠO SESSION MỚI
+        // SESSION MỚI + SESSION_START x2
         // =================================================
 
         Tao_Session_Moi();
 
-
-        // =================================================
-        // SESSION_START
-        // =================================================
-
         uint8_t goi_session[12];
-
 
         Tao_GoiTin_SessionStart(
             goi_session
         );
-
-
-        // =================================================
-        // SESSION_START LOW-LATENCY
-        //
-        // Trước đây:
-        //   gửi 3 lần + delay 100 ms sau mỗi lần
-        //   -> mất hơn 300 ms trước VOICE đầu tiên.
-        //
-        // Bây giờ:
-        //   gửi 2 lần, chỉ nghỉ 5 ms GIỮA hai packet.
-        //   Không delay sau packet thứ hai.
-        //
-        // Vẫn giữ 2 bản để có dự phòng nếu một SESSION bị mất.
-        // =================================================
 
         for (
             int lan = 0;
@@ -497,329 +556,234 @@ void loop()
                 12
             );
 
-
             if (lan == 0)
             {
-                delay(
-                    5
-                );
+                delay(5);
             }
         }
 
 
         // =================================================
-        // BẮT ĐẦU GỬI VOICE THEO BURST
-        // =================================================
-
-        uint8_t dem_packet_trong_burst =
-            0;
-
-
-        bool gui_that_bai =
-            false;
-
-
-        // =================================================
-        // MỖI PACKET = TỐI ĐA 4 FRAME
-        //
-        // 1 frame  = 20 ms
-        // 4 frame  = 80 ms audio
-        // VOICE    = 96 byte cố định
+        // MỖI VOICE = TỐI ĐA 8 FRAME = 160ms
         // =================================================
 
         for (
             uint32_t i = 0;
-
             i < tong_so_khung_da_ghi;
-
-            i += 4
+            i += MAX_FRAME_PER_PACKET
         )
         {
-            uint8_t *khung_1 =
-                &Kho_Chua_AmThanh[
-                    i * 20
-                ];
-
-
-            uint8_t *khung_2 =
-                nullptr;
-
-            uint8_t *khung_3 =
-                nullptr;
-
-            uint8_t *khung_4 =
-                nullptr;
-
+            uint32_t con_lai =
+                tong_so_khung_da_ghi - i;
 
             uint8_t so_frame =
-                1;
-
-
-            if (
-                i + 1
-                <
-                tong_so_khung_da_ghi
-            )
-            {
-                khung_2 =
-                    &Kho_Chua_AmThanh[
-                        (i + 1) * 20
-                    ];
-
-                so_frame =
-                    2;
-            }
-
-
-            if (
-                i + 2
-                <
-                tong_so_khung_da_ghi
-            )
-            {
-                khung_3 =
-                    &Kho_Chua_AmThanh[
-                        (i + 2) * 20
-                    ];
-
-                so_frame =
-                    3;
-            }
-
-
-            if (
-                i + 3
-                <
-                tong_so_khung_da_ghi
-            )
-            {
-                khung_4 =
-                    &Kho_Chua_AmThanh[
-                        (i + 3) * 20
-                    ];
-
-                so_frame =
-                    4;
-            }
-
-
-            // =============================================
-            // PACKET CUỐI CÙNG CỦA TOÀN BỘ AUDIO?
-            //
-            // Cần xác định TRƯỚC khi AES-GCM để cờ LAST_AUDIO
-            // được đặt vào byte 3 và nằm trong AAD.
-            // =============================================
+                (
+                    con_lai >= MAX_FRAME_PER_PACKET
+                    ? MAX_FRAME_PER_PACKET
+                    : (uint8_t)con_lai
+                );
 
             bool la_packet_cuoi =
                 (
-                    i + 4
+                    i + so_frame
                     >=
                     tong_so_khung_da_ghi
                 );
 
 
             // =============================================
-            // ĐÓNG GÓI VOICE 96 BYTE
+            // PLAINTEXT BLOCK 160B
             //
-            // 0-7     HEADER / AAD
-            // byte 3  bit7 = LAST_AUDIO
-            // 8-87    CIPHERTEXT 80B
-            // 88-95   GCM TAG 8B
+            // Packet cuối thiếu frame được zero-pad.
+            // Sau khi AES-GCM tạo VOICE, parity KHÔNG XOR
+            // plaintext này; parity XOR protected block
+            // 168B = ciphertext160 + original GCM tag8.
             // =============================================
 
-            Tao_GoiTin_LoRa(
-                khung_1,
-                khung_2,
-                khung_3,
-                khung_4,
+            uint8_t payload_160[
+                VOICE_PLAINTEXT_BYTES
+            ];
+
+            memset(
+                payload_160,
+                0,
+                sizeof(payload_160)
+            );
+
+            memcpy(
+                payload_160,
+                &Kho_Chua_AmThanh[
+                    i * SPEEX_BYTES_PER_FRAME
+                ],
+                so_frame * SPEEX_BYTES_PER_FRAME
+            );
+
+
+            Tao_GoiTin_Voice(
+                payload_160,
                 so_frame,
                 la_packet_cuoi,
-                goi_tin_hoan_chinh
+                goi_voice
             );
 
-
-            // =============================================
-            // ĐỌC SEQ32
-            // =============================================
 
             uint32_t seq_num_tx =
-                ((uint32_t)
-                    goi_tin_hoan_chinh[4]
-                    << 24)
+                ((uint32_t)goi_voice[4] << 24)
                 |
-                ((uint32_t)
-                    goi_tin_hoan_chinh[5]
-                    << 16)
+                ((uint32_t)goi_voice[5] << 16)
                 |
-                ((uint32_t)
-                    goi_tin_hoan_chinh[6]
-                    << 8)
+                ((uint32_t)goi_voice[6] << 8)
                 |
-                ((uint32_t)
-                    goi_tin_hoan_chinh[7]);
+                ((uint32_t)goi_voice[7]);
 
 
-            Serial.print(
-                "[SU TX] SEQ = "
-            );
-
-
-            Serial.println(
-                seq_num_tx
-            );
-
-
-            // =============================================
-            // PHÁT 1 PACKET 96 BYTE
-            // =============================================
-
-            Phat_GoiTin_LoRa(
-                goi_tin_hoan_chinh,
-                96
-            );
-
-
-            dem_packet_trong_burst++;
-
-
-            // =============================================
-            // CHƯA ĐỦ BURST
-            //
-            // Cho rBS một khoảng rất nhỏ để quay lại
-            // vòng receive Python.
-            //
-            // KHÔNG dùng delay(40).
-            // =============================================
-
-            if (
-                dem_packet_trong_burst
-                    < BURST_SIZE
-                &&
-                !la_packet_cuoi
-            )
+            if (data_count_group == 0)
             {
-                delay(
-                    5
+                group_start_seq =
+                    seq_num_tx;
+
+                memset(
+                    parity_group,
+                    0,
+                    sizeof(parity_group)
                 );
+
+                group_has_last =
+                    false;
+
+                final_frame_count =
+                    0;
             }
 
 
             // =============================================
-            // ĐỦ 2 PACKET
+            // CẬP NHẬT XOR PARITY TRÊN DỮ LIỆU ĐÃ MÃ HÓA
             //
-            // HOẶC BURST CUỐI CHỈ CÓ 1 PACKET
+            // goi_voice[8..167]   = ciphertext 160B
+            // goi_voice[168..175] = original GCM tag 8B
             //
-            // -> SU DỪNG PHÁT
-            // -> chuyển sang RX
-            // -> chờ READY từ rBS
+            // Tổng protected block = 168B.
+            // =============================================
+
+            for (
+                size_t b = 0;
+                b < FEC_PARITY_BYTES;
+                b++
+            )
+            {
+                parity_group[b] ^=
+                    goi_voice[8 + b];
+            }
+
+            data_count_group++;
+
+            if (la_packet_cuoi)
+            {
+                group_has_last =
+                    true;
+
+                final_frame_count =
+                    so_frame;
+            }
+
+
+            Serial.printf(
+                "[SU TX] VOICE | SEQ=%u | FRAME=%u | LAST=%u | SIZE=176B\n",
+                seq_num_tx,
+                so_frame,
+                la_packet_cuoi ? 1 : 0
+            );
+
+
+            // =============================================
+            // ARQ SU -> rBS
             // =============================================
 
             if (
-                dem_packet_trong_burst
-                    >= BURST_SIZE
+                !Gui_Packet_Co_ACK(
+                    goi_voice,
+                    SIZE_VOICE_PACKET_SU,
+                    TYPE_VOICE_SU,
+                    seq_num_tx
+                )
+            )
+            {
+                gui_that_bai =
+                    true;
 
+                break;
+            }
+
+
+            // =============================================
+            // ĐỦ 8 DATA HOẶC ĐẾN PACKET CUỐI
+            // -> PHÁT 1 PARITY PACKET
+            //
+            // FEC overhead:
+            //   full group: 1 / 8 = 12.5%
+            // =============================================
+
+            if (
+                data_count_group
+                    >= FEC_DATA_PER_GROUP
                 ||
-
                 la_packet_cuoi
             )
             {
-                Serial.print(
-                    "[SU] BURST XONG | "
-                    "SO PACKET = "
+                Tao_GoiTin_FEC(
+                    parity_group,
+                    group_start_seq,
+                    data_count_group,
+                    group_has_last,
+                    final_frame_count,
+                    goi_fec
+                );
+
+                Serial.printf(
+                    "[SU TX] FEC | GROUP_START=%u | DATA=%u | HAS_LAST=%u | FINAL_FRAME=%u | SIZE=184B | PARITY=CIPHERTEXT+TAG\n",
+                    group_start_seq,
+                    data_count_group,
+                    group_has_last ? 1 : 0,
+                    final_frame_count
                 );
 
 
-                Serial.println(
-                    dem_packet_trong_burst
-                );
-
-
-                Serial.println(
-                    "[SU] CHO READY TU rBS..."
-                );
-
-
-                // =========================================
-                // Hàm này nằm trong phat_lora.cpp
-                //
-                // SU chuyển sang RX và chờ:
-                //
-                // DST  = SU
-                // SRC  = rBS
-                // TYPE = READY = 0x03
-                // =========================================
-
-                bool co_ready =
-                    Cho_READY_RBS(
-                        READY_TIMEOUT_MS
-                    );
-
-
-                if (!co_ready)
+                if (
+                    !Gui_Packet_Co_ACK(
+                        goi_fec,
+                        SIZE_FEC_PACKET_SU,
+                        TYPE_FEC_SU,
+                        group_start_seq
+                    )
+                )
                 {
-                    Serial.println(
-                        "[SU ERROR] "
-                        "KHONG NHAN DUOC READY!"
-                    );
-
-
                     gui_that_bai =
                         true;
-
 
                     break;
                 }
 
 
-                Serial.println(
-                    "[SU] READY OK -> "
-                    "GUI BURST TIEP"
-                );
-
-
-                // Burst mới
-                dem_packet_trong_burst =
+                data_count_group =
                     0;
+
+                memset(
+                    parity_group,
+                    0,
+                    sizeof(parity_group)
+                );
             }
         }
 
 
         // =================================================
-        // KẾT THÚC
+        // AUDIO_END 5B
+        //
+        // Chỉ gửi sau khi final FEC đã được ACK.
         // =================================================
 
         if (!gui_that_bai)
         {
-            // =================================================
-            // AUDIO_END FALLBACK / CONFIRMATION
-            //
-            // rBS đã biết packet cuối qua LAST_AUDIO và đã gửi
-            // END_AUDIO sớm cho DU trước READY.
-            //
-            // Control này vẫn gửi sau READY để:
-            //   1) xác nhận SU đã hoàn tất phiên;
-            //   2) cho rBS gửi thêm một END dự phòng nếu END sớm mất.
-            // =================================================
-
-            // =================================================
-            // AUDIO_END = 5 BYTE
-            //
-            // QUAN TRỌNG:
-            // rBS dùng thư viện Adafruit RFM9x.
-            // Driver này loại packet vật lý < 5 byte vì mặc định
-            // coi 4 byte đầu là RadioHead header.
-            //
-            // Vì vậy AUDIO_END không thể chỉ có 4 byte.
-            //
-            // Byte 0 = DST  = DU
-            // Byte 1 = SRC  = SU
-            // Byte 2 = TYPE = AUDIO_END
-            // Byte 3 = 0
-            // Byte 4 = dummy 0x00
-            //
-            // rBS chỉ dùng byte 0..3 để parse control.
-            // =================================================
-
             uint8_t goi_audio_end[5] =
             {
                 ID_TRAM_DU_CTRL,
@@ -829,17 +793,14 @@ void loop()
                 0x00
             };
 
-
             Phat_GoiTin_LoRa(
                 goi_audio_end,
                 sizeof(goi_audio_end)
             );
 
-
             Serial.println(
                 "[SU CTRL] AUDIO_END 5B -> rBS"
             );
-
 
             Serial.println(
                 ">> DA GUI XONG!"
@@ -848,7 +809,7 @@ void loop()
         else
         {
             Serial.println(
-                ">> GUI BI DUNG DO TIMEOUT READY!"
+                ">> GUI BI DUNG DO ARQ FAIL!"
             );
         }
 

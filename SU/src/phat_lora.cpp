@@ -33,6 +33,20 @@ static const uint8_t TYPE_READY = 0x03;
 
 
 // =====================================================
+// GUARD SAU READY
+//
+// Sau khi rBS phát READY, nó phải chuyển TX -> RX.
+// Nếu SU phát burst tiếp theo hoặc AUDIO_END quá sớm,
+// packet đầu có thể bị rBS bỏ lỡ.
+//
+// 8 ms là guard nhỏ, cùng cỡ với PHASE2_RX_GUARD
+// đã dùng ổn định ở chiều rBS -> DU.
+// =====================================================
+
+static const uint32_t POST_READY_TX_GUARD_MS = 8;
+
+
+// =====================================================
 // KHỞI TẠO LORA
 // =====================================================
 
@@ -281,6 +295,29 @@ bool Cho_READY_RBS(
                     LoRa.idle();
 
 
+                    // =============================
+                    // GUARD TX SAU READY
+                    //
+                    // Cho rBS đủ thời gian:
+                    //   TX READY xong
+                    //   -> chuyển về RX
+                    //   -> ổn định RX continuous
+                    //
+                    // Sau guard này SU mới return về main
+                    // để phát burst tiếp theo hoặc AUDIO_END.
+                    // =============================
+
+                    delay(
+                        POST_READY_TX_GUARD_MS
+                    );
+
+
+                    Serial.printf(
+                        "[SU] POST_READY_TX_GUARD = %u ms\n",
+                        (unsigned int)POST_READY_TX_GUARD_MS
+                    );
+
+
                     return true;
                 }
             }
@@ -289,9 +326,18 @@ bool Cho_READY_RBS(
             // =========================================
             // PACKET KHÁC -> BỎ QUA
             //
-            // Có thể SU nghe thấy packet rBS -> DU.
-            // SU chỉ quan tâm TYPE_READY gửi cho SU.
+            // Có thể SU nghe thấy:
+            //   - packet rBS -> DU
+            //   - END_AUDIO EARLY -> DU
+            //
+            // QUAN TRỌNG:
+            // LoRa.parsePacket() đưa SX1278 về STANDBY khi nhận
+            // được một packet. Sau khi bỏ packet không phải READY,
+            // phải quay lại RX continuous NGAY để không bỏ lỡ READY.
             // =========================================
+
+            LoRa.receive();
+
 
             Serial.print(
                 "[SU DROP RX] Packet khong phai READY | SIZE = "

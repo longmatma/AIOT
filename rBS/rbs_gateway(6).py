@@ -33,8 +33,8 @@ TAN_SO_LORA = 433.0
 
 BURST_SIZE = 2
 
-# Burst cuối chỉ có 1 packet: fallback nếu BURST_END explicit bị mất.
-# khoảng này thì relay phần còn lại.
+# Fallback khi burst bị thiếu VOICE do packet loss.
+# Bình thường LAST_AUDIO trong VOICE làm final burst relay ngay.
 FINAL_BURST_TIMEOUT = 0.060
 
 # Sau khi rBS gửi READY mà không thấy VOICE tiếp theo trong
@@ -52,6 +52,23 @@ RELAY_PACKET_GAP = 0.010
 # trước khi rBS phát READY.
 READY_GUARD = 0.010
 
+# ============================================================
+# PHASE 1 -> PHASE 2 GUARD
+#
+# DU cũng nghe trực tiếp packet 96B của SU trong PHASE 1.
+# Sau packet cuối burst, DU cần một khoảng rất ngắn để:
+#   - đọc/xả packet SU trực tiếp
+#   - gọi LoRa.receive() trở lại
+#
+# Nếu rBS relay packet đầu của PHASE 2 ngay lập tức,
+# DU có thể bỏ lỡ packet đầu đó.
+#
+# Chỉ áp dụng từ burst thứ 2 trở đi.
+# Burst đầu đã có SESSION_START relay làm khoảng đệm tự nhiên.
+# ============================================================
+
+PHASE2_RX_GUARD = 0.008
+
 
 # ============================================================
 # TYPE BÊN TRONG PACKET SU
@@ -62,12 +79,23 @@ TYPE_SESSION_START = 0x02
 TYPE_READY = 0x03
 
 # Control explicit từ SU.
+# BURST_END riêng đã bỏ; final packet được đánh dấu bằng LAST_AUDIO
+# trong byte 3 của VOICE (thuộc AAD).
 TYPE_AUDIO_END_SU = 0x04
-TYPE_BURST_END = 0x05
 
 SIZE_VOICE = 96
 SIZE_SESSION = 12
-SIZE_CONTROL_SU = 4
+
+# Control SU phải có ít nhất 5 byte để Adafruit RFM9x
+# không loại packet trước khi trả về Python.
+#
+# Byte 0..3 = control header hiện tại.
+# Byte 4    = dummy 0x00.
+SIZE_CONTROL_SU = 5
+
+VOICE_LENGTH = 88
+VOICE_LENGTH_MASK = 0x7F
+FLAG_LAST_AUDIO = 0x80
 
 
 # ============================================================
@@ -122,15 +150,18 @@ def parse_packet_su(packet_bytes):
         return None
 
     # --------------------------------------------------------
-    # CONTROL EXPLICIT 4 BYTE TỪ SU
+    # CONTROL EXPLICIT 5 BYTE TỪ SU
+    #
+    # Adafruit RFM9x reject packet < 5 byte, nên AUDIO_END
+    # có thêm byte dummy ở cuối.
+    #
+    # Byte 0..3 giữ format control cũ.
+    # Byte 4 là dummy và không tham gia parse.
+    #
+    # Chỉ còn AUDIO_END sau READY.
+    # BURST_END riêng đã được thay bằng LAST_AUDIO trong VOICE.
     # --------------------------------------------------------
     if len(packet_bytes) == SIZE_CONTROL_SU:
-
-        if packet_type == TYPE_BURST_END:
-            return {
-                "kind": "burst_end",
-                "raw": packet_bytes,
-            }
 
         if packet_type == TYPE_AUDIO_END_SU:
             return {
@@ -168,7 +199,17 @@ def parse_packet_su(packet_bytes):
         if len(packet_bytes) != SIZE_VOICE:
             return None
 
-        if length_field != 88:
+        voice_length = (
+            length_field
+            & VOICE_LENGTH_MASK
+        )
+
+        la_packet_cuoi = (
+            length_field
+            & FLAG_LAST_AUDIO
+        ) != 0
+
+        if voice_length != VOICE_LENGTH:
             return None
 
         seq = int.from_bytes(
@@ -184,6 +225,7 @@ def parse_packet_su(packet_bytes):
             "raw": packet_bytes,
             "seq": seq,
             "frames": so_frame,
+            "last_audio": la_packet_cuoi,
         }
 
     return None
@@ -295,6 +337,33 @@ def relay_burst(
         print(
             f"[TIME][rBS] RX_LAST -> PHASE2_START = "
             f"{t_phase2_start_us - t_rx_last_us} us"
+        )
+
+
+    # ========================================================
+    # GUARD CHO DU TRƯỚC PACKET VOICE ĐẦU PHASE 2
+    #
+    # Từ burst thứ 2 trở đi, không còn SESSION_START đứng trước
+    # VOICE. Nếu relay ngay, DU có thể vẫn đang xả packet SU
+    # trực tiếp 96B của PHASE 1 và bỏ lỡ packet relay đầu tiên.
+    #
+    # Burst đầu không cần guard này vì SESSION_START relay đã
+    # tạo khoảng đệm trước SEQ 0.
+    # ========================================================
+
+    if session_da_gui:
+
+        t_phase2_guard_start_us = now_us()
+
+        time.sleep(
+            PHASE2_RX_GUARD
+        )
+
+        t_phase2_guard_end_us = now_us()
+
+        print(
+            f"[TIME][rBS] PHASE2_RX_GUARD = "
+            f"{(t_phase2_guard_end_us - t_phase2_guard_start_us) / 1000:.3f} ms"
         )
 
 
@@ -485,7 +554,10 @@ def main():
     print(f" BURST_SIZE = {BURST_SIZE} PACKET")
     print(" INNER VOICE = 96 BYTE")
     print(" RELAY VOICE = 100 BYTE")
-    print(" LOW LATENCY CTRL = BURST_END + AUDIO_END EXPLICIT")
+    print(" LOW LATENCY CTRL = LAST_AUDIO(AAD)")
+    print(" FINAL CTRL = READY -> SU AUDIO_END(5B) -> DU END x3")
+    print(f" CONTROL SU = {SIZE_CONTROL_SU} BYTE")
+    print(f" PHASE2_RX_GUARD = {PHASE2_RX_GUARD * 1000:.1f} ms")
     print("====================================================")
 
 
@@ -613,57 +685,17 @@ def main():
 
 
             # ------------------------------------------------
-            # BURST_END EXPLICIT
-            #
-            # Chỉ xuất hiện ở burst cuối có 1 VOICE packet.
-            # Relay NGAY, không chờ FINAL_BURST_TIMEOUT.
-            # ------------------------------------------------
-
-            if thong_tin["kind"] == "burst_end":
-
-                print(
-                    "[rBS RX CTRL] BURST_END FROM SU"
-                )
-
-                if burst_voice:
-
-                    session_da_gui, t_ready_end_us = relay_burst(
-                        rfm9x,
-                        burst_voice,
-                        goi_session,
-                        session_da_gui,
-                        t_rx_last_us
-                    )
-
-                    burst_voice.clear()
-
-                    t_rx_last_us = None
-
-                    thoi_diem_voice_cuoi = None
-
-                    da_relay_voice_trong_session = True
-
-                    # Chỉ còn là fallback nếu AUDIO_END explicit bị mất.
-                    deadline_end_audio = (
-                        time.monotonic()
-                        +
-                        END_OF_AUDIO_IDLE
-                    )
-
-                continue
-
-
-            # ------------------------------------------------
             # AUDIO_END EXPLICIT
             #
-            # SU chỉ gửi sau READY của burst cuối.
-            # Vì vậy khi control này tới, toàn bộ VOICE đã relay xong.
+            # SU gửi sau READY của burst cuối.
+            # LAST_AUDIO đã giúp rBS relay final burst ngay;
+            # AUDIO_END là tín hiệu chính để rBS báo DU PLAY.
             # ------------------------------------------------
 
             if thong_tin["kind"] == "audio_end":
 
                 print(
-                    "[rBS RX CTRL] AUDIO_END FROM SU"
+                    "[rBS RX CTRL] AUDIO_END 5B FROM SU"
                 )
 
                 # Safety: nếu vẫn còn packet cuối chưa relay vì một
@@ -802,10 +834,20 @@ def main():
                     "frames"
                 ]
 
+                la_packet_cuoi = thong_tin[
+                    "last_audio"
+                ]
+
+                if la_packet_cuoi:
+                    print(
+                        "[rBS] LAST_AUDIO NHAN DUOC -> FINAL BURST RELAY NGAY"
+                    )
+
                 print(
                     f"[rBS RX] VOICE | "
                     f"SEQ = {seq} | "
-                    f"FRAME = {so_frame}"
+                    f"FRAME = {so_frame} | "
+                    f"LAST = {1 if la_packet_cuoi else 0}"
                 )
 
                 print(
@@ -831,12 +873,16 @@ def main():
 
 
                 # --------------------------------------------
-                # ĐỦ 4 PACKET -> RELAY
+                # RELAY KHI:
+                #   - đủ BURST_SIZE = 2 packet; hoặc
+                #   - gặp LAST_AUDIO, kể cả final burst chỉ có 1 packet.
                 # --------------------------------------------
 
                 if (
                     len(burst_voice)
                     >= BURST_SIZE
+                    or
+                    la_packet_cuoi
                 ):
 
                     session_da_gui, t_ready_end_us = relay_burst(
@@ -869,7 +915,10 @@ def main():
 
 
         # ----------------------------------------------------
-        # BURST CUỐI CHỈ 1-3 PACKET
+        # FALLBACK BURST THIẾU PACKET
+        #
+        # Bình thường LAST_AUDIO làm final burst relay ngay.
+        # Nhánh 60 ms chỉ còn cứu burst bị thiếu VOICE do packet loss.
         # ----------------------------------------------------
 
         if (

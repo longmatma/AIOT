@@ -108,6 +108,13 @@ void KhoiTao_LoRa_RX()
     LoRa.enableCrc();
 
 
+    // DIO0 dùng làm RX_DONE trong chế độ receive().
+    pinMode(
+        LORA_DIO0,
+        INPUT
+    );
+
+
     // RX continuous ngay sau khi khởi tạo.
     LoRa.receive();
 
@@ -139,12 +146,40 @@ bool Nhan_GoiTin_LoRa(
     uint8_t* buffer,
     size_t &do_dai_nhan)
 {
+    // =================================================
+    // GIỮ SX1278 Ở RX CONTINUOUS KHI IDLE
+    //
+    // LoRa.receive() đã map DIO0 = RX_DONE và đưa radio
+    // vào MODE_RX_CONTINUOUS.
+    //
+    // QUAN TRỌNG:
+    // Không gọi LoRa.parsePacket() liên tục khi chưa có
+    // RX_DONE, vì parsePacket() có thể chuyển radio sang
+    // RX_SINGLE. Sau thời gian idle dài, việc trộn hai
+    // cơ chế này có thể làm trạng thái RX không ổn định.
+    //
+    // Chỉ parse khi DIO0 báo đã nhận xong packet.
+    // =================================================
+
+    if (
+        digitalRead(LORA_DIO0)
+        == LOW
+    )
+    {
+        return false;
+    }
+
+
     int packetSize =
         LoRa.parsePacket();
 
 
     if (packetSize <= 0)
     {
+        // Có thể là RX_DONE kèm CRC error hoặc IRQ bất thường.
+        // Khôi phục RX continuous ngay.
+        LoRa.receive();
+
         return false;
     }
 

@@ -101,6 +101,17 @@ bool da_co_seq = false;
 #define SIZE_SESSION_PACKET 12
 #define SIZE_AUDIO_END_PACKET 4
 
+// Byte 3 của VOICE:
+//   bit 7    = LAST_AUDIO
+//   bit 0..6 = LENGTH = 88
+//
+// Chỉ mask khi KIỂM TRA LENGTH.
+// Khi GCM authenticate, header vẫn giữ nguyên byte3 để
+// LAST_AUDIO được xác thực như một phần của AAD.
+#define VOICE_LENGTH_DU       88
+#define FLAG_LAST_AUDIO_DU  0x80
+#define VOICE_LENGTH_MASK   0x7F
+
 
 // =====================================================
 // TASK 1
@@ -245,7 +256,7 @@ void TacVu_LoRaRX(void *thamSo)
             // =================================================
             // ĐƯA PACKET VÀO QUEUE
             //
-            // Queue luôn có item 56 byte.
+            // Queue luôn có item 96 byte.
             // SESSION chỉ dùng 12 byte đầu.
             // Phần còn lại đã memset = 0.
             // =================================================
@@ -528,14 +539,18 @@ void TacVu_GiaiMa(void *thamSo)
             // Byte 88-95  GCM Tag 8B
             // =================================================
 
-            if (
+            uint8_t voice_length =
                 goi_tin[3]
-                != 88
+                & VOICE_LENGTH_MASK;
+
+            if (
+                voice_length
+                != VOICE_LENGTH_DU
             )
             {
                 Serial.printf(
                     "[DU DROP] LENGTH VOICE sai: %u\n",
-                    goi_tin[3]
+                    voice_length
                 );
 
                 continue;

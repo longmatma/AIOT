@@ -42,17 +42,16 @@ extern U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2;
 // ========================================================
 // CONTROL SU -> rBS
 //
-// TYPE_BURST_END:
-//   Chỉ dùng cho burst CUỐI có 1-3 VOICE packet.
-//   Báo rBS relay ngay, không phải chờ timeout 60 ms.
+// Không còn gửi BURST_END riêng.
+// Packet VOICE cuối mang cờ LAST_AUDIO ngay trong byte 3/AAD.
 //
-// TYPE_AUDIO_END_SU:
-//   Gửi sau khi burst cuối đã được READY.
-//   Báo rBS chuyển END_AUDIO sang DU ngay, không chờ 120 ms.
+// TYPE_AUDIO_END_SU vẫn được giữ:
+//   - gửi sau READY của burst cuối;
+//   - đóng vai trò fallback/confirmation cho END_AUDIO sớm
+//     mà rBS đã gửi tới DU.
 // ========================================================
 
 #define TYPE_AUDIO_END_SU 0x04
-#define TYPE_BURST_END    0x05
 
 #define ID_TRAM_SU_CTRL   0x01
 #define ID_TRAM_DU_CTRL   0x02
@@ -605,9 +604,25 @@ void loop()
 
 
             // =============================================
+            // PACKET CUỐI CÙNG CỦA TOÀN BỘ AUDIO?
+            //
+            // Cần xác định TRƯỚC khi AES-GCM để cờ LAST_AUDIO
+            // được đặt vào byte 3 và nằm trong AAD.
+            // =============================================
+
+            bool la_packet_cuoi =
+                (
+                    i + 4
+                    >=
+                    tong_so_khung_da_ghi
+                );
+
+
+            // =============================================
             // ĐÓNG GÓI VOICE 96 BYTE
             //
             // 0-7     HEADER / AAD
+            // byte 3  bit7 = LAST_AUDIO
             // 8-87    CIPHERTEXT 80B
             // 88-95   GCM TAG 8B
             // =============================================
@@ -618,6 +633,7 @@ void loop()
                 khung_3,
                 khung_4,
                 so_frame,
+                la_packet_cuoi,
                 goi_tin_hoan_chinh
             );
 
@@ -664,18 +680,6 @@ void loop()
 
 
             dem_packet_trong_burst++;
-
-
-            // =============================================
-            // PACKET CUỐI CÙNG CỦA TOÀN BỘ AUDIO?
-            // =============================================
-
-            bool la_packet_cuoi =
-                (
-                    i + 4
-                    >=
-                    tong_so_khung_da_ghi
-                );
 
 
             // =============================================
@@ -728,46 +732,6 @@ void loop()
                 Serial.println(
                     dem_packet_trong_burst
                 );
-
-
-                // =========================================
-                // BURST CUỐI KHÔNG ĐỦ 2 PACKET
-                //
-                // Gửi control để rBS relay ngay thay vì
-                // phải chờ FINAL_BURST_TIMEOUT.
-                // =========================================
-
-                if (
-                    la_packet_cuoi
-                    &&
-                    dem_packet_trong_burst < BURST_SIZE
-                )
-                {
-                    uint8_t goi_burst_end[4] =
-                    {
-                        ID_TRAM_DU_CTRL,
-                        ID_TRAM_SU_CTRL,
-                        TYPE_BURST_END,
-                        0x00
-                    };
-
-
-                    // Cho rBS vài ms xử lý VOICE vừa nhận xong.
-                    delay(
-                        5
-                    );
-
-
-                    Phat_GoiTin_LoRa(
-                        goi_burst_end,
-                        sizeof(goi_burst_end)
-                    );
-
-
-                    Serial.println(
-                        "[SU CTRL] BURST_END -> rBS"
-                    );
-                }
 
 
                 Serial.println(
@@ -827,20 +791,41 @@ void loop()
         if (!gui_that_bai)
         {
             // =================================================
-            // AUDIO_END EXPLICIT
+            // AUDIO_END FALLBACK / CONFIRMATION
             //
-            // Burst cuối đã được rBS READY, nghĩa là toàn bộ
-            // VOICE đã relay xong sang DU.
+            // rBS đã biết packet cuối qua LAST_AUDIO và đã gửi
+            // END_AUDIO sớm cho DU trước READY.
             //
-            // Báo END ngay để DU bắt đầu PLAY, không cần rBS
-            // chờ END_OF_AUDIO_IDLE nữa.
+            // Control này vẫn gửi sau READY để:
+            //   1) xác nhận SU đã hoàn tất phiên;
+            //   2) cho rBS gửi thêm một END dự phòng nếu END sớm mất.
             // =================================================
 
-            uint8_t goi_audio_end[4] =
+            // =================================================
+            // AUDIO_END = 5 BYTE
+            //
+            // QUAN TRỌNG:
+            // rBS dùng thư viện Adafruit RFM9x.
+            // Driver này loại packet vật lý < 5 byte vì mặc định
+            // coi 4 byte đầu là RadioHead header.
+            //
+            // Vì vậy AUDIO_END không thể chỉ có 4 byte.
+            //
+            // Byte 0 = DST  = DU
+            // Byte 1 = SRC  = SU
+            // Byte 2 = TYPE = AUDIO_END
+            // Byte 3 = 0
+            // Byte 4 = dummy 0x00
+            //
+            // rBS chỉ dùng byte 0..3 để parse control.
+            // =================================================
+
+            uint8_t goi_audio_end[5] =
             {
                 ID_TRAM_DU_CTRL,
                 ID_TRAM_SU_CTRL,
                 TYPE_AUDIO_END_SU,
+                0x00,
                 0x00
             };
 
@@ -852,7 +837,7 @@ void loop()
 
 
             Serial.println(
-                "[SU CTRL] AUDIO_END -> rBS"
+                "[SU CTRL] AUDIO_END 5B -> rBS"
             );
 
 

@@ -109,8 +109,12 @@ void Tao_GoiTin_SessionStart(
 //   bit 0..5  TYPE_VOICE = 0x01
 //   bit 6..7  frame_count - 1
 //
-// Byte 3      LENGTH = 88
-//             = ciphertext 80B + tag 8B
+// Byte 3:
+//   bit 7      LAST_AUDIO
+//   bit 0..6   LENGTH = 88
+//              = ciphertext 80B + tag 8B
+//
+// LAST_AUDIO nằm trong AAD nên được AES-GCM xác thực.
 //
 // Byte 4..7   SEQ32 big-endian
 // Byte 8..87  ciphertext 80B
@@ -126,6 +130,7 @@ void Tao_GoiTin_LoRa(
     uint8_t *khung_3,
     uint8_t *khung_4,
     uint8_t so_frame,
+    bool la_packet_cuoi,
     uint8_t *goi_tin_ra)
 {
     if (
@@ -162,9 +167,23 @@ void Tao_GoiTin_LoRa(
         ((so_frame - 1) << 6);
 
 
-    // 80B ciphertext + 8B GCM tag
+    // =================================================
+    // BYTE 3 = LENGTH + LAST_AUDIO
+    //
+    // bit 7    = 1 nếu đây là packet cuối của cả câu
+    // bit 0..6 = LENGTH = 88
+    //
+    // Byte 3 thuộc AAD (header 0..7), vì vậy cờ LAST_AUDIO
+    // cũng được AES-GCM xác thực tại DU.
+    // =================================================
     goi_tin_ra[3] =
-        88;
+        VOICE_LENGTH_SU
+        |
+        (
+            la_packet_cuoi
+            ? FLAG_LAST_AUDIO_SU
+            : 0x00
+        );
 
 
     goi_tin_ra[4] =

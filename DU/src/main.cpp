@@ -122,6 +122,37 @@ extern void GiaiMa_KhungMat(
 
 
 // =====================================================
+// THONG KE LINK LOCAL TAI DU - HIEN THI OLED
+//
+// DATA  = so VOICE packet mong doi theo cac FEC group.
+// LOST  = so VOICE packet mat TRUOC khi packet-FEC sua.
+// FEC   = so VOICE packet packet-FEC khoi phuc thanh cong.
+// FINAL = so VOICE packet con mat SAU packet-FEC.
+//
+// DAY LA PACKET-FEC CUA PHAN MEM, KHONG PHAI FEC PHY CR 4/5.
+// =====================================================
+
+struct DULinkOLEDStats
+{
+    uint32_t expected_voice;
+    uint32_t raw_missing_voice;
+    uint32_t fec_recovered_voice;
+    uint32_t final_missing_voice;
+};
+
+static DULinkOLEDStats du_oled_stats;
+
+static void Reset_ThongKe_OLED_DU()
+{
+    memset(
+        &du_oled_stats,
+        0,
+        sizeof(du_oled_stats)
+    );
+}
+
+
+// =====================================================
 // FEC GROUP STATE
 //
 // DU không decode Speex ngay khi VOICE đến.
@@ -163,6 +194,11 @@ struct FECGroupState
 
     bool has_last;
     uint8_t final_frames;
+
+    // Dung de ghi lai so packet mat TRUOC khi FEC recovery
+    // thay doi present[].
+    bool fec_received;
+    uint8_t raw_missing_before_recovery;
 };
 
 
@@ -323,12 +359,42 @@ static void Flush_FEC_Group(
         }
     }
 
+    uint8_t raw_missing =
+        fec_group.fec_received
+        ? fec_group.raw_missing_before_recovery
+        : missing;
+
+    uint8_t recovered =
+        raw_missing >= missing
+        ? (raw_missing - missing)
+        : 0;
+
+    du_oled_stats.expected_voice +=
+        count;
+
+    du_oled_stats.raw_missing_voice +=
+        raw_missing;
+
+    du_oled_stats.fec_recovered_voice +=
+        recovered;
+
+    du_oled_stats.final_missing_voice +=
+        missing;
+
     Serial.printf(
-        "[DU FEC] FLUSH GROUP=%u | DATA=%u | MISSING=%u | REASON=%s\n",
+        "[DU FEC] FLUSH GROUP=%u | DATA=%u | RAW_MISSING=%u | FEC_RECOVERED=%u | FINAL_MISSING=%u | REASON=%s\n",
         fec_group.start_seq,
         count,
+        raw_missing,
+        recovered,
         missing,
         ly_do
+    );
+
+    HienThi_DU_DangNhan(
+        du_oled_stats.expected_voice,
+        du_oled_stats.raw_missing_voice,
+        du_oled_stats.fec_recovered_voice
     );
 
     for (
@@ -603,6 +669,13 @@ void TacVu_GiaiMa(void *thamSo)
                     "END_AUDIO"
                 );
 
+                HienThi_DU_KetQua(
+                    du_oled_stats.expected_voice,
+                    du_oled_stats.raw_missing_voice,
+                    du_oled_stats.fec_recovered_voice,
+                    du_oled_stats.final_missing_voice
+                );
+
                 Serial.println(
                     "[DU AUDIO] DA NHAN DU CAU -> BAT DAU PHAT"
                 );
@@ -693,6 +766,13 @@ void TacVu_GiaiMa(void *thamSo)
                 0;
 
             Reset_FEC_Group();
+            Reset_ThongKe_OLED_DU();
+
+            HienThi_DU_DangNhan(
+                0,
+                0,
+                0
+            );
 
             Serial.printf(
                 "[DU] NEW SESSION = %016llX\n",
@@ -863,6 +943,12 @@ void TacVu_GiaiMa(void *thamSo)
                         i;
                 }
             }
+
+            fec_group.fec_received =
+                true;
+
+            fec_group.raw_missing_before_recovery =
+                missing_count;
 
             if (missing_count == 1)
             {
@@ -1458,6 +1544,8 @@ void setup()
 {
     Serial.begin(115200);
 
+    Reset_ThongKe_OLED_DU();
+
 
     // =================================================
     // OLED
@@ -1466,10 +1554,8 @@ void setup()
     KhoiTao_OLED();
 
 
-    CapNhat_TrangThai_OLED(
-        "Dang kiem tra LoRa...",
-        0,
-        0
+    HienThi_DU_KhoiDong(
+        "Kiem tra LoRa..."
     );
 
 
@@ -1487,11 +1573,7 @@ void setup()
     KhoiTao_GiaiMa_Speex();
 
 
-    CapNhat_TrangThai_OLED(
-        "Dang cho song...",
-        0,
-        0
-    );
+    HienThi_DU_ChoNhan();
 
 
     // =================================================

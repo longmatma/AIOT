@@ -2,51 +2,290 @@
 #include <U8g2lib.h>
 #include <Wire.h>
 
-// Đổi sang 2 chân rảnh bất kỳ (tránh các chân LoRa và chân 1 của Audio)
-#define OLED_SDA 4 
-#define OLED_SCL 5 
+#define OLED_SDA 4
+#define OLED_SCL 5
 
-U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, /* reset=*/ U8X8_PIN_NONE);
+U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2(
+    U8G2_R0,
+    /* reset=*/ U8X8_PIN_NONE
+);
 
-void KhoiTao_OLED() {
-    // Ép I2C phần cứng chuyển sang dùng chân 4 và 5
-    Wire.begin(OLED_SDA, OLED_SCL); 
-    
+
+void KhoiTao_OLED()
+{
+    Wire.begin(
+        OLED_SDA,
+        OLED_SCL
+    );
+
     u8g2.begin();
-    u8g2.enableUTF8Print(); 
-    
-    // Màn hình khởi động
-    u8g2.clearBuffer();
-    u8g2.setFont(u8g2_font_ncenB08_tr);
-    u8g2.drawStr(15, 30, "TRAM NHAN (DU)");
-    u8g2.drawStr(15, 50, "Dang khoi dong...");
-    u8g2.sendBuffer();
-    
-    Serial.println("Khoi tao OLED THANH CONG!");
+    u8g2.enableUTF8Print();
+
+    HienThi_DU_KhoiDong(
+        "Dang khoi dong..."
+    );
+
+    Serial.println(
+        "Khoi tao OLED THANH CONG!"
+    );
 }
 
-void CapNhat_TrangThai_OLED(String trang_thai, int rssi, int so_goi_tin) {
+
+void HienThi_DU_KhoiDong(
+    const char *trang_thai)
+{
     u8g2.clearBuffer();
-    
-    // Vẽ khung giao diện
-    u8g2.drawFrame(0, 0, 128, 64);
-    
-    // Hiển thị trạng thái
-    u8g2.setFont(u8g2_font_helvB08_te);
-    u8g2.setCursor(5, 15);
-    u8g2.print("Status: ");
-    u8g2.print(trang_thai);
-    
-    // Hiển thị cường độ sóng RSSI
-    u8g2.setCursor(5, 35);
-    u8g2.print("LoRa RSSI: ");
-    u8g2.print(rssi);
-    u8g2.print(" dBm");
-    
-    // Hiển thị bộ đếm gói tin
-    u8g2.setCursor(5, 55);
-    u8g2.print("Goi tin: ");
-    u8g2.print(so_goi_tin);
-    
+
+    u8g2.setFont(
+        u8g2_font_ncenB08_tr
+    );
+
+    u8g2.drawStr(
+        15,
+        26,
+        "TRAM NHAN (DU)"
+    );
+
+    u8g2.setFont(
+        u8g2_font_6x10_tr
+    );
+
+    u8g2.setCursor(
+        10,
+        47
+    );
+
+    u8g2.print(
+        trang_thai
+    );
+
+    u8g2.sendBuffer();
+}
+
+
+void HienThi_DU_ChoNhan()
+{
+    u8g2.clearBuffer();
+    u8g2.drawFrame(
+        0,
+        0,
+        128,
+        64
+    );
+
+    u8g2.setFont(
+        u8g2_font_6x10_tr
+    );
+
+    u8g2.setCursor(
+        5,
+        15
+    );
+
+    u8g2.print(
+        "DU - SAN SANG"
+    );
+
+    u8g2.setCursor(
+        5,
+        34
+    );
+
+    u8g2.print(
+        "CHO NHAN AUDIO..."
+    );
+
+    u8g2.setCursor(
+        5,
+        54
+    );
+
+    u8g2.print(
+        "HOP2: READY"
+    );
+
+    u8g2.sendBuffer();
+}
+
+
+void HienThi_DU_DangNhan(
+    uint32_t so_voice_expected,
+    uint32_t so_goi_mat_raw,
+    uint32_t so_goi_fec_cuu)
+{
+    u8g2.clearBuffer();
+    u8g2.drawFrame(
+        0,
+        0,
+        128,
+        64
+    );
+
+    u8g2.setFont(
+        u8g2_font_6x10_tr
+    );
+
+    u8g2.setCursor(
+        5,
+        11
+    );
+
+    u8g2.print(
+        "DU - DANG NHAN"
+    );
+
+    u8g2.setCursor(
+        5,
+        27
+    );
+
+    u8g2.print(
+        "DATA: "
+    );
+
+    u8g2.print(
+        so_voice_expected
+    );
+
+    u8g2.setCursor(
+        5,
+        42
+    );
+
+    u8g2.print(
+        "LOST: "
+    );
+
+    u8g2.print(
+        so_goi_mat_raw
+    );
+
+    u8g2.setCursor(
+        5,
+        57
+    );
+
+    u8g2.print(
+        "FEC : "
+    );
+
+    u8g2.print(
+        so_goi_fec_cuu
+    );
+
+    u8g2.sendBuffer();
+}
+
+
+void HienThi_DU_KetQua(
+    uint32_t so_voice_expected,
+    uint32_t so_goi_mat_raw,
+    uint32_t so_goi_fec_cuu,
+    uint32_t so_goi_con_mat)
+{
+    const char *chat_luong;
+
+    if (so_goi_con_mat > 0)
+    {
+        chat_luong =
+            "BAD";
+    }
+    else if (so_goi_mat_raw > 0)
+    {
+        chat_luong =
+            "WARN";
+    }
+    else
+    {
+        chat_luong =
+            "GOOD";
+    }
+
+    u8g2.clearBuffer();
+    u8g2.drawFrame(
+        0,
+        0,
+        128,
+        64
+    );
+
+    u8g2.setFont(
+        u8g2_font_5x8_tr
+    );
+
+    u8g2.setCursor(
+        4,
+        9
+    );
+
+    u8g2.print(
+        "DU - KET QUA"
+    );
+
+    u8g2.setCursor(
+        4,
+        20
+    );
+
+    u8g2.print(
+        "DATA : "
+    );
+
+    u8g2.print(
+        so_voice_expected
+    );
+
+    u8g2.setCursor(
+        4,
+        31
+    );
+
+    u8g2.print(
+        "LOST : "
+    );
+
+    u8g2.print(
+        so_goi_mat_raw
+    );
+
+    u8g2.setCursor(
+        4,
+        42
+    );
+
+    u8g2.print(
+        "FEC  : "
+    );
+
+    u8g2.print(
+        so_goi_fec_cuu
+    );
+
+    u8g2.setCursor(
+        4,
+        53
+    );
+
+    u8g2.print(
+        "FINAL: "
+    );
+
+    u8g2.print(
+        so_goi_con_mat
+    );
+
+    u8g2.setCursor(
+        67,
+        53
+    );
+
+    u8g2.print(
+        "H2:"
+    );
+
+    u8g2.print(
+        chat_luong
+    );
+
     u8g2.sendBuffer();
 }

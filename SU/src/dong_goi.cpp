@@ -98,7 +98,7 @@ void Tao_GoiTin_Voice(
 
     // High bit của SEQ dành làm domain FEC.
     // Với MAX_KHUNG_THOAI hiện tại (~375 packet/session)
-    // sẽ không bao giờ chạm giới hạn này.
+    
     if (so_thu_tu_goi & 0x80000000UL)
     {
         Serial.println(

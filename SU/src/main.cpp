@@ -36,8 +36,9 @@ extern U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2;
 //
 // End-to-end packet FEC:
 //   8 DATA + 1 PARITY.
-//   Parity XOR trên plaintext block 160B rồi parity được AES-GCM.
-//   DU có thể khôi phục 1 VOICE mất trong mỗi group.
+//   Parity XOR tren protected block 168B = ciphertext160 + original GCM tag8.
+//   FEC parity packet tu duoc AES-GCM bao ve.
+//   DU co the khoi phuc 1 VOICE mat trong moi group va verify GCM goc.
 //
 // CR LoRa vẫn = 4/5.
 // ========================================================
@@ -72,6 +73,29 @@ uint32_t tong_so_khung_da_ghi = 0;
 
 // Đo thời gian giữ PTT thực tế cho từng câu.
 uint32_t thoi_diem_bat_dau_ghi_ms = 0;
+
+
+// ========================================================
+// THONG KE LINK LOCAL TAI SU - HIEN THI OLED
+//
+// DATA  = so VOICE packet goc cua cau noi.
+// RETRY = tong so lan phat lai do khong nhan duoc ACK.
+// FAIL  = so packet ARQ (VOICE/FEC) that bai sau khi het retry.
+//
+// Luu y: RETRY cho biet Hop1 co van de, nhung mot retry co the
+// do packet SU->rBS mat HOAC ACK rBS->SU mat.
+// ========================================================
+
+uint32_t su_oled_voice_packets = 0;
+uint32_t su_oled_retransmissions = 0;
+uint32_t su_oled_fail_packets = 0;
+
+static void Reset_ThongKe_OLED_SU()
+{
+    su_oled_voice_packets = 0;
+    su_oled_retransmissions = 0;
+    su_oled_fail_packets = 0;
+}
 
 
 // ========================================================
@@ -114,6 +138,14 @@ static bool Gui_Packet_Co_ACK(
     {
         if (lan > 0)
         {
+            su_oled_retransmissions++;
+
+            HienThi_SU_DangGui(
+                su_oled_voice_packets,
+                su_oled_retransmissions,
+                su_oled_fail_packets
+            );
+
             Serial.printf(
                 "[SU ARQ] RETRY %u/%u | KIND=0x%02X | SEQ=%u\n",
                 lan,
@@ -139,6 +171,14 @@ static bool Gui_Packet_Co_ACK(
             return true;
         }
     }
+
+    su_oled_fail_packets++;
+
+    HienThi_SU_DangGui(
+        su_oled_voice_packets,
+        su_oled_retransmissions,
+        su_oled_fail_packets
+    );
 
     Serial.printf(
         "[SU ARQ FAIL] KIND=0x%02X | SEQ=%u\n",
@@ -279,10 +319,6 @@ void loop()
         );
 
 
-    static uint32_t thoi_gian_ve_oled =
-        0;
-
-
     // ====================================================
     // TRẠNG THÁI 1
     // VỪA BẤM PTT
@@ -307,13 +343,16 @@ void loop()
             millis();
 
 
-        adc_digi_start();
-
-
+        // OLED cap nhat TRUOC khi bat ADC-DMA.
+        // Trong luc dang thu, KHONG goi I2C/OLED de tranh can thiệp
+        // vao duong thu am DMA da duoc kiem chung on dinh.
         Ve_GiaoDien_OLED(
             0,
             true
         );
+
+
+        adc_digi_start();
 
 
         Serial.println(
@@ -345,32 +384,12 @@ void loop()
         )
         {
             // ============================================
-            // OLED
+            // KHONG CAP NHAT OLED TRONG LUC ADC-DMA DANG THU
+            //
+            // Ban OLED se giu nguyen man hinh "PHAT AM".
+            // Muc dich: tach hoan toan I2C/OLED khoi duong thu am.
+            // Sau khi nha PTT va adc_digi_stop(), OLED moi cap nhat lai.
             // ============================================
-
-            if (
-                millis()
-                -
-                thoi_gian_ve_oled
-                > 150
-            )
-            {
-                int bien_do =
-                    Tinh_BienDo_Mic(
-                        mang_tam_PCM,
-                        320
-                    );
-
-
-                Ve_GiaoDien_OLED(
-                    bien_do,
-                    true
-                );
-
-
-                thoi_gian_ve_oled =
-                    millis();
-            }
 
 
             // ============================================
@@ -404,6 +423,17 @@ void loop()
 
 
                     tong_so_khung_da_ghi++;
+
+                    // Log nhe de xac nhan ADC/Speex van dang thu,
+                    // khong cap nhat OLED trong luc DMA hoat dong.
+                    if ((tong_so_khung_da_ghi % 50) == 0)
+                    {
+                        Serial.printf(
+                            "[SU REC] FRAME=%u | AUDIO_MS=%u\n",
+                            (unsigned int)tong_so_khung_da_ghi,
+                            (unsigned int)(tong_so_khung_da_ghi * 20)
+                        );
+                    }
                 }
             }
         }
@@ -423,6 +453,8 @@ void loop()
     {
         trang_thai =
             DANG_PHAT_SONG;
+
+        Reset_ThongKe_OLED_SU();
 
 
         // =================================================
@@ -476,22 +508,11 @@ void loop()
         // OLED
         // =================================================
 
-        u8g2.clearBuffer();
-
-
-        u8g2.setFont(
-            u8g2_font_ncenB14_tr
+        HienThi_SU_DangGui(
+            0,
+            0,
+            0
         );
-
-
-        u8g2.drawStr(
-            10,
-            35,
-            "DANG GUI..."
-        );
-
-
-        u8g2.sendBuffer();
 
 
         Serial.print(
@@ -687,6 +708,14 @@ void loop()
             }
 
 
+            su_oled_voice_packets++;
+
+            HienThi_SU_DangGui(
+                su_oled_voice_packets,
+                su_oled_retransmissions,
+                su_oled_fail_packets
+            );
+
             Serial.printf(
                 "[SU TX] VOICE | SEQ=%u | FRAME=%u | LAST=%u | SIZE=176B\n",
                 seq_num_tx,
@@ -822,9 +851,10 @@ void loop()
             NGHI_NGOI;
 
 
-        Ve_GiaoDien_OLED(
-            0,
-            false
+        HienThi_SU_KetQua(
+            su_oled_voice_packets,
+            su_oled_retransmissions,
+            su_oled_fail_packets
         );
     }
 

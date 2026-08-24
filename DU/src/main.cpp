@@ -63,6 +63,11 @@ uint8_t *Audio_Buffer_Storage =
 // nhận END_AUDIO từ rBS.
 volatile bool cho_phep_phat_audio = false;
 
+// Task bao PLAY_STARTED ve rBS, tach khoi core phat audio.
+// Audio task chi notify SAU khi first PWM sample da duoc ghi.
+TaskHandle_t Task_PlayReport_Handle = nullptr;
+volatile uint64_t play_report_session_id = 0;
+
 
 // =====================================================
 // PHIÊN BẢO MẬT HIỆN TẠI
@@ -391,11 +396,8 @@ static void Flush_FEC_Group(
         ly_do
     );
 
-    HienThi_DU_DangNhan(
-        du_oled_stats.expected_voice,
-        du_oled_stats.raw_missing_voice,
-        du_oled_stats.fec_recovered_voice
-    );
+    // Khong refresh OLED theo tung FEC group de tranh chen I2C
+    // vao duong transport. Counter van duoc cap nhat trong RAM.
 
     for (
         uint8_t i = 0;
@@ -669,19 +671,21 @@ void TacVu_GiaiMa(void *thamSo)
                     "END_AUDIO"
                 );
 
+                Serial.println(
+                    "[DU AUDIO] DA NHAN DU CAU -> BAT DAU PHAT"
+                );
+
+                // Mo gate TRUOC khi ve OLED. Audio task o core0 co the
+                // bat dau ngay, OLED I2C o core1 khong chen them delay vao PLAY.
+                cho_phep_phat_audio =
+                    true;
+
                 HienThi_DU_KetQua(
                     du_oled_stats.expected_voice,
                     du_oled_stats.raw_missing_voice,
                     du_oled_stats.fec_recovered_voice,
                     du_oled_stats.final_missing_voice
                 );
-
-                Serial.println(
-                    "[DU AUDIO] DA NHAN DU CAU -> BAT DAU PHAT"
-                );
-
-                cho_phep_phat_audio =
-                    true;
             }
             else
             {
@@ -1332,6 +1336,36 @@ void TacVu_GiaiMa(void *thamSo)
 
 
 // =====================================================
+// TASK BAO DU DA BAT DAU PLAY VE rBS
+//
+// Khong TX LoRa truc tiep trong audio task, vi endPacket() blocking
+// co the lam tre sample audio dau tien. Audio task chi notify task nay
+// SAU khi first PWM sample da duoc ghi ra loa.
+// =====================================================
+
+void TacVu_BaoPlay(void *thamSo)
+{
+    while (1)
+    {
+        ulTaskNotifyTake(
+            pdTRUE,
+            portMAX_DELAY
+        );
+
+        uint64_t session_can_bao =
+            play_report_session_id;
+
+        if (session_can_bao != 0)
+        {
+            Gui_PLAY_STARTED_RBS(
+                session_can_bao
+            );
+        }
+    }
+}
+
+
+// =====================================================
 // TASK 3
 // PHÁT ÂM THANH
 // =====================================================
@@ -1386,6 +1420,9 @@ void TacVu_PhatAmThanh(void *thamSo)
 
         if (pcm_data != NULL)
         {
+            bool day_la_mau_audio_dau_tien =
+                false;
+
             // =============================================
             // BẬT AUDIO OUTPUT
             // =============================================
@@ -1407,6 +1444,8 @@ void TacVu_PhatAmThanh(void *thamSo)
                 dang_phat_loa =
                     true;
 
+                day_la_mau_audio_dau_tien =
+                    true;
 
                 Serial.println(
                     "[DU AUDIO] PLAY"
@@ -1454,6 +1493,24 @@ void TacVu_PhatAmThanh(void *thamSo)
                     PWM_CHANNEL,
                     pwm_val
                 );
+
+                // Day la moc PLAY thuc te: first PWM sample da ra GPIO.
+                // Bao report task NGAY SAU moc nay, khong block audio.
+                if (day_la_mau_audio_dau_tien)
+                {
+                    play_report_session_id =
+                        session_id_hien_tai;
+
+                    if (Task_PlayReport_Handle != nullptr)
+                    {
+                        xTaskNotifyGive(
+                            Task_PlayReport_Handle
+                        );
+                    }
+
+                    day_la_mau_audio_dau_tien =
+                        false;
+                }
 
 
                 thoi_gian_mau_tiep_theo +=
@@ -1775,6 +1832,21 @@ void setup()
             delay(1000);
         }
     }
+
+
+    // =================================================
+    // TASK PLAY REPORT
+    // =================================================
+
+    xTaskCreatePinnedToCore(
+        TacVu_BaoPlay,
+        "PLAY_REPORT",
+        4096,
+        NULL,
+        3,
+        &Task_PlayReport_Handle,
+        1
+    );
 
 
     // =================================================

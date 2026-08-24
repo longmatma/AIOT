@@ -19,7 +19,9 @@ void HienThi_SU_DangGui(
 void HienThi_SU_KetQua(
     uint32_t so_voice_packet,
     uint32_t so_lan_retry,
-    uint32_t so_packet_fail
+    uint32_t so_packet_fail,
+    bool e2e_hop_le,
+    uint32_t e2e_ms
 );
 
 #endif

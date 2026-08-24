@@ -39,6 +39,15 @@ VOICE_LENGTH = 168
 TYPE_RELAY = 0x10
 TYPE_RELAY_END = 0x11
 
+# Control DU -> rBS -> SU de do PTT_RELEASE -> DU_PLAY.
+TYPE_PLAY_STARTED = 0x12
+SIZE_PLAY_STARTED = 12
+
+# Sau END #1, rBS mo RX window cho DU bao PLAY.
+# Playback DU da bat dau ngay tu END #1; window nay KHONG chen delay vao loa.
+PLAY_REPORT_WINDOW = 0.120
+PLAY_REPORT_FORWARD_GUARD = 0.008
+
 # Giữ các guard đã chứng minh ổn định.
 PHASE2_RX_GUARD = 0.008
 READY_GUARD = 0.010
@@ -251,9 +260,132 @@ def gui_ready_ack(
     )
 
 
-def gui_end_audio_cho_du(rfm9x):
+def parse_play_started_du(packet_bytes, expected_session_id):
 
-    for lan in range(3):
+    if packet_bytes is None:
+        return None
+
+    p = bytes(packet_bytes)
+
+    # DU tu dong tao RadioHead-compatible header 4B + session 8B.
+    if len(p) != SIZE_PLAY_STARTED:
+        return None
+
+    if (
+        p[0] != ID_TRAM_RBS
+        or p[1] != ID_TRAM_DU
+        or p[2] != TYPE_PLAY_STARTED
+    ):
+        return None
+
+    session_id = int.from_bytes(
+        p[4:12],
+        byteorder="big",
+        signed=False,
+    )
+
+    if session_id == 0:
+        return None
+
+    if (
+        expected_session_id is not None
+        and session_id != expected_session_id
+    ):
+        return None
+
+    return session_id
+
+
+def gui_play_started_cho_su(rfm9x, session_id):
+
+    rfm9x.send(
+        int(session_id).to_bytes(
+            8,
+            byteorder="big",
+            signed=False,
+        ),
+        destination=ID_TRAM_SU,
+        node=ID_TRAM_RBS,
+        identifier=TYPE_PLAY_STARTED,
+        flags=0,
+    )
+
+    print(
+        f"[rBS CTRL] PLAY_STARTED -> SU | "
+        f"SESSION={session_id:016X}"
+    )
+
+
+def gui_end_audio_cho_du(rfm9x, expected_session_id=None):
+    """
+    END #1 -> DU bat dau PLAY.
+    rBS lap tuc mo RX de nhan PLAY_STARTED cua DU, forward ve SU.
+    Sau do moi gui END #2/#3 lam redundancy nhu baseline cu.
+
+    Nhu vay reverse report khong can cho het 3 END, nen phep do E2E
+    chi bi cong them airtime cua 2 packet report nho (~20.6 ms).
+    """
+
+    # END #1 - day la END lam DU mo play gate binh thuong.
+    rfm9x.send(
+        b"\x00",
+        destination=ID_TRAM_DU,
+        node=ID_TRAM_RBS,
+        identifier=TYPE_RELAY_END,
+        flags=0,
+    )
+
+    print("[rBS CTRL] END_AUDIO #1 -> DU | MO CUA SO PLAY_REPORT")
+
+    got_play_report = False
+    deadline = time.monotonic() + PLAY_REPORT_WINDOW
+
+    while time.monotonic() < deadline:
+        p = rfm9x.receive(
+            timeout=0.005,
+            with_header=True,
+        )
+
+        if p is None:
+            continue
+
+        sid = parse_play_started_du(
+            p,
+            expected_session_id,
+        )
+
+        if sid is None:
+            continue
+
+        print(
+            f"[rBS RX CTRL] PLAY_STARTED FROM DU | "
+            f"SESSION={sid:016X}"
+        )
+
+        # SU cung nghe thay packet DU->rBS. Cho SU doc/xả packet do
+        # va re-arm RX continuous truoc khi rBS forward report.
+        time.sleep(PLAY_REPORT_FORWARD_GUARD)
+
+        print(
+            f"[TIME][rBS] PLAY_REPORT_FORWARD_GUARD = "
+            f"{PLAY_REPORT_FORWARD_GUARD * 1000:.1f} ms"
+        )
+
+        gui_play_started_cho_su(
+            rfm9x,
+            sid,
+        )
+
+        got_play_report = True
+        break
+
+    if not got_play_report:
+        print(
+            "[rBS CTRL] PLAY_REPORT TIMEOUT -> SU se hien E2E ---"
+        )
+
+    # Giu redundancy END x3: gui not END #2 va #3.
+    for lan in range(2):
         rfm9x.send(
             b"\x00",
             destination=ID_TRAM_DU,
@@ -262,10 +394,10 @@ def gui_end_audio_cho_du(rfm9x):
             flags=0,
         )
 
-        if lan < 2:
+        if lan == 0:
             time.sleep(0.020)
 
-    print("[rBS CTRL] END_AUDIO -> DU")
+    print("[rBS CTRL] END_AUDIO #2/#3 -> DU")
 
 
 # ============================================================
@@ -424,7 +556,7 @@ def main():
     print(" CR = 4/5 | SF7 | BW500k")
     print(" FIRST HOP = STOP-AND-WAIT ARQ")
     print(" SECOND HOP = PACKET FEC 8 DATA + 1 PARITY")
-    print(" FINAL = FINAL FEC ACK -> SU AUDIO_END(5B) -> DU END x3")
+    print(" FINAL = AUDIO_END -> END#1 -> DU PLAY_REPORT -> SU -> END#2/#3")
     print(f" PHASE2_RX_GUARD = {PHASE2_RX_GUARD * 1000:.1f} ms")
     print("====================================================")
 
@@ -516,7 +648,8 @@ def main():
 
                 if da_relay_data:
                     gui_end_audio_cho_du(
-                        rfm9x
+                        rfm9x,
+                        session_id_hien_tai,
                     )
 
                     print(
@@ -551,7 +684,8 @@ def main():
                 ):
                     if da_relay_data:
                         gui_end_audio_cho_du(
-                            rfm9x
+                            rfm9x,
+                            session_id_hien_tai,
                         )
 
                     session_id_hien_tai = (
@@ -733,7 +867,8 @@ def main():
 
             if da_relay_data:
                 gui_end_audio_cho_du(
-                    rfm9x
+                    rfm9x,
+                    session_id_hien_tai,
                 )
 
             (

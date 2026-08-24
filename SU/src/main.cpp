@@ -64,6 +64,26 @@ extern U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2;
 
 
 // ========================================================
+// DO E2E THUC DUNG: PTT RELEASE -> DU PLAY
+//
+// DU gui PLAY_STARTED ve rBS ngay sau khi ghi mau PWM dau tien.
+// rBS forward PLAY_STARTED ve SU. SU do elapsed tren CHINH dong ho SU.
+//
+// Gia tri quan sat co them airtime cua duong phan hoi:
+//   DU -> rBS : packet 12B ~= 10.304 ms
+//   guard de SU re-arm RX sau khi nghe ke DU report = 8 ms
+//   rBS -> SU : packet 12B ~= 10.304 ms
+// Tong ~= 28.608 ms, lam tron 29 ms.
+//
+// OLED hien E2E~ = observed - 21 ms.
+// Day la uoc luong rat gan de test/toi uu, chua phai phep do PPS dong bo.
+// ========================================================
+
+#define PLAY_REPORT_TIMEOUT_MS       500
+#define PLAY_REPORT_RETURN_EST_MS     29
+
+
+// ========================================================
 // BỘ NHỚ AUDIO
 // ========================================================
 
@@ -73,6 +93,9 @@ uint32_t tong_so_khung_da_ghi = 0;
 
 // Đo thời gian giữ PTT thực tế cho từng câu.
 uint32_t thoi_diem_bat_dau_ghi_ms = 0;
+
+// Moc bat dau E2E = ngay khi loop phat hien PTT vua duoc nha.
+uint32_t e2e_ptt_release_ms = 0;
 
 
 // ========================================================
@@ -140,11 +163,7 @@ static bool Gui_Packet_Co_ACK(
         {
             su_oled_retransmissions++;
 
-            HienThi_SU_DangGui(
-                su_oled_voice_packets,
-                su_oled_retransmissions,
-                su_oled_fail_packets
-            );
+            // Khong refresh OLED o tung retry de tranh I2C lam tang delay.
 
             Serial.printf(
                 "[SU ARQ] RETRY %u/%u | KIND=0x%02X | SEQ=%u\n",
@@ -174,11 +193,7 @@ static bool Gui_Packet_Co_ACK(
 
     su_oled_fail_packets++;
 
-    HienThi_SU_DangGui(
-        su_oled_voice_packets,
-        su_oled_retransmissions,
-        su_oled_fail_packets
-    );
+    // Khong refresh OLED o day; final screen se cap nhat sau session.
 
     Serial.printf(
         "[SU ARQ FAIL] KIND=0x%02X | SEQ=%u\n",
@@ -451,6 +466,11 @@ void loop()
         trang_thai == DANG_GHI_AM
     )
     {
+        // T0 cua phep do E2E: bat ngay khi SU phat hien PTT da nha.
+        // Dat truoc ADC stop/OLED de tinh ca processing local sau khi nha nut.
+        e2e_ptt_release_ms =
+            millis();
+
         trang_thai =
             DANG_PHAT_SONG;
 
@@ -558,7 +578,8 @@ void loop()
         // SESSION MỚI + SESSION_START x2
         // =================================================
 
-        Tao_Session_Moi();
+        uint64_t session_id_tx =
+            Tao_Session_Moi();
 
         uint8_t goi_session[12];
 
@@ -710,11 +731,8 @@ void loop()
 
             su_oled_voice_packets++;
 
-            HienThi_SU_DangGui(
-                su_oled_voice_packets,
-                su_oled_retransmissions,
-                su_oled_fail_packets
-            );
+            // Khong refresh OLED theo tung VOICE packet.
+            // Counter van duoc cap nhat trong RAM; tranh chen I2C vao latency.
 
             Serial.printf(
                 "[SU TX] VOICE | SEQ=%u | FRAME=%u | LAST=%u | SIZE=176B\n",
@@ -811,6 +829,10 @@ void loop()
         // Chỉ gửi sau khi final FEC đã được ACK.
         // =================================================
 
+        bool e2e_hop_le = false;
+        uint32_t e2e_observed_ms = 0;
+        uint32_t e2e_est_ms = 0;
+
         if (!gui_that_bai)
         {
             uint8_t goi_audio_end[5] =
@@ -830,6 +852,43 @@ void loop()
             Serial.println(
                 "[SU CTRL] AUDIO_END 5B -> rBS"
             );
+
+            // Sau AUDIO_END, SU vao RX va cho tin PLAY_STARTED da duoc
+            // rBS forward tu DU. Timer van chay tren CHINH dong ho SU.
+            if (
+                Cho_PLAY_STARTED_RBS(
+                    PLAY_REPORT_TIMEOUT_MS,
+                    session_id_tx
+                )
+            )
+            {
+                e2e_observed_ms =
+                    millis() - e2e_ptt_release_ms;
+
+                // Tru airtime uoc tinh cua duong report quay ve 2 hop.
+                // Neu sau nay doi SF/BW/CR hoac format report, cap nhat hang so nay.
+                e2e_est_ms =
+                    (
+                        e2e_observed_ms > PLAY_REPORT_RETURN_EST_MS
+                        ? e2e_observed_ms - PLAY_REPORT_RETURN_EST_MS
+                        : e2e_observed_ms
+                    );
+
+                e2e_hop_le = true;
+
+                Serial.printf(
+                    "[SU E2E] OBS=%u ms | RETURN_EST=%u ms | PTT_RELEASE->DU_PLAY ~= %u ms\n",
+                    (unsigned int)e2e_observed_ms,
+                    (unsigned int)PLAY_REPORT_RETURN_EST_MS,
+                    (unsigned int)e2e_est_ms
+                );
+            }
+            else
+            {
+                Serial.println(
+                    "[SU E2E] KHONG NHAN DUOC PLAY_STARTED -> E2E KHONG CO SO LIEU"
+                );
+            }
 
             Serial.println(
                 ">> DA GUI XONG!"
@@ -854,7 +913,9 @@ void loop()
         HienThi_SU_KetQua(
             su_oled_voice_packets,
             su_oled_retransmissions,
-            su_oled_fail_packets
+            su_oled_fail_packets,
+            e2e_hop_le,
+            e2e_est_ms
         );
     }
 

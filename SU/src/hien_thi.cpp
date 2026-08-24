@@ -301,13 +301,56 @@ void HienThi_SU_DangGui(
 void HienThi_SU_KetQua(
     uint32_t so_voice_packet,
     uint32_t so_lan_retry,
-    uint32_t so_packet_fail)
+    uint32_t so_packet_fail,
+    bool e2e_hop_le,
+    uint32_t e2e_ms)
 {
-    Ve_ThongKe_SU(
-        "SU - KET QUA",
-        so_voice_packet,
-        so_lan_retry,
-        so_packet_fail,
-        true
-    );
+    const char *chat_luong;
+
+    if (so_packet_fail > 0)
+    {
+        chat_luong = "BAD";
+    }
+    else if (so_lan_retry > 0)
+    {
+        chat_luong = "WARN";
+    }
+    else
+    {
+        chat_luong = "GOOD";
+    }
+
+    u8g2.clearBuffer();
+    u8g2.drawFrame(0, 0, 128, 64);
+    u8g2.setFont(u8g2_font_5x8_tr);
+
+    u8g2.setCursor(4, 9);
+    u8g2.print("SU - KET QUA");
+
+    u8g2.setCursor(4, 21);
+    u8g2.print("D:");
+    u8g2.print(so_voice_packet);
+    u8g2.print(" R:");
+    u8g2.print(so_lan_retry);
+    u8g2.print(" F:");
+    u8g2.print(so_packet_fail);
+
+    u8g2.setCursor(4, 35);
+    u8g2.print("HOP1: ");
+    u8g2.print(chat_luong);
+
+    u8g2.setCursor(4, 51);
+    if (e2e_hop_le)
+    {
+        // Dau ~: day la estimate PTT release -> DU first PWM sample.
+        u8g2.print("E2E~: ");
+        u8g2.print(e2e_ms);
+        u8g2.print(" ms");
+    }
+    else
+    {
+        u8g2.print("E2E~: ---");
+    }
+
+    u8g2.sendBuffer();
 }

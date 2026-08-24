@@ -22,4 +22,11 @@ bool Cho_READY_RBS(
     uint32_t expected_seq
 );
 
+// Cho rBS forward su kien DU da bat dau PLAY.
+// Physical packet: 4B RadioHead header + SESSION_ID64 8B = 12B.
+bool Cho_PLAY_STARTED_RBS(
+    uint32_t timeout_ms,
+    uint64_t expected_session_id
+);
+
 #endif

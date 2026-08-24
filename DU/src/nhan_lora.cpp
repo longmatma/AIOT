@@ -3,10 +3,12 @@
 #include <Arduino.h>
 #include <SPI.h>
 #include <LoRa.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 
 
 // =====================================================
-// CHÂN LORA
+// CHAN LORA
 // =====================================================
 
 #define LORA_SCK   12
@@ -27,19 +29,19 @@
 
 
 // =====================================================
-// TYPE WRAPPER rBS -> DU
+// TYPE
 // =====================================================
 
-#define TYPE_RELAY       0x10
-#define TYPE_RELAY_END   0x11
+#define TYPE_RELAY          0x10
+#define TYPE_RELAY_END      0x11
+#define TYPE_PLAY_STARTED   0x12
 
-// TYPE nội bộ đưa sang main.cpp.
-// Gói này không tồn tại trong ciphertext SU.
-#define TYPE_AUDIO_END   0x04
+// TYPE noi bo dua sang main.cpp.
+#define TYPE_AUDIO_END      0x04
 
 
 // =====================================================
-// KÍCH THƯỚC
+// KICH THUOC
 // =====================================================
 
 #define SIZE_SESSION_INNER  12
@@ -52,38 +54,25 @@
 #define SIZE_END_RELAY       5
 
 
+// RX task va PLAY_REPORT task cung dung mot SX1278.
+// Mutex ngan hai task cham SPI/radio cung luc.
+static SemaphoreHandle_t LoRa_Mutex = nullptr;
+
+
 // =====================================================
-// KHỞI TẠO LORA RX
+// KHOI TAO LORA RX
 // =====================================================
 
 void KhoiTao_LoRa_RX()
 {
-    SPI.begin(
-        LORA_SCK,
-        LORA_MISO,
-        LORA_MOSI,
-        LORA_CS
-    );
+    LoRa_Mutex =
+        xSemaphoreCreateMutex();
 
-
-    LoRa.setSPI(
-        SPI
-    );
-
-
-    LoRa.setPins(
-        LORA_CS,
-        LORA_RST,
-        LORA_DIO0
-    );
-
-
-    if (!LoRa.begin(433E6))
+    if (LoRa_Mutex == nullptr)
     {
         Serial.println(
-            "LOI: Khong tim thay module LoRa RX!"
+            "[DU ERROR] Khong tao duoc LoRa mutex!"
         );
-
 
         while (1)
         {
@@ -91,35 +80,46 @@ void KhoiTao_LoRa_RX()
         }
     }
 
-
-    LoRa.setSpreadingFactor(
-        7
+    SPI.begin(
+        LORA_SCK,
+        LORA_MISO,
+        LORA_MOSI,
+        LORA_CS
     );
 
-
-    LoRa.setSignalBandwidth(
-        500E3
+    LoRa.setSPI(
+        SPI
     );
 
-
-    LoRa.setCodingRate4(
-        5
+    LoRa.setPins(
+        LORA_CS,
+        LORA_RST,
+        LORA_DIO0
     );
 
+    if (!LoRa.begin(433E6))
+    {
+        Serial.println(
+            "LOI: Khong tim thay module LoRa RX!"
+        );
 
+        while (1)
+        {
+            delay(1000);
+        }
+    }
+
+    LoRa.setSpreadingFactor(7);
+    LoRa.setSignalBandwidth(500E3);
+    LoRa.setCodingRate4(5);
     LoRa.enableCrc();
 
-
-    // DIO0 dùng làm RX_DONE trong chế độ receive().
     pinMode(
         LORA_DIO0,
         INPUT
     );
 
-
-    // RX continuous ngay sau khi khởi tạo.
     LoRa.receive();
-
 
     Serial.println(
         "Khoi tao LoRa RX THANH CONG!"
@@ -128,150 +128,115 @@ void KhoiTao_LoRa_RX()
 
 
 // =====================================================
-// NHẬN PACKET
+// NHAN PACKET rBS -> DU
 //
-// DU TỪ GIỜ CHỈ NHẬN PACKET DO rBS BỌC.
-//
-// rBS SESSION:
-//   4B wrapper + 12B packet gốc = 16B
-//
-// rBS VOICE:
-//   4B wrapper + 176B packet gốc = 180B
-//
-// rBS FEC:
-//   4B wrapper + 184B packet gốc = 188B
-//
-// rBS END_AUDIO:
-//   4B header + 1B payload = 5B
-//
-// Packet SU trực tiếp 12B / 176B / 184B sẽ bị bỏ.
+// GIU FIX IDLE:
+// - DIO0 INPUT
+// - chi parsePacket khi RX_DONE HIGH
+// - sau packet / parse error quay lai LoRa.receive()
 // =====================================================
 
 bool Nhan_GoiTin_LoRa(
     uint8_t* buffer,
     size_t &do_dai_nhan)
 {
-    // =================================================
-    // GIỮ SX1278 Ở RX CONTINUOUS KHI IDLE
-    //
-    // LoRa.receive() đã map DIO0 = RX_DONE và đưa radio
-    // vào MODE_RX_CONTINUOUS.
-    //
-    // QUAN TRỌNG:
-    // Không gọi LoRa.parsePacket() liên tục khi chưa có
-    // RX_DONE, vì parsePacket() có thể chuyển radio sang
-    // RX_SINGLE. Sau thời gian idle dài, việc trộn hai
-    // cơ chế này có thể làm trạng thái RX không ổn định.
-    //
-    // Chỉ parse khi DIO0 báo đã nhận xong packet.
-    // =================================================
+    do_dai_nhan = 0;
+
+    if (LoRa_Mutex == nullptr)
+    {
+        return false;
+    }
+
+    if (
+        xSemaphoreTake(
+            LoRa_Mutex,
+            pdMS_TO_TICKS(2)
+        )
+        != pdTRUE
+    )
+    {
+        return false;
+    }
 
     if (
         digitalRead(LORA_DIO0)
         == LOW
     )
     {
+        xSemaphoreGive(
+            LoRa_Mutex
+        );
+
         return false;
     }
-
 
     int packetSize =
         LoRa.parsePacket();
 
-
     if (packetSize <= 0)
     {
-        // Có thể là RX_DONE kèm CRC error hoặc IRQ bất thường.
-        // Khôi phục RX continuous ngay.
         LoRa.receive();
+
+        xSemaphoreGive(
+            LoRa_Mutex
+        );
 
         return false;
     }
 
-
-    // =================================================
-    // ĐỌC TRỌN PACKET RA BUFFER TẠM
-    // =================================================
-
     uint8_t raw_packet[256];
-
-    size_t raw_len =
-        0;
-
+    size_t raw_len = 0;
 
     while (
         LoRa.available()
-        &&
-        raw_len < sizeof(raw_packet)
+        && raw_len < sizeof(raw_packet)
     )
     {
         raw_packet[raw_len++] =
             (uint8_t)LoRa.read();
     }
 
-
-    // Nếu packet lớn hơn buffer tạm thì xả nốt.
     while (LoRa.available())
     {
         LoRa.read();
     }
 
-
-    // QUAY LẠI RX NGAY.
+    // Re-arm RX continuous NGAY sau khi doc packet.
     LoRa.receive();
-
 
     if (
         raw_len
         != (size_t)packetSize
     )
     {
+        xSemaphoreGive(
+            LoRa_Mutex
+        );
+
         return false;
     }
 
-
-    // =================================================
-    // BỎ PACKET SU TRỰC TIẾP
-    //
-    // Đây là điều quan trọng để DU chỉ nghe qua rBS.
-    // =================================================
-
+    // Bo packet SU truc tiep; DU chi nhan qua rBS.
     if (
         packetSize == SIZE_SESSION_INNER
-        ||
-        packetSize == SIZE_VOICE_INNER
-        ||
-        packetSize == SIZE_FEC_INNER
+        || packetSize == SIZE_VOICE_INNER
+        || packetSize == SIZE_FEC_INNER
     )
     {
+        xSemaphoreGive(
+            LoRa_Mutex
+        );
+
         return false;
     }
 
-
-    // =================================================
-    // END AUDIO: 5 BYTE
-    // =================================================
-
-    if (
-        packetSize == SIZE_END_RELAY
-    )
+    // END AUDIO 5B outer -> packet noi bo 4B.
+    if (packetSize == SIZE_END_RELAY)
     {
-        uint8_t dst =
-            raw_packet[0];
-
-        uint8_t src =
-            raw_packet[1];
-
-        uint8_t type =
-            raw_packet[2];
-
-
         if (
-            dst == ID_TRAM_DU
-            &&
-            src == ID_TRAM_RBS
-            &&
-            type == TYPE_RELAY_END
+            raw_packet[0] == ID_TRAM_DU
+            && raw_packet[1] == ID_TRAM_RBS
+            && raw_packet[2] == TYPE_RELAY_END
         )
         {
             memset(
@@ -280,126 +245,97 @@ bool Nhan_GoiTin_LoRa(
                 SIZE_FEC_INNER
             );
 
+            buffer[0] = ID_TRAM_DU;
+            buffer[1] = ID_TRAM_RBS;
+            buffer[2] = TYPE_AUDIO_END;
+            buffer[3] = 0;
 
-            // Tạo control packet nội bộ 4B cho main.cpp.
-            buffer[0] =
-                ID_TRAM_DU;
+            do_dai_nhan = 4;
 
-            buffer[1] =
-                ID_TRAM_RBS;
-
-            buffer[2] =
-                TYPE_AUDIO_END;
-
-            buffer[3] =
-                0;
-
-
-            do_dai_nhan =
-                4;
-
+            xSemaphoreGive(
+                LoRa_Mutex
+            );
 
             return true;
         }
 
+        xSemaphoreGive(
+            LoRa_Mutex
+        );
 
         return false;
     }
-
-
-    // =================================================
-    // CHỈ CHẤP NHẬN WRAPPER 16B / 180B / 188B
-    // =================================================
 
     if (
         packetSize != SIZE_SESSION_RELAY
-        &&
-        packetSize != SIZE_VOICE_RELAY
-        &&
-        packetSize != SIZE_FEC_RELAY
+        && packetSize != SIZE_VOICE_RELAY
+        && packetSize != SIZE_FEC_RELAY
     )
     {
+        xSemaphoreGive(
+            LoRa_Mutex
+        );
+
         return false;
     }
 
-
-    // =================================================
-    // KIỂM TRA OUTER HEADER
-    // =================================================
-
-    uint8_t outer_dst =
-        raw_packet[0];
-
-    uint8_t outer_src =
-        raw_packet[1];
-
-    uint8_t outer_type =
-        raw_packet[2];
-
-    uint8_t inner_len =
-        raw_packet[3];
-
+    uint8_t outer_dst = raw_packet[0];
+    uint8_t outer_src = raw_packet[1];
+    uint8_t outer_type = raw_packet[2];
+    uint8_t inner_len = raw_packet[3];
 
     if (
         outer_dst != ID_TRAM_DU
-        ||
-        outer_src != ID_TRAM_RBS
-        ||
-        outer_type != TYPE_RELAY
+        || outer_src != ID_TRAM_RBS
+        || outer_type != TYPE_RELAY
     )
     {
+        xSemaphoreGive(
+            LoRa_Mutex
+        );
+
         return false;
     }
-
 
     if (
         inner_len != SIZE_SESSION_INNER
-        &&
-        inner_len != SIZE_VOICE_INNER
-        &&
-        inner_len != SIZE_FEC_INNER
+        && inner_len != SIZE_VOICE_INNER
+        && inner_len != SIZE_FEC_INNER
     )
     {
+        xSemaphoreGive(
+            LoRa_Mutex
+        );
+
         return false;
     }
-
 
     if (
         packetSize
         != (4 + inner_len)
     )
     {
+        xSemaphoreGive(
+            LoRa_Mutex
+        );
+
         return false;
     }
-
-
-    // =================================================
-    // KIỂM TRA PACKET GỐC BÊN TRONG
-    //
-    // Packet gốc vẫn phải là SU -> DU.
-    // =================================================
 
     uint8_t *inner =
         &raw_packet[4];
 
-
     if (
         inner[0] != ID_TRAM_DU
-        ||
-        inner[1] != ID_TRAM_SU
+        || inner[1] != ID_TRAM_SU
     )
     {
+        xSemaphoreGive(
+            LoRa_Mutex
+        );
+
         return false;
     }
-
-
-    // =================================================
-    // UNWRAP
-    //
-    // Copy packet SU nguyên vẹn về buffer main.cpp.
-    // Main nhận nguyên VOICE 176B hoặc FEC 184B bên trong wrapper.
-    // AAD vẫn là 8 byte header gốc của SU.
-    // =================================================
 
     memset(
         buffer,
@@ -407,17 +343,103 @@ bool Nhan_GoiTin_LoRa(
         SIZE_FEC_INNER
     );
 
-
     memcpy(
         buffer,
         inner,
         inner_len
     );
 
-
     do_dai_nhan =
         inner_len;
 
+    xSemaphoreGive(
+        LoRa_Mutex
+    );
 
     return true;
+}
+
+
+// =====================================================
+// DU -> rBS: PLAY_STARTED
+//
+// Goi SAU khi first PWM sample da duoc ghi ra GPIO audio.
+// Physical 12B:
+//   [DST=rBS][SRC=DU][TYPE=0x12][flags=0][SESSION_ID64]
+// =====================================================
+
+bool Gui_PLAY_STARTED_RBS(
+    uint64_t session_id)
+{
+    if (
+        session_id == 0
+        || LoRa_Mutex == nullptr
+    )
+    {
+        return false;
+    }
+
+    if (
+        xSemaphoreTake(
+            LoRa_Mutex,
+            pdMS_TO_TICKS(50)
+        )
+        != pdTRUE
+    )
+    {
+        Serial.println(
+            "[DU PLAY REPORT] Khong lay duoc LoRa mutex"
+        );
+
+        return false;
+    }
+
+    uint8_t report[12];
+
+    report[0] = ID_TRAM_RBS;
+    report[1] = ID_TRAM_DU;
+    report[2] = TYPE_PLAY_STARTED;
+    report[3] = 0x00;
+
+    report[4]  = (session_id >> 56) & 0xFF;
+    report[5]  = (session_id >> 48) & 0xFF;
+    report[6]  = (session_id >> 40) & 0xFF;
+    report[7]  = (session_id >> 32) & 0xFF;
+    report[8]  = (session_id >> 24) & 0xFF;
+    report[9]  = (session_id >> 16) & 0xFF;
+    report[10] = (session_id >> 8)  & 0xFF;
+    report[11] =  session_id        & 0xFF;
+
+    LoRa.idle();
+    LoRa.beginPacket();
+    LoRa.write(
+        report,
+        sizeof(report)
+    );
+
+    int ok =
+        LoRa.endPacket();
+
+    // Bao xong phai quay lai RX continuous.
+    LoRa.receive();
+
+    xSemaphoreGive(
+        LoRa_Mutex
+    );
+
+    if (ok == 1)
+    {
+        Serial.printf(
+            "[DU CTRL] PLAY_STARTED -> rBS | SESSION=%016llX\n",
+            (unsigned long long)session_id
+        );
+
+        return true;
+    }
+
+    Serial.println(
+        "[DU PLAY REPORT] TX FAIL"
+    );
+
+    return false;
 }

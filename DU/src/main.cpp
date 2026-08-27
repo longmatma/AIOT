@@ -11,6 +11,7 @@
 #include "giai_ma_speex.h"
 #include "man_hinh.h"
 #include "ma_hoa.h"
+#include "gps_du.h"
 
 
 // =====================================================
@@ -18,6 +19,13 @@
 // =====================================================
 
 #define CHAN_AUDIO_OUT      1
+
+// HMI V5: chi 1 nut + 1 LED.
+// GPIO6  = NACK thu cong (nguoi nghe bao "khong ro").
+// GPIO16 = LED trang thai duy nhat.
+// GPIO7 va GPIO21 khong dung trong ban nay.
+#define CHAN_NUT_NACK       6
+#define CHAN_LED_STATUS    16
 #define PWM_CHANNEL         0
 
 // Tần số lấy mẫu âm thanh
@@ -68,6 +76,118 @@ volatile bool cho_phep_phat_audio = false;
 TaskHandle_t Task_PlayReport_Handle = nullptr;
 volatile uint64_t play_report_session_id = 0;
 
+// Session cua cau vua phat xong, dung cho AUTO_ACK/NACK.
+// Tach khoi session_id_hien_tai de khong nham neu session moi den som.
+volatile uint64_t du_last_played_session_id = 0;
+
+// =====================================================
+// HMI V5 - 1 LED + 1 NUT
+//
+// LED DU:
+//   OFF       = khong co session.
+//   ON lien tuc= da co SESSION_START, dang cho DATA; hoac session
+//               dang active nhung DATA bi ngung > timeout.
+//   Chop packet= VOICE/FEC dang toi that.
+//   Nhay cham  = dang gui AUTO-ACK/NACK va cho SU confirm.
+//   ON 2 giay  = SU da confirm response.
+//
+// ACK = TU DONG sau khi DU phat het audio.
+// NACK = nut GPIO6, nguoi nghe bam khi "khong ro".
+// =====================================================
+volatile bool du_hmi_can_nack = false;
+volatile bool du_auto_ack_request = false;
+volatile uint64_t du_auto_ack_session = 0;
+
+volatile bool du_user_pending = false;
+volatile bool du_user_confirmed = false;
+volatile uint8_t du_user_pending_code = 0;
+volatile uint64_t du_user_pending_session = 0;
+volatile uint32_t du_confirm_led_until_ms = 0;
+
+// LED session/data.
+volatile bool du_session_led_active = false;
+volatile bool du_data_started = false;
+volatile uint32_t du_last_data_ms = 0;
+volatile uint32_t du_packet_pulse_until_ms = 0;
+
+#define DU_PACKET_PULSE_MS      70UL
+#define DU_DATA_GAP_TIMEOUT_MS 300UL
+
+static void BaoHieu_RX_Packet_DU()
+{
+    du_data_started = true;
+    du_last_data_ms = millis();
+    du_packet_pulse_until_ms = du_last_data_ms + DU_PACKET_PULSE_MS;
+}
+
+static void Reset_HMI_DU_ChoSessionMoi()
+{
+    du_hmi_can_nack = false;
+    du_auto_ack_request = false;
+    du_auto_ack_session = 0;
+    du_user_pending = false;
+    du_user_confirmed = false;
+    du_user_pending_code = 0;
+    du_user_pending_session = 0;
+    du_confirm_led_until_ms = 0;
+
+    du_session_led_active = true;
+    du_data_started = false;
+    du_last_data_ms = millis();
+    du_packet_pulse_until_ms = 0;
+}
+
+static void CapNhat_LED_DU()
+{
+    uint32_t now = millis();
+
+    // Uu tien cao nhat: response dang cho SU confirm.
+    if (du_user_pending && !du_user_confirmed)
+    {
+        bool sang = (((now / 220UL) % 2UL) == 0);
+        digitalWrite(CHAN_LED_STATUS, sang ? HIGH : LOW);
+        return;
+    }
+
+    // SU da confirm ACK/NACK -> sang 2 giay roi tat.
+    if (du_user_confirmed)
+    {
+        if ((int32_t)(du_confirm_led_until_ms - now) > 0)
+        {
+            digitalWrite(CHAN_LED_STATUS, HIGH);
+            return;
+        }
+
+        du_user_confirmed = false;
+        du_user_pending_code = 0;
+        du_user_pending_session = 0;
+    }
+
+    if (du_session_led_active)
+    {
+        // Da nhan SESSION_START nhung chua co DATA -> sang dung.
+        if (!du_data_started)
+        {
+            digitalWrite(CHAN_LED_STATUS, HIGH);
+            return;
+        }
+
+        // DATA da tung toi, nhung bi ngung qua timeout -> sang dung.
+        if (now - du_last_data_ms >= DU_DATA_GAP_TIMEOUT_MS)
+        {
+            digitalWrite(CHAN_LED_STATUS, HIGH);
+            return;
+        }
+
+        // DATA dang toi -> chop theo packet that.
+        bool pulse = ((int32_t)(du_packet_pulse_until_ms - now) > 0);
+        digitalWrite(CHAN_LED_STATUS, pulse ? HIGH : LOW);
+        return;
+    }
+
+    digitalWrite(CHAN_LED_STATUS, LOW);
+}
+
 
 // =====================================================
 // PHIÊN BẢO MẬT HIỆN TẠI
@@ -99,6 +219,7 @@ bool da_co_seq = false;
 #define TYPE_SESSION_START  0x02
 #define TYPE_AUDIO_END      0x04
 #define TYPE_FEC            0x05
+#define TYPE_USER_CONFIRM_LOCAL 0x06
 
 #define TYPE_MASK           0x0F
 #define FLAG_LAST_AUDIO     0x10
@@ -469,6 +590,53 @@ void TacVu_LoRaRX(void *thamSo)
                 goi_tin[2]
                 & TYPE_MASK;
 
+            if (packet_type == TYPE_USER_CONFIRM_LOCAL)
+            {
+                if (do_dai != 12)
+                {
+                    Serial.println("[DU HMI DROP] USER_CONFIRM sai size");
+                    continue;
+                }
+
+                uint8_t code = goi_tin[3];
+                uint64_t sid =
+                    ((uint64_t)goi_tin[4] << 56) |
+                    ((uint64_t)goi_tin[5] << 48) |
+                    ((uint64_t)goi_tin[6] << 40) |
+                    ((uint64_t)goi_tin[7] << 32) |
+                    ((uint64_t)goi_tin[8] << 24) |
+                    ((uint64_t)goi_tin[9] << 16) |
+                    ((uint64_t)goi_tin[10] << 8) |
+                    ((uint64_t)goi_tin[11]);
+
+                if (
+                    du_user_pending
+                    && sid == du_user_pending_session
+                    && code == du_user_pending_code
+                )
+                {
+                    du_user_confirmed = true;
+                    du_user_pending = false;
+                    du_confirm_led_until_ms = millis() + 2000UL;
+                    du_hmi_can_nack = true;
+
+                    Serial.printf(
+                        "[DU HMI] SU CONFIRMED USER_%s | SESSION=%016llX\n",
+                        code == USER_RESPONSE_ACK ? "ACK" : "NACK",
+                        (unsigned long long)sid
+                    );
+                }
+                else
+                {
+                    Serial.printf(
+                        "[DU HMI DROP] USER_CONFIRM khong khop pending | SESSION=%016llX\n",
+                        (unsigned long long)sid
+                    );
+                }
+
+                continue;
+            }
+
             if (
                 packet_type
                 == TYPE_SESSION_START
@@ -602,6 +770,12 @@ void TacVu_LoRaRX(void *thamSo)
                 continue;
             }
 
+            // Chi VOICE/FEC moi lam LED chop theo DATA that.
+            if (packet_type == TYPE_VOICE || packet_type == TYPE_FEC)
+            {
+                BaoHieu_RX_Packet_DU();
+            }
+
             if (
                 xQueueSend(
                     HangDoi_GoiTinNhan,
@@ -675,6 +849,11 @@ void TacVu_GiaiMa(void *thamSo)
                     "[DU AUDIO] DA NHAN DU CAU -> BAT DAU PHAT"
                 );
 
+                // END da toi -> ket thuc trang thai RX session tren LED.
+                du_session_led_active = false;
+                du_data_started = false;
+                du_packet_pulse_until_ms = 0;
+
                 // Mo gate TRUOC khi ve OLED. Audio task o core0 co the
                 // bat dau ngay, OLED I2C o core1 khong chen them delay vao PLAY.
                 cho_phep_phat_audio =
@@ -740,11 +919,16 @@ void TacVu_GiaiMa(void *thamSo)
                     == session_id_hien_tai
             )
             {
+                du_session_led_active = true;
+
                 Serial.printf(
-                    "[DU] SESSION LAP LAI = %016llX\n",
+                    "[DU] SESSION LAP LAI = %016llX -> GUI LAI SESSION_READY\n",
                     (unsigned long long)session_moi
                 );
 
+                DuLieuGPS_DU gps_du = Lay_DuLieu_GPS_DU();
+                Gui_GPS_REPORT_DU(session_moi, gps_du);
+                Gui_SESSION_READY_RBS(session_moi);
                 continue;
             }
 
@@ -759,6 +943,8 @@ void TacVu_GiaiMa(void *thamSo)
 
             da_co_session =
                 true;
+
+            Reset_HMI_DU_ChoSessionMoi();
 
             cho_phep_phat_audio =
                 false;
@@ -782,6 +968,15 @@ void TacVu_GiaiMa(void *thamSo)
                 "[DU] NEW SESSION = %016llX\n",
                 (unsigned long long)session_id_hien_tai
             );
+
+            // GPS packet rieng: gui snapshot truoc READY de rBS thu duoc
+            // trong cua so bat tay. GPS khong gate session.
+            DuLieuGPS_DU gps_du = Lay_DuLieu_GPS_DU();
+            In_TrangThai_GPS_DU(gps_du);
+            Gui_GPS_REPORT_DU(session_id_hien_tai, gps_du);
+
+            // May DU tu dong xac nhan, nguoi dung KHONG can bam nut.
+            Gui_SESSION_READY_RBS(session_id_hien_tai);
 
             continue;
         }
@@ -1501,6 +1696,9 @@ void TacVu_PhatAmThanh(void *thamSo)
                     play_report_session_id =
                         session_id_hien_tai;
 
+                    du_last_played_session_id =
+                        session_id_hien_tai;
+
                     if (Task_PlayReport_Handle != nullptr)
                     {
                         xTaskNotifyGive(
@@ -1588,7 +1786,138 @@ void TacVu_PhatAmThanh(void *thamSo)
             Serial.println(
                 "[DU AUDIO] PHAT XONG -> CHO CAU TIEP"
             );
+
+            du_hmi_can_nack = (du_last_played_session_id != 0);
+
+            if (du_last_played_session_id != 0)
+            {
+                // ACK ky thuat tu dong: DU da nhan va PHAT XONG audio.
+                du_auto_ack_session = du_last_played_session_id;
+                du_auto_ack_request = true;
+
+                Serial.printf(
+                    "[DU HMI] AUTO_ACK REQUEST | SESSION=%016llX | GPIO6=NACK neu nghe khong ro\n",
+                    (unsigned long long)du_last_played_session_id
+                );
+            }
         }
+    }
+}
+
+
+// =====================================================
+// TASK HMI V5
+//
+// ACK: tu dong sau khi PLAY xong.
+// NACK: 1 nut GPIO6, nguoi dung bam neu nghe khong ro.
+// Ca ACK/NACK deu DU -> rBS -> SU, sau do SU USER_CONFIRM ve lai DU.
+// =====================================================
+void TacVu_HMI_NguoiDung(void *thamSo)
+{
+    bool nack_prev = HIGH;
+
+    while (1)
+    {
+        CapNhat_LED_DU();
+
+        uint8_t code_can_gui = 0;
+        uint64_t session_can_gui = 0;
+
+        // -------------------------------------------------
+        // AUTO ACK: chi tao mot transaction sau khi PLAY xong.
+        // -------------------------------------------------
+        if (
+            du_auto_ack_request
+            && !du_user_pending
+        )
+        {
+            code_can_gui = USER_RESPONSE_ACK;
+            session_can_gui = du_auto_ack_session;
+            du_auto_ack_request = false;
+        }
+
+        // -------------------------------------------------
+        // MANUAL NACK: nut duy nhat GPIO6.
+        // -------------------------------------------------
+        bool nack_now = digitalRead(CHAN_NUT_NACK);
+
+        if (
+            code_can_gui == 0
+            && du_hmi_can_nack
+            && !du_user_pending
+            && nack_prev == HIGH
+            && nack_now == LOW
+        )
+        {
+            vTaskDelay(pdMS_TO_TICKS(25));
+
+            if (digitalRead(CHAN_NUT_NACK) == LOW)
+            {
+                code_can_gui = USER_RESPONSE_NACK;
+                session_can_gui = du_last_played_session_id;
+            }
+        }
+
+        nack_prev = nack_now;
+
+        // -------------------------------------------------
+        // GUI RESPONSE + CHO SU CONFIRM, toi da 3 lan.
+        // -------------------------------------------------
+        if (code_can_gui != 0 && session_can_gui != 0)
+        {
+            du_user_pending = true;
+            du_user_confirmed = false;
+            du_confirm_led_until_ms = 0;
+            du_user_pending_code = code_can_gui;
+            du_user_pending_session = session_can_gui;
+
+            Serial.printf(
+                "[DU HMI] %s -> BAT DAU GUI | SESSION=%016llX\n",
+                code_can_gui == USER_RESPONSE_ACK ? "AUTO_ACK" : "USER_NACK",
+                (unsigned long long)session_can_gui
+            );
+
+            bool da_confirm = false;
+
+            for (uint8_t attempt = 0; attempt < 3 && !da_confirm; attempt++)
+            {
+                Gui_USER_RESPONSE_RBS(
+                    session_can_gui,
+                    code_can_gui
+                );
+
+                uint32_t t0 = millis();
+
+                while (millis() - t0 < 350UL)
+                {
+                    CapNhat_LED_DU();
+
+                    if (du_user_confirmed)
+                    {
+                        da_confirm = true;
+                        break;
+                    }
+
+                    vTaskDelay(pdMS_TO_TICKS(10));
+                }
+            }
+
+            if (!da_confirm)
+            {
+                Serial.printf(
+                    "[DU HMI] %s TIMEOUT -> CHUA CO CONFIRM TU SU\n",
+                    code_can_gui == USER_RESPONSE_ACK ? "AUTO_ACK" : "USER_NACK"
+                );
+
+                du_user_pending = false;
+                du_user_confirmed = false;
+                du_user_pending_code = 0;
+                du_user_pending_session = 0;
+                du_confirm_led_until_ms = 0;
+            }
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
 
@@ -1600,6 +1929,13 @@ void TacVu_PhatAmThanh(void *thamSo)
 void setup()
 {
     Serial.begin(115200);
+
+    // GPS NEO-6M doc lien tuc tren task rieng, khong block LoRa/audio.
+    KhoiTao_GPS_DU();
+
+    pinMode(CHAN_NUT_NACK, INPUT_PULLUP);
+    pinMode(CHAN_LED_STATUS, OUTPUT);
+    digitalWrite(CHAN_LED_STATUS, LOW);
 
     Reset_ThongKe_OLED_DU();
 
@@ -1832,6 +2168,21 @@ void setup()
             delay(1000);
         }
     }
+
+
+    // =================================================
+    // TASK HMI AUTO-ACK + MANUAL NACK
+    // =================================================
+
+    xTaskCreatePinnedToCore(
+        TacVu_HMI_NguoiDung,
+        "HMI_USER",
+        4096,
+        NULL,
+        2,
+        NULL,
+        1
+    );
 
 
     // =================================================

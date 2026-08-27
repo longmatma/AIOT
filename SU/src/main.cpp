@@ -8,6 +8,7 @@
 #include "dong_goi.h"
 #include "phat_lora.h"
 #include "hien_thi.h"
+#include "gps_su.h"
 
 
 extern U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2;
@@ -17,7 +18,11 @@ extern U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2;
 // CẤU HÌNH
 // ========================================================
 
-#define CHAN_NUT_PTT 6
+#define CHAN_NUT_PTT      7
+
+// Chi dung 1 LED trang thai tai SU.
+// GPIO16 = LED duy nhat. GPIO21 khong dung trong ban V5.
+#define CHAN_LED_STATUS  16
 
 #define MAX_KHUNG_THOAI 3000
 
@@ -43,8 +48,13 @@ extern U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2;
 // CR LoRa vẫn = 4/5.
 // ========================================================
 
-#define READY_TIMEOUT_MS 350
-#define MAX_TX_RETRY        2
+#define READY_TIMEOUT_MS          350
+#define MAX_TX_RETRY                2
+
+// SESSION_START -> rBS -> DU -> SESSION_READY -> rBS -> SU.
+// SU cho rBS toi da ~900 ms de rBS tu retry SESSION_START toi DU 3 lan.
+#define SESSION_SETUP_TIMEOUT_MS   900
+#define SESSION_REQUEST_RETRY        2
 
 // ========================================================
 // CONTROL SU -> rBS
@@ -96,6 +106,100 @@ uint32_t thoi_diem_bat_dau_ghi_ms = 0;
 
 // Moc bat dau E2E = ngay khi loop phat hien PTT vua duoc nha.
 uint32_t e2e_ptt_release_ms = 0;
+
+// ========================================================
+// HMI 1 LED TAI SU
+//
+// OFF       : idle / dang ghi am.
+// ON lien tuc: dang cho SESSION_READY.
+// Chop theo packet: dang TX VOICE/FEC.
+// 3 chop cham: SESSION_SETUP FAIL.
+// ON 2 giay : DU da AUTO-ACK sau khi phat xong.
+// NACK      : lap vo han "nhay nhanh -> nhay cham -> nhay nhanh..."
+//             cho toi khi bat dau cau PTT moi.
+// ========================================================
+uint64_t su_last_session_id = 0;
+uint8_t su_user_feedback = 0;
+uint32_t su_ack_led_until_ms = 0;
+
+static void Dat_LED_SU(bool sang)
+{
+    digitalWrite(CHAN_LED_STATUS, sang ? HIGH : LOW);
+}
+
+static void Dat_PhanHoi_SU(uint8_t code)
+{
+    su_user_feedback = code;
+
+    if (code == USER_RESPONSE_ACK)
+    {
+        su_ack_led_until_ms = millis() + 2000UL;
+        Dat_LED_SU(true);
+    }
+    else if (code == USER_RESPONSE_NACK)
+    {
+        su_ack_led_until_ms = 0;
+    }
+    else
+    {
+        su_ack_led_until_ms = 0;
+        Dat_LED_SU(false);
+    }
+}
+
+static void Bao_Loi_Session_SU()
+{
+    // 3 chop cham, de nhin khac ro voi chop packet.
+    for (uint8_t i = 0; i < 3; i++)
+    {
+        Dat_LED_SU(true);
+        delay(320);
+        Dat_LED_SU(false);
+        delay(320);
+    }
+}
+
+static void CapNhat_LED_PhanHoi_SU()
+{
+    if (su_user_feedback == USER_RESPONSE_ACK)
+    {
+        if ((int32_t)(su_ack_led_until_ms - millis()) > 0)
+        {
+            Dat_LED_SU(true);
+        }
+        else
+        {
+            su_user_feedback = 0;
+            su_ack_led_until_ms = 0;
+            Dat_LED_SU(false);
+        }
+        return;
+    }
+
+    if (su_user_feedback == USER_RESPONSE_NACK)
+    {
+        // Chu ky 2.4 s:
+        //   0..0.8 s  : nhay nhanh, doi trang thai moi 100 ms.
+        //   0.8..2.4 s: nhay cham, doi trang thai moi 400 ms.
+        // Sau do lap lai -> FAST / SLOW / FAST / SLOW...
+        uint32_t pha = millis() % 2400UL;
+        bool sang;
+
+        if (pha < 800UL)
+        {
+            sang = ((pha / 100UL) % 2UL) == 0;
+        }
+        else
+        {
+            sang = (((pha - 800UL) / 400UL) % 2UL) == 0;
+        }
+
+        Dat_LED_SU(sang);
+        return;
+    }
+
+    Dat_LED_SU(false);
+}
 
 
 // ========================================================
@@ -174,10 +278,13 @@ static bool Gui_Packet_Co_ACK(
             );
         }
 
+        // LED duy nhat chop theo moi lan TX DATA that.
+        Dat_LED_SU(true);
         Phat_GoiTin_LoRa(
             packet,
             packet_len
         );
+        Dat_LED_SU(false);
 
         if (
             Cho_READY_RBS(
@@ -215,11 +322,17 @@ void setup()
         115200
     );
 
+    // GPS NEO-6M doc lien tuc trong task rieng, khong block audio/PTT.
+    KhoiTao_GPS_SU();
+
 
     pinMode(
         CHAN_NUT_PTT,
         INPUT_PULLUP
     );
+
+    pinMode(CHAN_LED_STATUS, OUTPUT);
+    Dat_LED_SU(false);
 
 
     // ====================================================
@@ -347,6 +460,12 @@ void loop()
     {
         trang_thai =
             DANG_GHI_AM;
+
+        // Cau moi -> xoa ACK/NACK cua cau truoc.
+        su_user_feedback = 0;
+        su_ack_led_until_ms = 0;
+        su_last_session_id = 0;
+        Dat_LED_SU(false);
 
 
         tong_so_khung_da_ghi =
@@ -575,11 +694,19 @@ void loop()
 
 
         // =================================================
-        // SESSION MỚI + SESSION_START x2
+        // SESSION SETUP
+        //
+        // Nhả PTT -> SU gui SESSION_START.
+        // rBS tu relay SESSION_START toi DU toi da 3 lan.
+        // DU nhan duoc -> tu dong gui SESSION_READY.
+        // rBS forward SESSION_READY ve SU.
+        // CHI KHI READY thanh cong SU moi gui VOICE/FEC.
         // =================================================
 
         uint64_t session_id_tx =
             Tao_Session_Moi();
+
+        su_last_session_id = session_id_tx;
 
         uint8_t goi_session[12];
 
@@ -587,21 +714,81 @@ void loop()
             goi_session
         );
 
+        bool session_ready = false;
+        bool session_fail_remote = false;
+
+        // LED sang dung = dang cho handshake SESSION_READY.
+        Dat_LED_SU(true);
+
         for (
-            int lan = 0;
-            lan < 2;
+            uint8_t lan = 0;
+            lan <= SESSION_REQUEST_RETRY;
             lan++
         )
         {
-            Phat_GoiTin_LoRa(
-                goi_session,
-                12
+            Serial.printf(
+                "[SU SESSION] REQUEST %u/%u | SESSION=%016llX\n",
+                (unsigned int)(lan + 1),
+                (unsigned int)(SESSION_REQUEST_RETRY + 1),
+                (unsigned long long)session_id_tx
             );
 
-            if (lan == 0)
+            Phat_GoiTin_LoRa(
+                goi_session,
+                sizeof(goi_session)
+            );
+
+            session_fail_remote = false;
+
+            if (
+                Cho_SESSION_READY_RBS(
+                    SESSION_SETUP_TIMEOUT_MS,
+                    session_id_tx,
+                    session_fail_remote
+                )
+            )
             {
-                delay(5);
+                session_ready = true;
+                break;
             }
+
+            if (session_fail_remote)
+            {
+                break;
+            }
+        }
+
+        Dat_LED_SU(false);
+
+        if (!session_ready)
+        {
+            gui_that_bai = true;
+
+            Serial.printf(
+                "[SU SESSION FAIL] KHONG THIET LAP DUOC SESSION=%016llX\n",
+                (unsigned long long)session_id_tx
+            );
+
+            Bao_Loi_Session_SU();
+        }
+        else
+        {
+            Serial.printf(
+                "[SU SESSION READY] DU DA SAN SANG | SESSION=%016llX\n",
+                (unsigned long long)session_id_tx
+            );
+
+            // GPS la packet rieng, khong chen vao SESSION_START/VOICE.
+            // Gui snapshot moi nhat NGAY SAU READY, truoc VOICE.
+            DuLieuGPS_SU gps_su = Lay_DuLieu_GPS_SU();
+            In_TrangThai_GPS_SU(gps_su);
+
+            Dat_LED_SU(true);
+            Gui_GPS_REPORT_SU(session_id_tx, gps_su);
+            Dat_LED_SU(false);
+
+            // Cho rBS doc GPS_REPORT + re-arm RX truoc VOICE dau tien.
+            delay(8);
         }
 
 
@@ -611,7 +798,7 @@ void loop()
 
         for (
             uint32_t i = 0;
-            i < tong_so_khung_da_ghi;
+            i < tong_so_khung_da_ghi && !gui_that_bai;
             i += MAX_FRAME_PER_PACKET
         )
         {
@@ -844,10 +1031,12 @@ void loop()
                 0x00
             };
 
+            Dat_LED_SU(true);
             Phat_GoiTin_LoRa(
                 goi_audio_end,
                 sizeof(goi_audio_end)
             );
+            Dat_LED_SU(false);
 
             Serial.println(
                 "[SU CTRL] AUDIO_END 5B -> rBS"
@@ -917,6 +1106,8 @@ void loop()
             e2e_hop_le,
             e2e_est_ms
         );
+
+        Bat_CheDo_RX_LoRa();
     }
 
 
@@ -930,8 +1121,18 @@ void loop()
         trang_thai == NGHI_NGOI
     )
     {
-        delay(
-            10
-        );
+        CapNhat_LED_PhanHoi_SU();
+
+        if (su_last_session_id != 0)
+        {
+            uint8_t response_code = 0;
+            if (KiemTra_USER_RESPONSE_RBS(su_last_session_id, response_code))
+            {
+                Dat_PhanHoi_SU(response_code);
+                Gui_USER_CONFIRM_RBS(su_last_session_id, response_code);
+            }
+        }
+
+        delay(5);
     }
 }

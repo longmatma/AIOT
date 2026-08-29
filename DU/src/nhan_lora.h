@@ -36,11 +36,18 @@ bool Gui_USER_RESPONSE_RBS(
 
 // GPS REPORT DU -> rBS, 44B packet rieng.
 #define TYPE_GPS_REPORT 0x17
+#define TYPE_VI_TRI_DINH_KY 0x18
 #define SIZE_GPS_REPORT 44
+#define CONG_SUAT_PHAT_DU_DBM 17
 
 bool Gui_GPS_REPORT_DU(
-    uint64_t session_id,
-    const DuLieuGPS_DU &gps
+    uint64_t ma_phien,
+    const DuLieuGPS_DU &du_lieu_gps
+);
+
+bool Gui_VI_TRI_DINH_KY_DU(
+    uint64_t so_thu_tu_bao_cao,
+    const DuLieuGPS_DU &du_lieu_gps
 );
 
 #endif

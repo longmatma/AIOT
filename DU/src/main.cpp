@@ -12,6 +12,7 @@
 #include "man_hinh.h"
 #include "ma_hoa.h"
 #include "gps_du.h"
+#include "hmi_du.h"
 
 
 // =====================================================
@@ -20,12 +21,6 @@
 
 #define CHAN_AUDIO_OUT      1
 
-// HMI V5: chi 1 nut + 1 LED.
-// GPIO6  = NACK thu cong (nguoi nghe bao "khong ro").
-// GPIO16 = LED trang thai duy nhat.
-// GPIO7 va GPIO21 khong dung trong ban nay.
-#define CHAN_NUT_NACK       6
-#define CHAN_LED_STATUS    16
 #define PWM_CHANNEL         0
 
 // Tần số lấy mẫu âm thanh
@@ -35,6 +30,16 @@
 #define PWM_CARRIER_FREQ    100000
 
 #define PWM_RESOLUTION      8
+
+
+// =====================================================
+// BAO CAO VI TRI DINH KY DU -> rBS
+// DU khoi dong lech SU 2.5 giay de giam kha nang hai beacon trung nhau.
+// =====================================================
+#define CHU_KY_BAO_CAO_VI_TRI_DU_MS 5000UL
+#define TRE_BAO_CAO_VI_TRI_DU_LUC_KHOI_DONG_MS 3500UL
+
+volatile uint64_t so_thu_tu_bao_cao_vi_tri_du = 0;
 
 
 // =====================================================
@@ -81,112 +86,9 @@ volatile uint64_t play_report_session_id = 0;
 volatile uint64_t du_last_played_session_id = 0;
 
 // =====================================================
-// HMI V5 - 1 LED + 1 NUT
-//
-// LED DU:
-//   OFF       = khong co session.
-//   ON lien tuc= da co SESSION_START, dang cho DATA; hoac session
-//               dang active nhung DATA bi ngung > timeout.
-//   Chop packet= VOICE/FEC dang toi that.
-//   Nhay cham  = dang gui AUTO-ACK/NACK va cho SU confirm.
-//   ON 2 giay  = SU da confirm response.
-//
-// ACK = TU DONG sau khi DU phat het audio.
-// NACK = nut GPIO6, nguoi nghe bam khi "khong ro".
+// HMI DU DA TACH SANG hmi_du.cpp / hmi_du.h
+// main.cpp khong con quan ly GPIO nut/LED hay transaction ACK/NACK.
 // =====================================================
-volatile bool du_hmi_can_nack = false;
-volatile bool du_auto_ack_request = false;
-volatile uint64_t du_auto_ack_session = 0;
-
-volatile bool du_user_pending = false;
-volatile bool du_user_confirmed = false;
-volatile uint8_t du_user_pending_code = 0;
-volatile uint64_t du_user_pending_session = 0;
-volatile uint32_t du_confirm_led_until_ms = 0;
-
-// LED session/data.
-volatile bool du_session_led_active = false;
-volatile bool du_data_started = false;
-volatile uint32_t du_last_data_ms = 0;
-volatile uint32_t du_packet_pulse_until_ms = 0;
-
-#define DU_PACKET_PULSE_MS      70UL
-#define DU_DATA_GAP_TIMEOUT_MS 300UL
-
-static void BaoHieu_RX_Packet_DU()
-{
-    du_data_started = true;
-    du_last_data_ms = millis();
-    du_packet_pulse_until_ms = du_last_data_ms + DU_PACKET_PULSE_MS;
-}
-
-static void Reset_HMI_DU_ChoSessionMoi()
-{
-    du_hmi_can_nack = false;
-    du_auto_ack_request = false;
-    du_auto_ack_session = 0;
-    du_user_pending = false;
-    du_user_confirmed = false;
-    du_user_pending_code = 0;
-    du_user_pending_session = 0;
-    du_confirm_led_until_ms = 0;
-
-    du_session_led_active = true;
-    du_data_started = false;
-    du_last_data_ms = millis();
-    du_packet_pulse_until_ms = 0;
-}
-
-static void CapNhat_LED_DU()
-{
-    uint32_t now = millis();
-
-    // Uu tien cao nhat: response dang cho SU confirm.
-    if (du_user_pending && !du_user_confirmed)
-    {
-        bool sang = (((now / 220UL) % 2UL) == 0);
-        digitalWrite(CHAN_LED_STATUS, sang ? HIGH : LOW);
-        return;
-    }
-
-    // SU da confirm ACK/NACK -> sang 2 giay roi tat.
-    if (du_user_confirmed)
-    {
-        if ((int32_t)(du_confirm_led_until_ms - now) > 0)
-        {
-            digitalWrite(CHAN_LED_STATUS, HIGH);
-            return;
-        }
-
-        du_user_confirmed = false;
-        du_user_pending_code = 0;
-        du_user_pending_session = 0;
-    }
-
-    if (du_session_led_active)
-    {
-        // Da nhan SESSION_START nhung chua co DATA -> sang dung.
-        if (!du_data_started)
-        {
-            digitalWrite(CHAN_LED_STATUS, HIGH);
-            return;
-        }
-
-        // DATA da tung toi, nhung bi ngung qua timeout -> sang dung.
-        if (now - du_last_data_ms >= DU_DATA_GAP_TIMEOUT_MS)
-        {
-            digitalWrite(CHAN_LED_STATUS, HIGH);
-            return;
-        }
-
-        // DATA dang toi -> chop theo packet that.
-        bool pulse = ((int32_t)(du_packet_pulse_until_ms - now) > 0);
-        digitalWrite(CHAN_LED_STATUS, pulse ? HIGH : LOW);
-        return;
-    }
-
-    digitalWrite(CHAN_LED_STATUS, LOW);
-}
 
 
 // =====================================================
@@ -586,6 +488,10 @@ void TacVu_LoRaRX(void *thamSo)
             )
         )
         {
+            // V10: khoa beacon ngay tai RX task, truoc khi packet vao queue.
+            // Tranh khe race: packet da nhan xong nhung decoder chua kip dat session active.
+            HMI_DU_TamDung_Beacon(1200UL);
+
             uint8_t packet_type =
                 goi_tin[2]
                 & TYPE_MASK;
@@ -609,31 +515,7 @@ void TacVu_LoRaRX(void *thamSo)
                     ((uint64_t)goi_tin[10] << 8) |
                     ((uint64_t)goi_tin[11]);
 
-                if (
-                    du_user_pending
-                    && sid == du_user_pending_session
-                    && code == du_user_pending_code
-                )
-                {
-                    du_user_confirmed = true;
-                    du_user_pending = false;
-                    du_confirm_led_until_ms = millis() + 2000UL;
-                    du_hmi_can_nack = true;
-
-                    Serial.printf(
-                        "[DU HMI] SU CONFIRMED USER_%s | SESSION=%016llX\n",
-                        code == USER_RESPONSE_ACK ? "ACK" : "NACK",
-                        (unsigned long long)sid
-                    );
-                }
-                else
-                {
-                    Serial.printf(
-                        "[DU HMI DROP] USER_CONFIRM khong khop pending | SESSION=%016llX\n",
-                        (unsigned long long)sid
-                    );
-                }
-
+                HMI_DU_XuLy_User_Confirm(sid, code);
                 continue;
             }
 
@@ -773,7 +655,7 @@ void TacVu_LoRaRX(void *thamSo)
             // Chi VOICE/FEC moi lam LED chop theo DATA that.
             if (packet_type == TYPE_VOICE || packet_type == TYPE_FEC)
             {
-                BaoHieu_RX_Packet_DU();
+                HMI_DU_Bao_Nhan_Data();
             }
 
             if (
@@ -849,10 +731,8 @@ void TacVu_GiaiMa(void *thamSo)
                     "[DU AUDIO] DA NHAN DU CAU -> BAT DAU PHAT"
                 );
 
-                // END da toi -> ket thuc trang thai RX session tren LED.
-                du_session_led_active = false;
-                du_data_started = false;
-                du_packet_pulse_until_ms = 0;
+                // END da toi -> module HMI ket thuc trang thai RX session.
+                HMI_DU_Bao_END_Audio();
 
                 // Mo gate TRUOC khi ve OLED. Audio task o core0 co the
                 // bat dau ngay, OLED I2C o core1 khong chen them delay vao PLAY.
@@ -919,15 +799,15 @@ void TacVu_GiaiMa(void *thamSo)
                     == session_id_hien_tai
             )
             {
-                du_session_led_active = true;
+                HMI_DU_TamDung_Beacon(1500UL);
 
                 Serial.printf(
                     "[DU] SESSION LAP LAI = %016llX -> GUI LAI SESSION_READY\n",
                     (unsigned long long)session_moi
                 );
 
-                DuLieuGPS_DU gps_du = Lay_DuLieu_GPS_DU();
-                Gui_GPS_REPORT_DU(session_moi, gps_du);
+                DuLieuGPS_DU du_lieu_gps_du = Lay_DuLieu_GPS_DU();
+                Gui_GPS_REPORT_DU(session_moi, du_lieu_gps_du);
                 Gui_SESSION_READY_RBS(session_moi);
                 continue;
             }
@@ -944,7 +824,7 @@ void TacVu_GiaiMa(void *thamSo)
             da_co_session =
                 true;
 
-            Reset_HMI_DU_ChoSessionMoi();
+            HMI_DU_Reset_Cho_Session_Moi();
 
             cho_phep_phat_audio =
                 false;
@@ -971,9 +851,9 @@ void TacVu_GiaiMa(void *thamSo)
 
             // GPS packet rieng: gui snapshot truoc READY de rBS thu duoc
             // trong cua so bat tay. GPS khong gate session.
-            DuLieuGPS_DU gps_du = Lay_DuLieu_GPS_DU();
-            In_TrangThai_GPS_DU(gps_du);
-            Gui_GPS_REPORT_DU(session_id_hien_tai, gps_du);
+            DuLieuGPS_DU du_lieu_gps_du = Lay_DuLieu_GPS_DU();
+            In_TrangThai_GPS_DU(du_lieu_gps_du);
+            Gui_GPS_REPORT_DU(session_id_hien_tai, du_lieu_gps_du);
 
             // May DU tu dong xac nhan, nguoi dung KHONG can bam nut.
             Gui_SESSION_READY_RBS(session_id_hien_tai);
@@ -1787,137 +1667,61 @@ void TacVu_PhatAmThanh(void *thamSo)
                 "[DU AUDIO] PHAT XONG -> CHO CAU TIEP"
             );
 
-            du_hmi_can_nack = (du_last_played_session_id != 0);
-
-            if (du_last_played_session_id != 0)
-            {
-                // ACK ky thuat tu dong: DU da nhan va PHAT XONG audio.
-                du_auto_ack_session = du_last_played_session_id;
-                du_auto_ack_request = true;
-
-                Serial.printf(
-                    "[DU HMI] AUTO_ACK REQUEST | SESSION=%016llX | GPIO6=NACK neu nghe khong ro\n",
-                    (unsigned long long)du_last_played_session_id
-                );
-            }
+            // HMI module tu tao AUTO_ACK va mo quyen NACK cho session vua phat xong.
+            HMI_DU_Bao_Phat_Xong(du_last_played_session_id);
         }
     }
 }
 
 
 // =====================================================
-// TASK HMI V5
-//
-// ACK: tu dong sau khi PLAY xong.
-// NACK: 1 nut GPIO6, nguoi dung bam neu nghe khong ro.
-// Ca ACK/NACK deu DU -> rBS -> SU, sau do SU USER_CONFIRM ve lai DU.
+// TASK BAO CAO VI TRI DINH KY DU -> rBS
+// - Chi gui khi session/data/audio/HMI khong ban radio.
+// - Gui best-effort, khong ACK.
+// - Ham TX con kiem tra DIO0 + LoRa mutex de khong giat radio khoi RX.
 // =====================================================
-void TacVu_HMI_NguoiDung(void *thamSo)
+void TacVu_BaoCao_ViTri_DinhKy_DU(void *tham_so)
 {
-    bool nack_prev = HIGH;
+    (void)tham_so;
+
+    vTaskDelay(pdMS_TO_TICKS(TRE_BAO_CAO_VI_TRI_DU_LUC_KHOI_DONG_MS));
+
+    uint32_t moc_gui_tiep_theo_ms = millis();
 
     while (1)
     {
-        CapNhat_LED_DU();
+        uint32_t bay_gio_ms = millis();
 
-        uint8_t code_can_gui = 0;
-        uint64_t session_can_gui = 0;
+        bool radio_dang_ban =
+            HMI_DU_Radio_Dang_Ban()
+            || cho_phep_phat_audio;
 
-        // -------------------------------------------------
-        // AUTO ACK: chi tao mot transaction sau khi PLAY xong.
-        // -------------------------------------------------
-        if (
-            du_auto_ack_request
-            && !du_user_pending
-        )
+        if (!radio_dang_ban &&
+            (int32_t)(bay_gio_ms - moc_gui_tiep_theo_ms) >= 0)
         {
-            code_can_gui = USER_RESPONSE_ACK;
-            session_can_gui = du_auto_ack_session;
-            du_auto_ack_request = false;
-        }
+            DuLieuGPS_DU du_lieu_gps_du = Lay_DuLieu_GPS_DU();
+            In_TrangThai_GPS_DU(du_lieu_gps_du);
 
-        // -------------------------------------------------
-        // MANUAL NACK: nut duy nhat GPIO6.
-        // -------------------------------------------------
-        bool nack_now = digitalRead(CHAN_NUT_NACK);
+            // V10: chi tang STT SAU KHI TX thanh cong.
+            // Beacon bi hoan do radio ban se thu lai cung STT, khong tao
+            // "lo hong STT" gia lam rBS hieu nham la mat packet tren khong trung.
+            uint64_t stt_du_kien = so_thu_tu_bao_cao_vi_tri_du + 1;
+            if (stt_du_kien == 0)
+                stt_du_kien = 1;
 
-        if (
-            code_can_gui == 0
-            && du_hmi_can_nack
-            && !du_user_pending
-            && nack_prev == HIGH
-            && nack_now == LOW
-        )
-        {
-            vTaskDelay(pdMS_TO_TICKS(25));
-
-            if (digitalRead(CHAN_NUT_NACK) == LOW)
-            {
-                code_can_gui = USER_RESPONSE_NACK;
-                session_can_gui = du_last_played_session_id;
-            }
-        }
-
-        nack_prev = nack_now;
-
-        // -------------------------------------------------
-        // GUI RESPONSE + CHO SU CONFIRM, toi da 3 lan.
-        // -------------------------------------------------
-        if (code_can_gui != 0 && session_can_gui != 0)
-        {
-            du_user_pending = true;
-            du_user_confirmed = false;
-            du_confirm_led_until_ms = 0;
-            du_user_pending_code = code_can_gui;
-            du_user_pending_session = session_can_gui;
-
-            Serial.printf(
-                "[DU HMI] %s -> BAT DAU GUI | SESSION=%016llX\n",
-                code_can_gui == USER_RESPONSE_ACK ? "AUTO_ACK" : "USER_NACK",
-                (unsigned long long)session_can_gui
+            bool gui_thanh_cong = Gui_VI_TRI_DINH_KY_DU(
+                stt_du_kien,
+                du_lieu_gps_du
             );
 
-            bool da_confirm = false;
+            if (gui_thanh_cong)
+                so_thu_tu_bao_cao_vi_tri_du = stt_du_kien;
 
-            for (uint8_t attempt = 0; attempt < 3 && !da_confirm; attempt++)
-            {
-                Gui_USER_RESPONSE_RBS(
-                    session_can_gui,
-                    code_can_gui
-                );
-
-                uint32_t t0 = millis();
-
-                while (millis() - t0 < 350UL)
-                {
-                    CapNhat_LED_DU();
-
-                    if (du_user_confirmed)
-                    {
-                        da_confirm = true;
-                        break;
-                    }
-
-                    vTaskDelay(pdMS_TO_TICKS(10));
-                }
-            }
-
-            if (!da_confirm)
-            {
-                Serial.printf(
-                    "[DU HMI] %s TIMEOUT -> CHUA CO CONFIRM TU SU\n",
-                    code_can_gui == USER_RESPONSE_ACK ? "AUTO_ACK" : "USER_NACK"
-                );
-
-                du_user_pending = false;
-                du_user_confirmed = false;
-                du_user_pending_code = 0;
-                du_user_pending_session = 0;
-                du_confirm_led_until_ms = 0;
-            }
+            moc_gui_tiep_theo_ms = bay_gio_ms +
+                (gui_thanh_cong ? CHU_KY_BAO_CAO_VI_TRI_DU_MS : 250UL);
         }
 
-        vTaskDelay(pdMS_TO_TICKS(10));
+        vTaskDelay(pdMS_TO_TICKS(50));
     }
 }
 
@@ -1932,10 +1736,6 @@ void setup()
 
     // GPS NEO-6M doc lien tuc tren task rieng, khong block LoRa/audio.
     KhoiTao_GPS_DU();
-
-    pinMode(CHAN_NUT_NACK, INPUT_PULLUP);
-    pinMode(CHAN_LED_STATUS, OUTPUT);
-    digitalWrite(CHAN_LED_STATUS, LOW);
 
     Reset_ThongKe_OLED_DU();
 
@@ -1958,6 +1758,8 @@ void setup()
 
     KhoiTao_LoRa_RX();
 
+    // Nut NACK + LED va task HMI nam hoan toan trong module rieng.
+    KhoiTao_HMI_DU();
 
     // =================================================
     // SPEEX
@@ -2171,21 +1973,6 @@ void setup()
 
 
     // =================================================
-    // TASK HMI AUTO-ACK + MANUAL NACK
-    // =================================================
-
-    xTaskCreatePinnedToCore(
-        TacVu_HMI_NguoiDung,
-        "HMI_USER",
-        4096,
-        NULL,
-        2,
-        NULL,
-        1
-    );
-
-
-    // =================================================
     // TASK PLAY REPORT
     // =================================================
 
@@ -2242,6 +2029,19 @@ void setup()
         2,
         NULL,
         1
+    );
+
+
+    // GPS beacon khoi tao SAU CUNG.
+    // Luc nay queue/audio/RX/decode/HMI deu da san sang; telemetry chi la best-effort.
+    xTaskCreatePinnedToCore(
+        TacVu_BaoCao_ViTri_DinhKy_DU,
+        "GPS_DINH_KY",
+        4096,
+        NULL,
+        1,
+        NULL,
+        0
     );
 
 

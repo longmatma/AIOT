@@ -5,6 +5,7 @@
 #include <SPI.h>
 #include <LoRa.h>
 #include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 #include <freertos/semphr.h>
 
 
@@ -119,6 +120,9 @@ void KhoiTao_LoRa_RX()
     LoRa.setCodingRate4(5);
     LoRa.enableCrc();
 
+    // Dat ro cong suat de rBS tinh he so kenh tu RSSI.
+    LoRa.setTxPower(CONG_SUAT_PHAT_DU_DBM);
+
     pinMode(
         LORA_DIO0,
         INPUT
@@ -206,7 +210,12 @@ bool Nhan_GoiTin_LoRa(
         LoRa.read();
     }
 
-    // Re-arm RX continuous NGAY sau khi doc packet.
+    // Luu RSSI/SNR cua packet vua nhan TRUOC khi re-arm RX.
+    // Day la thong tin quan trong de tach loi rBS->DU khoi loi DU->rBS.
+    int rssi_packet_dbm = LoRa.packetRssi();
+    float snr_packet_db = LoRa.packetSnr();
+
+    // GIU FIX IDLE: quay lai RX continuous ngay sau khi doc packet.
     LoRa.receive();
 
     if (
@@ -241,6 +250,13 @@ bool Nhan_GoiTin_LoRa(
             buffer[3] = code;
             memcpy(&buffer[4], &raw_packet[4], 8);
             do_dai_nhan = 12;
+
+            Serial.printf(
+                "[DU PHY RX] USER_CONFIRM rBS->DU | LEN=12 | RSSI=%d dBm | SNR=%.1f dB\n",
+                rssi_packet_dbm,
+                snr_packet_db
+            );
+
             xSemaphoreGive(LoRa_Mutex);
             return true;
         }
@@ -249,7 +265,9 @@ bool Nhan_GoiTin_LoRa(
         return false;
     }
 
-    // Bo packet SU truc tiep; DU chi nhan DATA qua rBS.
+    // QUAN TRONG: bo packet SU truc tiep.
+    // Kien truc he thong la SU -> rBS -> DU, KHONG phai SU -> DU truc tiep.
+    // Vi vay viec DU khong xu ly packet raw cua SU la CHU DICH, khong phai loi.
     if (
         packetSize == SIZE_SESSION_INNER
         || packetSize == SIZE_VOICE_INNER
@@ -284,6 +302,13 @@ bool Nhan_GoiTin_LoRa(
             buffer[3] = 0;
 
             do_dai_nhan = 4;
+
+            Serial.printf(
+                "[DU PHY RX] END rBS->DU | LEN=%d | RSSI=%d dBm | SNR=%.1f dB\n",
+                packetSize,
+                rssi_packet_dbm,
+                snr_packet_db
+            );
 
             xSemaphoreGive(
                 LoRa_Mutex
@@ -384,6 +409,15 @@ bool Nhan_GoiTin_LoRa(
 
     do_dai_nhan =
         inner_len;
+
+    uint8_t loai_inner = inner[2] & 0x0F;
+    Serial.printf(
+        "[DU PHY RX] RELAY rBS->DU | INNER_TYPE=0x%02X | LEN=%d | RSSI=%d dBm | SNR=%.1f dB\n",
+        loai_inner,
+        packetSize,
+        rssi_packet_dbm,
+        snr_packet_db
+    );
 
     xSemaphoreGive(
         LoRa_Mutex
@@ -599,94 +633,167 @@ bool Gui_USER_RESPONSE_RBS(
 
 
 // =====================================================
-// GPS REPORT DU -> rBS, 44B. Dung cung LoRa_Mutex voi RX/PLAY_REPORT.
-// DU gui GPS snapshot truoc SESSION_READY de rBS co the thu no ngay
-// trong cua so bat tay, nhung GPS KHONG quyet dinh session thanh/bai.
+// KIEM TRA KENH IM LANG TRUOC BEACON DINH KY
+//
+// Beacon la telemetry best-effort, nen KHONG duoc tranh quyen voi RX.
+// DIO0 chi len HIGH khi RxDone; vi vay V10 cho them mot khoang nghe ngan
+// truoc khi chuyen radio sang TX. SESSION_START 16B co airtime ngan hon
+// khoang guard nay o SF7/BW500, nen neu rBS dang gui START thi DU co co hoi
+// nhan xong va DIO0 len HIGH -> beacon se tu hoan.
 // =====================================================
-static void DU_Ghi_U32_BE(uint8_t *p, uint32_t v)
+static bool DU_Kenh_Im_Lang_Cho_Beacon(uint32_t guard_ms)
 {
-    p[0] = (v >> 24) & 0xFF;
-    p[1] = (v >> 16) & 0xFF;
-    p[2] = (v >> 8) & 0xFF;
-    p[3] = v & 0xFF;
-}
+    uint32_t bat_dau = millis();
 
-static void DU_Ghi_U64_BE(uint8_t *p, uint64_t v)
-{
-    for (int i = 0; i < 8; ++i)
-        p[i] = (uint8_t)((v >> (56 - 8 * i)) & 0xFF);
-}
-
-bool Gui_GPS_REPORT_DU(
-    uint64_t session_id,
-    const DuLieuGPS_DU &gps)
-{
-    if (session_id == 0 || LoRa_Mutex == nullptr) return false;
-
-    // rBS vua ket thuc TX SESSION_START; cho no quay lai RX.
-    delay(8);
-
-    if (xSemaphoreTake(LoRa_Mutex, pdMS_TO_TICKS(80)) != pdTRUE)
+    while (millis() - bat_dau < guard_ms)
     {
-        Serial.println("[DU GPS] Khong lay duoc LoRa mutex");
-        return false;
+        if (digitalRead(LORA_DIO0) == HIGH)
+            return false;
+
+        vTaskDelay(pdMS_TO_TICKS(1));
     }
 
-    uint8_t packet[SIZE_GPS_REPORT] = {};
-    packet[0] = ID_TRAM_RBS;
-    packet[1] = ID_TRAM_DU;
-    packet[2] = TYPE_GPS_REPORT;
+    return true;
+}
 
-    uint8_t flags = 0;
-    if (gps.gps_valid) flags |= 0x01;
-    if (gps.altitude_valid) flags |= 0x02;
-    if (gps.speed_valid) flags |= 0x04;
-    if (gps.hdop_valid) flags |= 0x08;
-    packet[3] = flags;
 
-    DU_Ghi_U64_BE(&packet[4], session_id);
+// =====================================================
+// BAO CAO GPS / VI TRI DU -> rBS, 44B
+// Dung chung LoRa_Mutex voi RX / PLAY_REPORT / HMI.
+// =====================================================
+static void DU_Ghi_U32_BE(uint8_t *con_tro, uint32_t gia_tri)
+{
+    con_tro[0] = (gia_tri >> 24) & 0xFF;
+    con_tro[1] = (gia_tri >> 16) & 0xFF;
+    con_tro[2] = (gia_tri >> 8) & 0xFF;
+    con_tro[3] = gia_tri & 0xFF;
+}
 
-    int32_t lat_e7 = gps.gps_valid ? (int32_t)llround(gps.latitude * 10000000.0) : 0;
-    int32_t lon_e7 = gps.gps_valid ? (int32_t)llround(gps.longitude * 10000000.0) : 0;
-    int32_t alt_cm = gps.altitude_valid ? (int32_t)llround(gps.altitude_m * 100.0) : 0;
-    uint32_t speed_cms = gps.speed_valid && gps.speed_mps > 0.0
-        ? (uint32_t)llround(gps.speed_mps * 100.0)
-        : 0;
-    uint16_t hdop_x100 = gps.hdop_valid && gps.hdop > 0.0
-        ? (uint16_t)min(65535L, (long)llround(gps.hdop * 100.0))
-        : 0;
+static void DU_Ghi_U64_BE(uint8_t *con_tro, uint64_t gia_tri)
+{
+    for (int i = 0; i < 8; ++i)
+        con_tro[i] = (uint8_t)((gia_tri >> (56 - 8 * i)) & 0xFF);
+}
 
-    DU_Ghi_U32_BE(&packet[12], (uint32_t)lat_e7);
-    DU_Ghi_U32_BE(&packet[16], (uint32_t)lon_e7);
-    DU_Ghi_U32_BE(&packet[20], (uint32_t)alt_cm);
-    DU_Ghi_U32_BE(&packet[24], speed_cms);
-    packet[28] = gps.satellites;
-    packet[29] = 0;
-    packet[30] = (hdop_x100 >> 8) & 0xFF;
-    packet[31] = hdop_x100 & 0xFF;
-    DU_Ghi_U32_BE(&packet[32], gps.fix_age_ms);
-    DU_Ghi_U32_BE(&packet[36], gps.utc_date_yyyymmdd);
-    DU_Ghi_U32_BE(&packet[40], gps.utc_time_ms_of_day);
+static bool Gui_Goi_ViTri_DU(
+    uint8_t loai_bao_cao,
+    uint64_t ma_tham_chieu,
+    const DuLieuGPS_DU &du_lieu_gps,
+    bool la_bao_cao_dinh_ky)
+{
+    if (ma_tham_chieu == 0 || LoRa_Mutex == nullptr) return false;
+    if (loai_bao_cao != TYPE_GPS_REPORT && loai_bao_cao != TYPE_VI_TRI_DINH_KY)
+        return false;
+
+    if (la_bao_cao_dinh_ky)
+    {
+        // V10: beacon best-effort KHONG cho mutex toi 80 ms nua.
+        // Neu radio dang co packet RxDone hoac khong im lang -> bo qua/thu lai sau.
+        if (digitalRead(LORA_DIO0) == HIGH)
+            return false;
+
+        if (!DU_Kenh_Im_Lang_Cho_Beacon(30UL))
+            return false;
+
+        // Try-lock = 0 tick: telemetry khong duoc xep hang truoc RX/control.
+        if (xSemaphoreTake(LoRa_Mutex, 0) != pdTRUE)
+            return false;
+
+        // Re-check sau khi chiem mutex de dong cua race cuoi cung.
+        if (digitalRead(LORA_DIO0) == HIGH)
+        {
+            xSemaphoreGive(LoRa_Mutex);
+            return false;
+        }
+    }
+    else
+    {
+        // GPS gan SESSION la control telemetry, duoc gui sau START.
+        delay(8);
+
+        if (xSemaphoreTake(LoRa_Mutex, pdMS_TO_TICKS(80)) != pdTRUE)
+        {
+            Serial.println("[DU GPS] Khong lay duoc LoRa mutex");
+            return false;
+        }
+    }
+
+    uint8_t goi_tin[SIZE_GPS_REPORT] = {};
+    goi_tin[0] = ID_TRAM_RBS;
+    goi_tin[1] = ID_TRAM_DU;
+    goi_tin[2] = loai_bao_cao;
+
+    uint8_t co_hieu = 0;
+    if (du_lieu_gps.gps_hop_le) co_hieu |= 0x01;
+    if (du_lieu_gps.do_cao_hop_le) co_hieu |= 0x02;
+    if (du_lieu_gps.toc_do_hop_le) co_hieu |= 0x04;
+    if (du_lieu_gps.hdop_hop_le) co_hieu |= 0x08;
+    goi_tin[3] = co_hieu;
+
+    DU_Ghi_U64_BE(&goi_tin[4], ma_tham_chieu);
+
+    int32_t vi_do_e7 = du_lieu_gps.gps_hop_le
+        ? (int32_t)llround(du_lieu_gps.vi_do * 10000000.0) : 0;
+    int32_t kinh_do_e7 = du_lieu_gps.gps_hop_le
+        ? (int32_t)llround(du_lieu_gps.kinh_do * 10000000.0) : 0;
+    int32_t do_cao_cm = du_lieu_gps.do_cao_hop_le
+        ? (int32_t)llround(du_lieu_gps.do_cao_m * 100.0) : 0;
+    uint32_t toc_do_cm_s = du_lieu_gps.toc_do_hop_le && du_lieu_gps.toc_do_m_s > 0.0
+        ? (uint32_t)llround(du_lieu_gps.toc_do_m_s * 100.0) : 0;
+    uint16_t hdop_x100 = du_lieu_gps.hdop_hop_le && du_lieu_gps.hdop > 0.0
+        ? (uint16_t)min(65535L, (long)llround(du_lieu_gps.hdop * 100.0)) : 0;
+
+    DU_Ghi_U32_BE(&goi_tin[12], (uint32_t)vi_do_e7);
+    DU_Ghi_U32_BE(&goi_tin[16], (uint32_t)kinh_do_e7);
+    DU_Ghi_U32_BE(&goi_tin[20], (uint32_t)do_cao_cm);
+    DU_Ghi_U32_BE(&goi_tin[24], toc_do_cm_s);
+    goi_tin[28] = du_lieu_gps.so_ve_tinh;
+    goi_tin[29] = (uint8_t)(int8_t)CONG_SUAT_PHAT_DU_DBM;
+    goi_tin[30] = (hdop_x100 >> 8) & 0xFF;
+    goi_tin[31] = hdop_x100 & 0xFF;
+    DU_Ghi_U32_BE(&goi_tin[32], du_lieu_gps.tuoi_fix_ms);
+    DU_Ghi_U32_BE(&goi_tin[36], du_lieu_gps.ngay_utc_yyyymmdd);
+    DU_Ghi_U32_BE(&goi_tin[40], du_lieu_gps.gio_utc_ms_trong_ngay);
 
     LoRa.idle();
     LoRa.beginPacket();
-    LoRa.write(packet, sizeof(packet));
-    int ok = LoRa.endPacket();
+    LoRa.write(goi_tin, sizeof(goi_tin));
+    int ket_qua_tx = LoRa.endPacket();
     LoRa.receive();
 
     xSemaphoreGive(LoRa_Mutex);
 
+    const char *ten_loai = loai_bao_cao == TYPE_VI_TRI_DINH_KY
+        ? "VI_TRI_DINH_KY" : "GPS_PHIEN";
+
     Serial.printf(
-        "[DU GPS TX] GPS_REPORT -> rBS | SESSION=%016llX | VALID=%u | LAT=%.7f | LON=%.7f | SAT=%u | HDOP=%.2f | AGE=%u ms | TX=%s\n",
-        (unsigned long long)session_id,
-        gps.gps_valid ? 1 : 0,
-        gps.latitude,
-        gps.longitude,
-        gps.satellites,
-        gps.hdop,
-        (unsigned int)gps.fix_age_ms,
-        ok == 1 ? "OK" : "FAIL"
+        "[DU GPS TX] %s -> rBS | MA=%016llX | HOP_LE=%u | VI_DO=%.7f | KINH_DO=%.7f | DO_CAO=%.1fm | TOC_DO=%.2fm/s | VE_TINH=%u | HDOP=%.2f | P_TX=%d dBm | TX=%s\n",
+        ten_loai,
+        (unsigned long long)ma_tham_chieu,
+        du_lieu_gps.gps_hop_le ? 1 : 0,
+        du_lieu_gps.vi_do,
+        du_lieu_gps.kinh_do,
+        du_lieu_gps.do_cao_m,
+        du_lieu_gps.toc_do_m_s,
+        du_lieu_gps.so_ve_tinh,
+        du_lieu_gps.hdop,
+        CONG_SUAT_PHAT_DU_DBM,
+        ket_qua_tx == 1 ? "OK" : "FAIL"
     );
 
-    return ok == 1;
+    return ket_qua_tx == 1;
+}
+
+bool Gui_GPS_REPORT_DU(
+    uint64_t ma_phien,
+    const DuLieuGPS_DU &du_lieu_gps)
+{
+    return Gui_Goi_ViTri_DU(TYPE_GPS_REPORT, ma_phien, du_lieu_gps, false);
+}
+
+bool Gui_VI_TRI_DINH_KY_DU(
+    uint64_t so_thu_tu_bao_cao,
+    const DuLieuGPS_DU &du_lieu_gps)
+{
+    return Gui_Goi_ViTri_DU(TYPE_VI_TRI_DINH_KY, so_thu_tu_bao_cao, du_lieu_gps, true);
 }

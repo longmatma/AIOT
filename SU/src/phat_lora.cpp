@@ -79,6 +79,9 @@ void KhoiTao_LoRa()
 
     LoRa.enableCrc();
 
+    // Dat ro cong suat de tinh he so kenh tai rBS.
+    LoRa.setTxPower(CONG_SUAT_PHAT_SU_DBM);
+
     LoRa.idle();
 
     Serial.println(
@@ -91,10 +94,12 @@ void KhoiTao_LoRa()
 // TX BLOCKING
 // =====================================================
 
-void Phat_GoiTin_LoRa(
+bool Phat_GoiTin_LoRa(
     uint8_t *goi_tin,
     size_t do_dai)
 {
+    // TX blocking. Tra ve ket qua de beacon dinh ky chi tang STT
+    // khi packet da duoc driver phat thanh cong.
     LoRa.idle();
 
     LoRa.beginPacket();
@@ -104,7 +109,8 @@ void Phat_GoiTin_LoRa(
         do_dai
     );
 
-    LoRa.endPacket();
+    int ket_qua_tx = LoRa.endPacket();
+    return ket_qua_tx == 1;
 }
 
 
@@ -625,93 +631,121 @@ bool Gui_USER_CONFIRM_RBS(
 
 
 // =====================================================
-// GPS REPORT SU -> rBS, 44B
+// BAO CAO GPS / VI TRI SU -> rBS, 44B
 //
-// [0]     DST=rBS
-// [1]     SRC=SU
-// [2]     TYPE_GPS_REPORT=0x17
-// [3]     FLAGS: bit0 GPS_VALID, bit1 ALT, bit2 SPEED, bit3 HDOP
-// [4..11] SESSION_ID64
-// [12..15] LAT_E7 int32
-// [16..19] LON_E7 int32
-// [20..23] ALT_CM int32
-// [24..27] SPEED_CM_S uint32
-// [28] SAT
-// [29] reserved
+// [0]     DICH=rBS
+// [1]     NGUON=SU
+// [2]     0x17 = GPS gan voi SESSION, 0x18 = VI TRI DINH KY
+// [3]     FLAGS: bit0 GPS, bit1 DO_CAO, bit2 TOC_DO, bit3 HDOP
+// [4..11] 0x17: MA_PHIEN64 | 0x18: SO_THU_TU_BAO_CAO64
+// [12..15] VI_DO_E7 int32
+// [16..19] KINH_DO_E7 int32
+// [20..23] DO_CAO_CM int32
+// [24..27] TOC_DO_CM_S uint32
+// [28] SO_VE_TINH
+// [29] CONG_SUAT_PHAT_DBM int8
 // [30..31] HDOP_X100 uint16
-// [32..35] FIX_AGE_MS uint32
-// [36..39] UTC_DATE_YYYYMMDD uint32
-// [40..43] UTC_TIME_MS_OF_DAY uint32
+// [32..35] TUOI_FIX_MS uint32
+// [36..39] NGAY_UTC_YYYYMMDD uint32
+// [40..43] GIO_UTC_MS_TRONG_NGAY uint32
 // =====================================================
-static void Ghi_U32_BE(uint8_t *p, uint32_t v)
+static void Ghi_U32_BE(uint8_t *con_tro, uint32_t gia_tri)
 {
-    p[0] = (v >> 24) & 0xFF;
-    p[1] = (v >> 16) & 0xFF;
-    p[2] = (v >> 8) & 0xFF;
-    p[3] = v & 0xFF;
+    con_tro[0] = (gia_tri >> 24) & 0xFF;
+    con_tro[1] = (gia_tri >> 16) & 0xFF;
+    con_tro[2] = (gia_tri >> 8) & 0xFF;
+    con_tro[3] = gia_tri & 0xFF;
 }
 
-static void Ghi_U64_BE(uint8_t *p, uint64_t v)
+static void Ghi_U64_BE(uint8_t *con_tro, uint64_t gia_tri)
 {
     for (int i = 0; i < 8; ++i)
-        p[i] = (uint8_t)((v >> (56 - 8 * i)) & 0xFF);
+        con_tro[i] = (uint8_t)((gia_tri >> (56 - 8 * i)) & 0xFF);
+}
+
+static bool Gui_Goi_ViTri_SU(
+    uint8_t loai_bao_cao,
+    uint64_t ma_tham_chieu,
+    const DuLieuGPS_SU &du_lieu_gps,
+    bool bat_lai_che_do_thu)
+{
+    if (ma_tham_chieu == 0) return false;
+    if (loai_bao_cao != TYPE_GPS_REPORT && loai_bao_cao != TYPE_VI_TRI_DINH_KY)
+        return false;
+
+    uint8_t goi_tin[SIZE_GPS_REPORT] = {};
+    goi_tin[0] = ID_RBS_READY;
+    goi_tin[1] = ID_SU_READY;
+    goi_tin[2] = loai_bao_cao;
+
+    uint8_t co_hieu = 0;
+    if (du_lieu_gps.gps_hop_le) co_hieu |= 0x01;
+    if (du_lieu_gps.do_cao_hop_le) co_hieu |= 0x02;
+    if (du_lieu_gps.toc_do_hop_le) co_hieu |= 0x04;
+    if (du_lieu_gps.hdop_hop_le) co_hieu |= 0x08;
+    goi_tin[3] = co_hieu;
+
+    Ghi_U64_BE(&goi_tin[4], ma_tham_chieu);
+
+    int32_t vi_do_e7 = du_lieu_gps.gps_hop_le
+        ? (int32_t)llround(du_lieu_gps.vi_do * 10000000.0) : 0;
+    int32_t kinh_do_e7 = du_lieu_gps.gps_hop_le
+        ? (int32_t)llround(du_lieu_gps.kinh_do * 10000000.0) : 0;
+    int32_t do_cao_cm = du_lieu_gps.do_cao_hop_le
+        ? (int32_t)llround(du_lieu_gps.do_cao_m * 100.0) : 0;
+    uint32_t toc_do_cm_s = du_lieu_gps.toc_do_hop_le && du_lieu_gps.toc_do_m_s > 0.0
+        ? (uint32_t)llround(du_lieu_gps.toc_do_m_s * 100.0) : 0;
+    uint16_t hdop_x100 = du_lieu_gps.hdop_hop_le && du_lieu_gps.hdop > 0.0
+        ? (uint16_t)min(65535L, (long)llround(du_lieu_gps.hdop * 100.0)) : 0;
+
+    Ghi_U32_BE(&goi_tin[12], (uint32_t)vi_do_e7);
+    Ghi_U32_BE(&goi_tin[16], (uint32_t)kinh_do_e7);
+    Ghi_U32_BE(&goi_tin[20], (uint32_t)do_cao_cm);
+    Ghi_U32_BE(&goi_tin[24], toc_do_cm_s);
+    goi_tin[28] = du_lieu_gps.so_ve_tinh;
+    goi_tin[29] = (uint8_t)(int8_t)CONG_SUAT_PHAT_SU_DBM;
+    goi_tin[30] = (hdop_x100 >> 8) & 0xFF;
+    goi_tin[31] = hdop_x100 & 0xFF;
+    Ghi_U32_BE(&goi_tin[32], du_lieu_gps.tuoi_fix_ms);
+    Ghi_U32_BE(&goi_tin[36], du_lieu_gps.ngay_utc_yyyymmdd);
+    Ghi_U32_BE(&goi_tin[40], du_lieu_gps.gio_utc_ms_trong_ngay);
+
+    bool tx_ok = Phat_GoiTin_LoRa(goi_tin, sizeof(goi_tin));
+
+    if (bat_lai_che_do_thu)
+        LoRa.receive();
+
+    const char *ten_loai = loai_bao_cao == TYPE_VI_TRI_DINH_KY
+        ? "VI_TRI_DINH_KY" : "GPS_PHIEN";
+
+    Serial.printf(
+        "[SU GPS TX] %s -> rBS | MA=%016llX | HOP_LE=%u | VI_DO=%.7f | KINH_DO=%.7f | DO_CAO=%.1fm | TOC_DO=%.2fm/s | VE_TINH=%u | HDOP=%.2f | P_TX=%d dBm | SIZE=%uB\n",
+        ten_loai,
+        (unsigned long long)ma_tham_chieu,
+        du_lieu_gps.gps_hop_le ? 1 : 0,
+        du_lieu_gps.vi_do,
+        du_lieu_gps.kinh_do,
+        du_lieu_gps.do_cao_m,
+        du_lieu_gps.toc_do_m_s,
+        du_lieu_gps.so_ve_tinh,
+        du_lieu_gps.hdop,
+        CONG_SUAT_PHAT_SU_DBM,
+        (unsigned int)sizeof(goi_tin)
+    );
+
+    return tx_ok;
 }
 
 bool Gui_GPS_REPORT_SU(
-    uint64_t session_id,
-    const DuLieuGPS_SU &gps)
+    uint64_t ma_phien,
+    const DuLieuGPS_SU &du_lieu_gps)
 {
-    if (session_id == 0) return false;
+    return Gui_Goi_ViTri_SU(TYPE_GPS_REPORT, ma_phien, du_lieu_gps, false);
+}
 
-    uint8_t packet[SIZE_GPS_REPORT] = {};
-    packet[0] = ID_RBS_READY;
-    packet[1] = ID_SU_READY;
-    packet[2] = TYPE_GPS_REPORT;
-
-    uint8_t flags = 0;
-    if (gps.gps_valid) flags |= 0x01;
-    if (gps.altitude_valid) flags |= 0x02;
-    if (gps.speed_valid) flags |= 0x04;
-    if (gps.hdop_valid) flags |= 0x08;
-    packet[3] = flags;
-
-    Ghi_U64_BE(&packet[4], session_id);
-
-    int32_t lat_e7 = gps.gps_valid ? (int32_t)llround(gps.latitude * 10000000.0) : 0;
-    int32_t lon_e7 = gps.gps_valid ? (int32_t)llround(gps.longitude * 10000000.0) : 0;
-    int32_t alt_cm = gps.altitude_valid ? (int32_t)llround(gps.altitude_m * 100.0) : 0;
-    uint32_t speed_cms = gps.speed_valid && gps.speed_mps > 0.0
-        ? (uint32_t)llround(gps.speed_mps * 100.0)
-        : 0;
-    uint16_t hdop_x100 = gps.hdop_valid && gps.hdop > 0.0
-        ? (uint16_t)min(65535L, (long)llround(gps.hdop * 100.0))
-        : 0;
-
-    Ghi_U32_BE(&packet[12], (uint32_t)lat_e7);
-    Ghi_U32_BE(&packet[16], (uint32_t)lon_e7);
-    Ghi_U32_BE(&packet[20], (uint32_t)alt_cm);
-    Ghi_U32_BE(&packet[24], speed_cms);
-    packet[28] = gps.satellites;
-    packet[29] = 0;
-    packet[30] = (hdop_x100 >> 8) & 0xFF;
-    packet[31] = hdop_x100 & 0xFF;
-    Ghi_U32_BE(&packet[32], gps.fix_age_ms);
-    Ghi_U32_BE(&packet[36], gps.utc_date_yyyymmdd);
-    Ghi_U32_BE(&packet[40], gps.utc_time_ms_of_day);
-
-    Phat_GoiTin_LoRa(packet, sizeof(packet));
-
-    Serial.printf(
-        "[SU GPS TX] GPS_REPORT -> rBS | SESSION=%016llX | VALID=%u | LAT=%.7f | LON=%.7f | SAT=%u | HDOP=%.2f | AGE=%u ms | SIZE=%uB\n",
-        (unsigned long long)session_id,
-        gps.gps_valid ? 1 : 0,
-        gps.latitude,
-        gps.longitude,
-        gps.satellites,
-        gps.hdop,
-        (unsigned int)gps.fix_age_ms,
-        (unsigned int)sizeof(packet)
-    );
-
-    return true;
+bool Gui_VI_TRI_DINH_KY_SU(
+    uint64_t so_thu_tu_bao_cao,
+    const DuLieuGPS_SU &du_lieu_gps)
+{
+    return Gui_Goi_ViTri_SU(TYPE_VI_TRI_DINH_KY, so_thu_tu_bao_cao, du_lieu_gps, true);
 }

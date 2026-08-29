@@ -6,7 +6,7 @@
 
 void KhoiTao_LoRa();
 
-void Phat_GoiTin_LoRa(
+bool Phat_GoiTin_LoRa(
     uint8_t *goi_tin,
     size_t do_dai
 );
@@ -69,11 +69,22 @@ bool Gui_USER_CONFIRM_RBS(
 // TYPE_GPS_REPORT = 0x17.
 // =====================================================
 #define TYPE_GPS_REPORT 0x17
+#define TYPE_VI_TRI_DINH_KY 0x18
 #define SIZE_GPS_REPORT 44
 
+// Arduino LoRa library khoi tao PA_BOOST mac dinh 17 dBm.
+// Dat ro rang de rBS co P_TX xac dinh khi uoc luong kenh.
+#define CONG_SUAT_PHAT_SU_DBM 17
+
 bool Gui_GPS_REPORT_SU(
-    uint64_t session_id,
-    const DuLieuGPS_SU &gps
+    uint64_t ma_phien,
+    const DuLieuGPS_SU &du_lieu_gps
+);
+
+// Bao cao vi tri ngoai phien, best-effort, khong ACK.
+bool Gui_VI_TRI_DINH_KY_SU(
+    uint64_t so_thu_tu_bao_cao,
+    const DuLieuGPS_SU &du_lieu_gps
 );
 
 #endif

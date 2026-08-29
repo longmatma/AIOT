@@ -9,6 +9,7 @@
 #include "phat_lora.h"
 #include "hien_thi.h"
 #include "gps_su.h"
+#include "hmi_su.h"
 
 
 extern U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2;
@@ -18,13 +19,19 @@ extern U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2;
 // CẤU HÌNH
 // ========================================================
 
-#define CHAN_NUT_PTT      7
-
-// Chi dung 1 LED trang thai tai SU.
-// GPIO16 = LED duy nhat. GPIO21 khong dung trong ban V5.
-#define CHAN_LED_STATUS  16
-
 #define MAX_KHUNG_THOAI 3000
+
+
+// ========================================================
+// BAO CAO VI TRI DINH KY SU -> rBS
+// GPS van cap nhat lien tuc trong task rieng; LoRa chi gui khi SU idle.
+// 5 giay la diem khoi dau an toan, co the doi ve sau.
+// ========================================================
+#define CHU_KY_BAO_CAO_VI_TRI_SU_MS 5000UL
+#define TRE_BAO_CAO_VI_TRI_SU_LUC_KHOI_DONG_MS 1000UL
+
+uint32_t moc_gui_vi_tri_su_tiep_theo_ms = 0;
+uint64_t so_thu_tu_bao_cao_vi_tri_su = 0;
 
 
 // ========================================================
@@ -52,8 +59,9 @@ extern U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2;
 #define MAX_TX_RETRY                2
 
 // SESSION_START -> rBS -> DU -> SESSION_READY -> rBS -> SU.
-// SU cho rBS toi da ~900 ms de rBS tu retry SESSION_START toi DU 3 lan.
-#define SESSION_SETUP_TIMEOUT_MS   900
+// V10: cho rong hon de DU co GPS report + SESSION_READY ma khong bi ep timeout.
+// Khi READY den som, SU thoat ngay nen khong lam tang do tre binh thuong.
+#define SESSION_SETUP_TIMEOUT_MS  1200
 #define SESSION_REQUEST_RETRY        2
 
 // ========================================================
@@ -108,98 +116,9 @@ uint32_t thoi_diem_bat_dau_ghi_ms = 0;
 uint32_t e2e_ptt_release_ms = 0;
 
 // ========================================================
-// HMI 1 LED TAI SU
-//
-// OFF       : idle / dang ghi am.
-// ON lien tuc: dang cho SESSION_READY.
-// Chop theo packet: dang TX VOICE/FEC.
-// 3 chop cham: SESSION_SETUP FAIL.
-// ON 2 giay : DU da AUTO-ACK sau khi phat xong.
-// NACK      : lap vo han "nhay nhanh -> nhay cham -> nhay nhanh..."
-//             cho toi khi bat dau cau PTT moi.
+// HMI SU DA TACH SANG hmi_su.cpp / hmi_su.h
+// main.cpp chi goi API HMI, khong con xu ly GPIO/LED truc tiep.
 // ========================================================
-uint64_t su_last_session_id = 0;
-uint8_t su_user_feedback = 0;
-uint32_t su_ack_led_until_ms = 0;
-
-static void Dat_LED_SU(bool sang)
-{
-    digitalWrite(CHAN_LED_STATUS, sang ? HIGH : LOW);
-}
-
-static void Dat_PhanHoi_SU(uint8_t code)
-{
-    su_user_feedback = code;
-
-    if (code == USER_RESPONSE_ACK)
-    {
-        su_ack_led_until_ms = millis() + 2000UL;
-        Dat_LED_SU(true);
-    }
-    else if (code == USER_RESPONSE_NACK)
-    {
-        su_ack_led_until_ms = 0;
-    }
-    else
-    {
-        su_ack_led_until_ms = 0;
-        Dat_LED_SU(false);
-    }
-}
-
-static void Bao_Loi_Session_SU()
-{
-    // 3 chop cham, de nhin khac ro voi chop packet.
-    for (uint8_t i = 0; i < 3; i++)
-    {
-        Dat_LED_SU(true);
-        delay(320);
-        Dat_LED_SU(false);
-        delay(320);
-    }
-}
-
-static void CapNhat_LED_PhanHoi_SU()
-{
-    if (su_user_feedback == USER_RESPONSE_ACK)
-    {
-        if ((int32_t)(su_ack_led_until_ms - millis()) > 0)
-        {
-            Dat_LED_SU(true);
-        }
-        else
-        {
-            su_user_feedback = 0;
-            su_ack_led_until_ms = 0;
-            Dat_LED_SU(false);
-        }
-        return;
-    }
-
-    if (su_user_feedback == USER_RESPONSE_NACK)
-    {
-        // Chu ky 2.4 s:
-        //   0..0.8 s  : nhay nhanh, doi trang thai moi 100 ms.
-        //   0.8..2.4 s: nhay cham, doi trang thai moi 400 ms.
-        // Sau do lap lai -> FAST / SLOW / FAST / SLOW...
-        uint32_t pha = millis() % 2400UL;
-        bool sang;
-
-        if (pha < 800UL)
-        {
-            sang = ((pha / 100UL) % 2UL) == 0;
-        }
-        else
-        {
-            sang = (((pha - 800UL) / 400UL) % 2UL) == 0;
-        }
-
-        Dat_LED_SU(sang);
-        return;
-    }
-
-    Dat_LED_SU(false);
-}
 
 
 // ========================================================
@@ -325,14 +244,12 @@ void setup()
     // GPS NEO-6M doc lien tuc trong task rieng, khong block audio/PTT.
     KhoiTao_GPS_SU();
 
+    moc_gui_vi_tri_su_tiep_theo_ms =
+        millis() + TRE_BAO_CAO_VI_TRI_SU_LUC_KHOI_DONG_MS;
 
-    pinMode(
-        CHAN_NUT_PTT,
-        INPUT_PULLUP
-    );
 
-    pinMode(CHAN_LED_STATUS, OUTPUT);
-    Dat_LED_SU(false);
+    // Nut PTT + LED duoc khoi tao trong module HMI rieng.
+    KhoiTao_HMI_SU();
 
 
     // ====================================================
@@ -433,18 +350,54 @@ void setup()
 
 
 // ========================================================
+// GUI VI TRI DINH KY KHI RADIO RANH
+// - Khong chen vao RECORD / SESSION / VOICE / FEC / ARQ.
+// - Neu SU dang cho ACK/NACK nguoi dung cua DU thi tam hoan.
+// - Best-effort: khong tao them ARQ de khong tang tai kenh.
+// ========================================================
+static void XuLy_BaoCao_ViTri_DinhKy_SU()
+{
+    if (trang_thai != NGHI_NGOI)
+        return;
+
+    // Chua nhan phan hoi cua DU cho cau vua roi -> uu tien nghe HMI.
+    if (HMI_SU_Dang_Cho_PhanHoi())
+        return;
+
+    uint32_t bay_gio_ms = millis();
+    if ((int32_t)(bay_gio_ms - moc_gui_vi_tri_su_tiep_theo_ms) < 0)
+        return;
+
+    DuLieuGPS_SU du_lieu_gps_su = Lay_DuLieu_GPS_SU();
+    In_TrangThai_GPS_SU(du_lieu_gps_su);
+
+    // V10: chi "tieu thu" STT khi TX thanh cong.
+    // Neu radio ban/TX loi, lan thu lai van dung cung STT -> rBS co the
+    // phan biet packet mat tren khong trung voi beacon bi hoan tai SU.
+    uint64_t stt_du_kien = so_thu_tu_bao_cao_vi_tri_su + 1;
+    if (stt_du_kien == 0)
+        stt_du_kien = 1;
+
+    bool gui_thanh_cong = Gui_VI_TRI_DINH_KY_SU(
+        stt_du_kien,
+        du_lieu_gps_su
+    );
+
+    if (gui_thanh_cong)
+        so_thu_tu_bao_cao_vi_tri_su = stt_du_kien;
+
+    moc_gui_vi_tri_su_tiep_theo_ms = bay_gio_ms +
+        (gui_thanh_cong ? CHU_KY_BAO_CAO_VI_TRI_SU_MS : 500UL);
+}
+
+
+// ========================================================
 // LOOP
 // ========================================================
 
 void loop()
 {
-    bool nut_dang_bam =
-        (
-            digitalRead(
-                CHAN_NUT_PTT
-            )
-            == LOW
-        );
+    bool nut_dang_bam = Nut_PTT_Dang_Bam_SU();
 
 
     // ====================================================
@@ -461,11 +414,8 @@ void loop()
         trang_thai =
             DANG_GHI_AM;
 
-        // Cau moi -> xoa ACK/NACK cua cau truoc.
-        su_user_feedback = 0;
-        su_ack_led_until_ms = 0;
-        su_last_session_id = 0;
-        Dat_LED_SU(false);
+        // Cau moi -> module HMI xoa ACK/NACK/session cua cau truoc.
+        HMI_SU_BatDau_CauMoi();
 
 
         tong_so_khung_da_ghi =
@@ -706,7 +656,7 @@ void loop()
         uint64_t session_id_tx =
             Tao_Session_Moi();
 
-        su_last_session_id = session_id_tx;
+        HMI_SU_Dat_Session(session_id_tx);
 
         uint8_t goi_session[12];
 
@@ -780,11 +730,11 @@ void loop()
 
             // GPS la packet rieng, khong chen vao SESSION_START/VOICE.
             // Gui snapshot moi nhat NGAY SAU READY, truoc VOICE.
-            DuLieuGPS_SU gps_su = Lay_DuLieu_GPS_SU();
-            In_TrangThai_GPS_SU(gps_su);
+            DuLieuGPS_SU du_lieu_gps_su = Lay_DuLieu_GPS_SU();
+            In_TrangThai_GPS_SU(du_lieu_gps_su);
 
             Dat_LED_SU(true);
-            Gui_GPS_REPORT_SU(session_id_tx, gps_su);
+            Gui_GPS_REPORT_SU(session_id_tx, du_lieu_gps_su);
             Dat_LED_SU(false);
 
             // Cho rBS doc GPS_REPORT + re-arm RX truoc VOICE dau tien.
@@ -1123,15 +1073,18 @@ void loop()
     {
         CapNhat_LED_PhanHoi_SU();
 
-        if (su_last_session_id != 0)
+        uint64_t ma_phien_hmi = HMI_SU_Lay_Session();
+        if (ma_phien_hmi != 0)
         {
-            uint8_t response_code = 0;
-            if (KiemTra_USER_RESPONSE_RBS(su_last_session_id, response_code))
+            uint8_t ma_phan_hoi = 0;
+            if (KiemTra_USER_RESPONSE_RBS(ma_phien_hmi, ma_phan_hoi))
             {
-                Dat_PhanHoi_SU(response_code);
-                Gui_USER_CONFIRM_RBS(su_last_session_id, response_code);
+                Dat_PhanHoi_SU(ma_phan_hoi);
+                Gui_USER_CONFIRM_RBS(ma_phien_hmi, ma_phan_hoi);
             }
         }
+
+        XuLy_BaoCao_ViTri_DinhKy_SU();
 
         delay(5);
     }

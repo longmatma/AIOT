@@ -6,11 +6,12 @@ import adafruit_rfm9x
 
 from gps_rbs import (
     QuanLyGPSRBS,
-    parse_gps_report,
-    TYPE_GPS_REPORT,
-    SIZE_GPS_REPORT,
-    ID_TRAM_SU as GPS_ID_SU,
-    ID_TRAM_DU as GPS_ID_DU,
+    phan_tich_bao_cao_gps,
+    LOAI_BAO_CAO_GPS_PHIEN,
+    LOAI_BAO_CAO_VI_TRI_DINH_KY,
+    KICH_THUOC_BAO_CAO_GPS,
+    MA_TRAM_SU as MA_GPS_SU,
+    MA_TRAM_DU as MA_GPS_DU,
 )
 
 
@@ -279,7 +280,9 @@ USER_HMI_FORWARD_GUARD = 0.008
 # SESSION_START -> SESSION_READY handshake.
 # rBS tu retry SESSION_START toi DU toi da 3 lan.
 SESSION_MAX_ATTEMPTS = 3
-SESSION_READY_WINDOW = 0.200
+# V10: tang cua so READY de du thoi gian cho DU xu ly START + GPS_PHIEN + READY.
+# Neu READY den som thi thoat ngay, khong cong them delay vao truong hop tot.
+SESSION_READY_WINDOW = 0.300
 SESSION_READY_FORWARD_GUARD = 0.008
 
 # Sau END #1, rBS mo RX window cho DU bao PLAY.
@@ -290,6 +293,13 @@ PLAY_REPORT_FORWARD_GUARD = 0.008
 # Giữ các guard đã chứng minh ổn định.
 PHASE2_RX_GUARD = 0.008
 READY_GUARD = 0.010
+
+# V10.1 - RX watchdog cho rBS.
+# DU/SU co beacon dinh ky ~5 s, nen 20 s im lang la bat thuong trong che do van hanh.
+# Khong thay doi protocol/ARQ/FEC/AES hay cac guard da on dinh.
+RX_WATCHDOG_IM_LANG_S = 20.0
+RX_WATCHDOG_HARD_O_LAN = 2
+RX_IDLE_YIELD_S = 0.001
 
 # Explicit AUDIO_END là đường bình thường.
 # Fallback để dài hơn ARQ retry, không ảnh hưởng latency bình thường.
@@ -312,18 +322,18 @@ def parse_packet_su(packet_bytes):
         SIZE_VOICE_PACKET,
         SIZE_FEC_PACKET,
         SIZE_CONTROL_SU,
-        SIZE_GPS_REPORT,
+        KICH_THUOC_BAO_CAO_GPS,
     ):
         return None
 
     dst = p[0]
     src = p[1]
 
-    # GPS_REPORT dung TYPE 0x17 va dich truc tiep rBS, khong dung TYPE_MASK.
-    if len(p) == SIZE_GPS_REPORT and p[2] == TYPE_GPS_REPORT:
-        gps = parse_gps_report(p)
-        if gps is not None and gps["src"] == GPS_ID_SU:
-            return {"kind": "gps", "raw": p, "gps": gps}
+    # GPS packet 0x17 (gan phien) hoac 0x18 (dinh ky), dich truc tiep rBS.
+    if len(p) == KICH_THUOC_BAO_CAO_GPS and p[2] in (LOAI_BAO_CAO_GPS_PHIEN, LOAI_BAO_CAO_VI_TRI_DINH_KY):
+        bao_cao_gps = phan_tich_bao_cao_gps(p)
+        if bao_cao_gps is not None and bao_cao_gps["nguon"] == MA_GPS_SU:
+            return {"kind": "gps", "raw": p, "gps": bao_cao_gps}
         return None
 
     packet_type = p[2] & TYPE_MASK
@@ -613,29 +623,34 @@ def thiet_lap_session_voi_du(rfm9x, goi_session, session_id, diag_session=None, 
 
             rssi, snr = lay_rssi_snr(rfm9x)
 
-            gps_report = parse_gps_report(p)
-            if (
-                gps_report is not None
-                and gps_report["src"] == GPS_ID_DU
-                and gps_report["session_id"] == session_id
-            ):
-                if gps_manager is not None:
-                    gps_manager.cap_nhat(gps_report, rssi, snr)
-                if diag_session is not None:
-                    cap_nhat_thong_ke_lien_ket(
-                        diag_session["link_du_rbs"],
-                        rssi,
-                        snr,
-                        "GPS_REPORT",
+            bao_cao_gps = phan_tich_bao_cao_gps(p)
+            if bao_cao_gps is not None:
+                du_lieu_gps = gps_manager.cap_nhat(bao_cao_gps, rssi, snr) if gps_manager is not None else bao_cao_gps
+
+                if bao_cao_gps["la_dinh_ky"]:
+                    if gps_manager is not None:
+                        gps_manager.in_bao_cao_dinh_ky(du_lieu_gps)
+                    continue
+
+                if (
+                    bao_cao_gps["nguon"] == MA_GPS_DU
+                    and bao_cao_gps["ma_phien"] == session_id
+                ):
+                    if diag_session is not None:
+                        cap_nhat_thong_ke_lien_ket(
+                            diag_session["link_du_rbs"],
+                            rssi,
+                            snr,
+                            "GPS_REPORT",
+                        )
+                    print(
+                        f"[rBS GPS] NHAN GPS_PHIEN tu DU | SESSION={session_id:016X} | "
+                        f"HOP_LE={1 if bao_cao_gps['gps_hop_le'] else 0} | "
+                        f"VI_DO={bao_cao_gps['vi_do']:.7f} | KINH_DO={bao_cao_gps['kinh_do']:.7f} | "
+                        f"VE_TINH={bao_cao_gps['so_ve_tinh']} | HDOP={bao_cao_gps['hdop']:.2f} | "
+                        f"TUOI_FIX={bao_cao_gps['tuoi_fix_ms']} ms | {chuoi_rssi_snr(rssi, snr)}"
                     )
-                print(
-                    f"[rBS GPS] NHẬN GPS_REPORT từ DU | SESSION={session_id:016X} | "
-                    f"VALID={1 if gps_report['gps_valid'] else 0} | "
-                    f"LAT={gps_report['latitude']:.7f} | LON={gps_report['longitude']:.7f} | "
-                    f"SAT={gps_report['satellites']} | HDOP={gps_report['hdop']:.2f} | "
-                    f"AGE={gps_report['fix_age_ms']} ms | {chuoi_rssi_snr(rssi, snr)}"
-                )
-                continue
+                    continue
 
             sid = parse_session_ready_du(
                 p,
@@ -1077,6 +1092,40 @@ def reset_session_state():
 
 
 # ============================================================
+# V10.1 - KHOI TAO / TU PHUC HOI LORA RX
+# ============================================================
+
+def cau_hinh_lora_rbs(rfm9x):
+    """Ap dung dung cau hinh RF baseline dang dung on dinh."""
+    rfm9x.signal_bandwidth = 500000
+    rfm9x.spreading_factor = 7
+    rfm9x.coding_rate = 5
+    rfm9x.tx_power = 23
+    # Dat radio ve RX ngay sau khoi tao/re-khoi tao.
+    rfm9x.listen()
+
+
+def khoi_tao_lora_rbs(spi, cs, reset):
+    """Tao lai driver RFM9x va ap dung nguyen cau hinh RF hien tai."""
+    radio = adafruit_rfm9x.RFM9x(
+        spi,
+        cs,
+        reset,
+        TAN_SO_LORA,
+        baudrate=1000000,
+    )
+    cau_hinh_lora_rbs(radio)
+    return radio
+
+
+def phuc_hoi_rx_mem(rfm9x):
+    """Soft re-arm: khong reset chip, chi dua RX ve STANDBY roi RX lien tuc."""
+    rfm9x.idle()
+    time.sleep(0.002)
+    rfm9x.listen()
+
+
+# ============================================================
 # MAIN
 # ============================================================
 
@@ -1096,6 +1145,7 @@ def main():
     print(" FINAL = AUDIO_END -> END#1 -> DU PLAY_REPORT -> SU -> END#2/#3")
     print(" SESSION = START -> DU READY -> MỚI CHO PHÉP VOICE")
     print(" HMI = DU ACK TỰ ĐỘNG / NACK THỦ CÔNG -> SU -> XÁC NHẬN -> DU")
+    print(" V10.1 = V10 + rBS RX WATCHDOG TU PHUC HOI")
     print(" LOG LINK = RSSI/SNR TB-MIN-MAX + SỐ GÓI + ARQ RETRY THEO SESSION")
     print(f" PHASE2_RX_GUARD = {PHASE2_RX_GUARD * 1000:.1f} ms")
     print("====================================================")
@@ -1110,18 +1160,7 @@ def main():
     )
 
     try:
-        rfm9x = adafruit_rfm9x.RFM9x(
-            spi,
-            CS,
-            RESET,
-            TAN_SO_LORA,
-            baudrate=1000000,
-        )
-
-        rfm9x.signal_bandwidth = 500000
-        rfm9x.spreading_factor = 7
-        rfm9x.coding_rate = 5
-        rfm9x.tx_power = 23
+        rfm9x = khoi_tao_lora_rbs(spi, CS, RESET)
 
     except RuntimeError as error:
         print(
@@ -1150,6 +1189,17 @@ def main():
     diag_session = None
     diag_hoan_tat_gan_nhat = None
 
+    # Watchdog chi can biet lan cuoi radio nhan duoc BAT KY packet nao.
+    # Trong he thong hien tai SU/DU co beacon dinh ky, vi vay neu im lang >20 s
+    # thi re-arm RX; neu lap lai 2 lan lien tiep thi re-khoi tao driver/chip LoRa.
+    thoi_diem_rx_cuoi = time.monotonic()
+    so_lan_soft_lien_tiep = 0
+
+    print(
+        f"[rBS WATCHDOG] BAT | IM_LANG={RX_WATCHDOG_IM_LANG_S:.0f}s | "
+        f"HARD_O_LAN={RX_WATCHDOG_HARD_O_LAN}"
+    )
+
     while True:
 
         t_rx_call_us = now_us()
@@ -1174,37 +1224,85 @@ def main():
         )
 
         if packet is not None:
+            # Bat ky packet hop le o tang radio deu chung minh RX dang song.
+            thoi_diem_rx_cuoi = now
+            so_lan_soft_lien_tiep = 0
+        else:
+            im_lang_s = now - thoi_diem_rx_cuoi
+
+            if im_lang_s >= RX_WATCHDOG_IM_LANG_S:
+                so_lan_soft_lien_tiep += 1
+
+                if so_lan_soft_lien_tiep < RX_WATCHDOG_HARD_O_LAN:
+                    try:
+                        print(
+                            f"[rBS WATCHDOG] RX IM LANG {im_lang_s:.1f}s "
+                            f"-> SOFT RE-ARM RX "
+                            f"(LAN={so_lan_soft_lien_tiep})"
+                        )
+                        phuc_hoi_rx_mem(rfm9x)
+                    except Exception as error:  # noqa: BLE001 - watchdog phai song qua loi driver
+                        print(
+                            f"[rBS WATCHDOG][CANH BAO] SOFT RE-ARM LOI: {error}"
+                        )
+
+                else:
+                    print(
+                        f"[rBS WATCHDOG] RX VAN IM SAU SOFT RE-ARM "
+                        f"-> HARD REINIT RFM9x"
+                    )
+                    try:
+                        rfm9x = khoi_tao_lora_rbs(spi, CS, RESET)
+                        print("[rBS WATCHDOG] HARD REINIT THANH CONG -> RX TRO LAI")
+                    except Exception as error:  # noqa: BLE001
+                        print(
+                            f"[rBS WATCHDOG][LOI] HARD REINIT THAT BAI: {error}"
+                        )
+                    so_lan_soft_lien_tiep = 0
+
+                # Bat dau mot cua so watchdog moi sau moi lan phuc hoi.
+                thoi_diem_rx_cuoi = time.monotonic()
+
+            # Nhuong CPU rat ngan khi khong co packet. Radio van o RX nen khong
+            # lam thay doi kien truc hay timing ARQ khi packet da den.
+            time.sleep(RX_IDLE_YIELD_S)
+
+        if packet is not None:
 
             rssi_goi, snr_goi = lay_rssi_snr(rfm9x)
 
-            # GPS REPORT SU/DU -> rBS. GPS la telemetry, khong gate VOICE.
-            gps_report = parse_gps_report(packet)
-            if gps_report is not None:
-                gps_manager.cap_nhat(gps_report, rssi_goi, snr_goi)
+            # GPS/VI TRI SU/DU -> rBS. Packet rieng, khong gate VOICE.
+            bao_cao_gps = phan_tich_bao_cao_gps(packet)
+            if bao_cao_gps is not None:
+                du_lieu_gps = gps_manager.cap_nhat(bao_cao_gps, rssi_goi, snr_goi)
 
-                diag_gps = None
-                if diag_session is not None and diag_session["session_id"] == gps_report["session_id"]:
-                    diag_gps = diag_session
-                elif diag_hoan_tat_gan_nhat is not None and diag_hoan_tat_gan_nhat["session_id"] == gps_report["session_id"]:
-                    diag_gps = diag_hoan_tat_gan_nhat
+                if bao_cao_gps["la_dinh_ky"]:
+                    gps_manager.in_bao_cao_dinh_ky(du_lieu_gps)
+                    continue
 
-                if diag_gps is not None:
-                    link_key = "link_su_rbs" if gps_report["src"] == GPS_ID_SU else "link_du_rbs"
+                thong_ke_phien_gps = None
+                if diag_session is not None and diag_session["session_id"] == bao_cao_gps["ma_phien"]:
+                    thong_ke_phien_gps = diag_session
+                elif diag_hoan_tat_gan_nhat is not None and diag_hoan_tat_gan_nhat["session_id"] == bao_cao_gps["ma_phien"]:
+                    thong_ke_phien_gps = diag_hoan_tat_gan_nhat
+
+                if thong_ke_phien_gps is not None:
+                    khoa_lien_ket = "link_su_rbs" if bao_cao_gps["nguon"] == MA_GPS_SU else "link_du_rbs"
                     cap_nhat_thong_ke_lien_ket(
-                        diag_gps[link_key],
+                        thong_ke_phien_gps[khoa_lien_ket],
                         rssi_goi,
                         snr_goi,
                         "GPS_REPORT",
                     )
 
-                ten = "SU" if gps_report["src"] == GPS_ID_SU else "DU"
+                ten_thiet_bi = "SU" if bao_cao_gps["nguon"] == MA_GPS_SU else "DU"
                 print(
-                    f"[rBS GPS] NHẬN GPS_REPORT từ {ten} | SESSION={gps_report['session_id']:016X} | "
-                    f"VALID={1 if gps_report['gps_valid'] else 0} | "
-                    f"LAT={gps_report['latitude']:.7f} | LON={gps_report['longitude']:.7f} | "
-                    f"ALT={gps_report['altitude_m']:.1f}m | SPEED={gps_report['speed_mps']:.2f}m/s | "
-                    f"SAT={gps_report['satellites']} | HDOP={gps_report['hdop']:.2f} | "
-                    f"AGE={gps_report['fix_age_ms']} ms | {chuoi_rssi_snr(rssi_goi, snr_goi)}"
+                    f"[rBS GPS] NHAN GPS_PHIEN tu {ten_thiet_bi} | SESSION={bao_cao_gps['ma_phien']:016X} | "
+                    f"HOP_LE={1 if bao_cao_gps['gps_hop_le'] else 0} | "
+                    f"VI_DO={bao_cao_gps['vi_do']:.7f} | KINH_DO={bao_cao_gps['kinh_do']:.7f} | "
+                    f"DO_CAO={bao_cao_gps['do_cao_m']:.1f}m | TOC_DO={bao_cao_gps['toc_do_m_s']:.2f}m/s | "
+                    f"VE_TINH={bao_cao_gps['so_ve_tinh']} | HDOP={bao_cao_gps['hdop']:.2f} | "
+                    f"TUOI_FIX={bao_cao_gps['tuoi_fix_ms']} ms | {chuoi_rssi_snr(rssi_goi, snr_goi)}"
                 )
                 continue
 

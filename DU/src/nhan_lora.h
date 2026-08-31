@@ -38,7 +38,11 @@ bool Gui_USER_RESPONSE_RBS(
 #define TYPE_GPS_REPORT 0x17
 #define TYPE_VI_TRI_DINH_KY 0x18
 #define SIZE_GPS_REPORT 44
-#define CONG_SUAT_PHAT_DU_DBM 17
+#define CONG_SUAT_PHAT_MAC_DINH_DU_DBM 17
+
+// Trạng thái RF hiện tại của DU, phục vụ telemetry và kiểm tra.
+int8_t Lay_CongSuat_Phat_DU_dBm();
+uint8_t Lay_HeSo_TraiPho_DU();
 
 bool Gui_GPS_REPORT_DU(
     uint64_t ma_phien,

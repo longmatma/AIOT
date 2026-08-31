@@ -55,14 +55,31 @@ uint64_t so_thu_tu_bao_cao_vi_tri_su = 0;
 // CR LoRa vẫn = 4/5.
 // ========================================================
 
-#define READY_TIMEOUT_MS          350
 #define MAX_TX_RETRY                2
+
+// Timeout ACK phải tăng theo SF vì airtime VOICE/FEC tăng mạnh khi SF tăng.
+// SF7 giữ nguyên baseline 350 ms đã chứng minh ổn định.
+static uint32_t Lay_Timeout_ACK_SU_ms()
+{
+    uint8_t sf = Lay_HeSo_TraiPho_SU();
+    if (sf <= 7) return 350;
+    if (sf == 8) return 550;
+    return 850;   // SF9
+}
 
 // SESSION_START -> rBS -> DU -> SESSION_READY -> rBS -> SU.
 // V10: cho rong hon de DU co GPS report + SESSION_READY ma khong bi ep timeout.
 // Khi READY den som, SU thoat ngay nen khong lam tang do tre binh thuong.
-#define SESSION_SETUP_TIMEOUT_MS  1200
 #define SESSION_REQUEST_RETRY        2
+
+// Bắt tay SESSION cũng cần thêm dư địa khi SF tăng. SF7 giữ nguyên 1200 ms.
+static uint32_t Lay_Timeout_Session_SU_ms()
+{
+    uint8_t sf = Lay_HeSo_TraiPho_SU();
+    if (sf <= 7) return 1200;
+    if (sf == 8) return 1500;
+    return 2000;
+}
 
 // ========================================================
 // CONTROL SU -> rBS
@@ -98,7 +115,16 @@ uint64_t so_thu_tu_bao_cao_vi_tri_su = 0;
 // ========================================================
 
 #define PLAY_REPORT_TIMEOUT_MS       500
-#define PLAY_REPORT_RETURN_EST_MS     29
+
+// Ước lượng airtime đường PLAY_STARTED quay về phụ thuộc SF.
+// 2 packet 12B + guard 8 ms: SF7≈29 ms, SF8≈49 ms, SF9≈80 ms.
+static uint32_t Lay_ThoiGian_PhanHoi_E2E_UocTinh_ms()
+{
+    uint8_t sf = Lay_HeSo_TraiPho_SU();
+    if (sf <= 7) return 29;
+    if (sf == 8) return 49;
+    return 80;
+}
 
 
 // ========================================================
@@ -207,7 +233,7 @@ static bool Gui_Packet_Co_ACK(
 
         if (
             Cho_READY_RBS(
-                READY_TIMEOUT_MS,
+                Lay_Timeout_ACK_SU_ms(),
                 ack_kind,
                 ack_seq
             )
@@ -692,7 +718,7 @@ void loop()
 
             if (
                 Cho_SESSION_READY_RBS(
-                    SESSION_SETUP_TIMEOUT_MS,
+                    Lay_Timeout_Session_SU_ms(),
                     session_id_tx,
                     session_fail_remote
                 )
@@ -1006,10 +1032,13 @@ void loop()
 
                 // Tru airtime uoc tinh cua duong report quay ve 2 hop.
                 // Neu sau nay doi SF/BW/CR hoac format report, cap nhat hang so nay.
+                uint32_t thoi_gian_phan_hoi_uoc_tinh_ms =
+                    Lay_ThoiGian_PhanHoi_E2E_UocTinh_ms();
+
                 e2e_est_ms =
                     (
-                        e2e_observed_ms > PLAY_REPORT_RETURN_EST_MS
-                        ? e2e_observed_ms - PLAY_REPORT_RETURN_EST_MS
+                        e2e_observed_ms > thoi_gian_phan_hoi_uoc_tinh_ms
+                        ? e2e_observed_ms - thoi_gian_phan_hoi_uoc_tinh_ms
                         : e2e_observed_ms
                     );
 
@@ -1018,7 +1047,7 @@ void loop()
                 Serial.printf(
                     "[SU E2E] OBS=%u ms | RETURN_EST=%u ms | PTT_RELEASE->DU_PLAY ~= %u ms\n",
                     (unsigned int)e2e_observed_ms,
-                    (unsigned int)PLAY_REPORT_RETURN_EST_MS,
+                    (unsigned int)thoi_gian_phan_hoi_uoc_tinh_ms,
                     (unsigned int)e2e_est_ms
                 );
             }
@@ -1082,6 +1111,13 @@ void loop()
                 Dat_PhanHoi_SU(ma_phan_hoi);
                 Gui_USER_CONFIRM_RBS(ma_phien_hmi, ma_phan_hoi);
             }
+        }
+
+        // Chỉ nhận lệnh điều khiển RF khi SU hoàn toàn rảnh.
+        // Không cho parser RF chen vào lúc đang chờ ACK/NACK HMI.
+        if (!HMI_SU_Dang_Cho_PhanHoi())
+        {
+            XuLy_DieuKhien_RF_SU();
         }
 
         XuLy_BaoCao_ViTri_DinhKy_SU();

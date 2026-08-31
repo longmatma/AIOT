@@ -12,6 +12,12 @@ static uint64_t ma_phien_su_gan_nhat = 0;
 static uint8_t phan_hoi_nguoi_dung_su = 0;
 static uint32_t moc_tat_led_ack_ms = 0;
 
+// Bao ve khoi truong hop mat ACK/NACK lam SU cho phan hoi mai mai.
+// MAX_KHUNG_THOAI hien tai cho phep cau noi toi da xap xi 60 giay,
+// nen 75 giay chi la watchdog du phong; khong tac dong khi ACK den binh thuong.
+static constexpr uint32_t THOI_GIAN_CHO_PHAN_HOI_TOI_DA_MS = 75000UL;
+static uint32_t moc_bat_dau_cho_phan_hoi_ms = 0;
+
 
 void KhoiTao_HMI_SU()
 {
@@ -22,6 +28,7 @@ void KhoiTao_HMI_SU()
     ma_phien_su_gan_nhat = 0;
     phan_hoi_nguoi_dung_su = 0;
     moc_tat_led_ack_ms = 0;
+    moc_bat_dau_cho_phan_hoi_ms = 0;
 
     Serial.println("[SU HMI] Khoi tao GPIO6=PTT, GPIO16=LED");
 }
@@ -46,6 +53,7 @@ void HMI_SU_BatDau_CauMoi()
     ma_phien_su_gan_nhat = 0;
     phan_hoi_nguoi_dung_su = 0;
     moc_tat_led_ack_ms = 0;
+    moc_bat_dau_cho_phan_hoi_ms = 0;
     Dat_LED_SU(false);
 }
 
@@ -53,6 +61,8 @@ void HMI_SU_BatDau_CauMoi()
 void HMI_SU_Dat_Session(uint64_t session_id)
 {
     ma_phien_su_gan_nhat = session_id;
+    phan_hoi_nguoi_dung_su = 0;
+    moc_bat_dau_cho_phan_hoi_ms = 0;
 }
 
 
@@ -64,13 +74,37 @@ uint64_t HMI_SU_Lay_Session()
 
 bool HMI_SU_Dang_Cho_PhanHoi()
 {
-    return ma_phien_su_gan_nhat != 0 && phan_hoi_nguoi_dung_su == 0;
+    if (ma_phien_su_gan_nhat == 0 || phan_hoi_nguoi_dung_su != 0)
+        return false;
+
+    // Moc timeout chi bat dau khi SU da quay ve trang thai nghi va
+    // ham nay duoc goi lan dau. Vi vay thoi gian ghi/gui cau noi dai
+    // khong bi tinh nham vao watchdog cho phan hoi.
+    uint32_t bay_gio_ms = millis();
+    if (moc_bat_dau_cho_phan_hoi_ms == 0)
+    {
+        moc_bat_dau_cho_phan_hoi_ms = bay_gio_ms == 0 ? 1UL : bay_gio_ms;
+        return true;
+    }
+
+    if ((uint32_t)(bay_gio_ms - moc_bat_dau_cho_phan_hoi_ms) >= THOI_GIAN_CHO_PHAN_HOI_TOI_DA_MS)
+    {
+        // Mat phan hoi khong duoc phep khoa beacon/RF vo thoi han.
+        ma_phien_su_gan_nhat = 0;
+        phan_hoi_nguoi_dung_su = 0;
+        moc_bat_dau_cho_phan_hoi_ms = 0;
+        Dat_LED_SU(false);
+        return false;
+    }
+
+    return true;
 }
 
 
 void Dat_PhanHoi_SU(uint8_t code)
 {
     phan_hoi_nguoi_dung_su = code;
+    moc_bat_dau_cho_phan_hoi_ms = 0;
 
     if (code == USER_RESPONSE_ACK)
     {
@@ -101,6 +135,12 @@ void Bao_Loi_Session_SU()
         Dat_LED_SU(false);
         delay(320);
     }
+
+    // Session bat tay that bai thi khong co phan hoi DU de cho nua.
+    // Giai phong ngay trang thai HMI de beacon va dieu khien RF tiep tuc.
+    ma_phien_su_gan_nhat = 0;
+    phan_hoi_nguoi_dung_su = 0;
+    moc_bat_dau_cho_phan_hoi_ms = 0;
 }
 
 
@@ -114,7 +154,15 @@ void CapNhat_LED_PhanHoi_SU()
         }
         else
         {
+            // ACK da duoc hien thi du 2 giay -> ket thuc hoan toan
+            // trang thai HMI cua phien cu.
+            //
+            // Neu chi xoa phan_hoi_nguoi_dung_su ma van giu ma phien,
+            // HMI_SU_Dang_Cho_PhanHoi() se lai tra ve true va lam SU
+            // ngung beacon dinh ky / ngung nhan dieu khien RF sau khi noi xong.
             phan_hoi_nguoi_dung_su = 0;
+            ma_phien_su_gan_nhat = 0;
+            moc_bat_dau_cho_phan_hoi_ms = 0;
             moc_tat_led_ack_ms = 0;
             Dat_LED_SU(false);
         }

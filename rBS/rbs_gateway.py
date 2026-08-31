@@ -3,7 +3,9 @@ import board
 import busio
 import digitalio
 import adafruit_rfm9x
+import builtins
 
+from dieu_khien_rf import BoDieuKhienRF
 from gps_rbs import (
     QuanLyGPSRBS,
     phan_tich_bao_cao_gps,
@@ -13,6 +15,37 @@ from gps_rbs import (
     MA_TRAM_SU as MA_GPS_SU,
     MA_TRAM_DU as MA_GPS_DU,
 )
+
+
+# ============================================================
+# LỌC LOG V11.1
+#
+# File gateway cũ có rất nhiều log chẩn đoán/timing hữu ích khi debug.
+# Không xóa logic đó để tránh ảnh hưởng transport đã ổn định; thay vào đó
+# chỉ cho hiện các nhóm log chính ở chế độ vận hành bình thường.
+# ============================================================
+_in_goc = builtins.print
+
+def print(*args, **kwargs):  # noqa: A001 - chủ đích lọc log legacy trong module này
+    noi_dung = " ".join(str(x) for x in args)
+    if not noi_dung:
+        return
+
+    cac_tien_to_duoc_hien = (
+        "[HỆ THỐNG]",
+        "[PHIÊN THOẠI]",
+        "[PHẢN HỒI]",
+        "[WATCHDOG]",
+        "[CẢNH BÁO]",
+        "[LỖI]",
+    )
+
+    if (
+        noi_dung.startswith(cac_tien_to_duoc_hien)
+        or "LỖI" in noi_dung
+        or "CẢNH BÁO" in noi_dung
+    ):
+        _in_goc(*args, **kwargs)
 
 
 def now_us():
@@ -1095,18 +1128,18 @@ def reset_session_state():
 # V10.1 - KHOI TAO / TU PHUC HOI LORA RX
 # ============================================================
 
-def cau_hinh_lora_rbs(rfm9x):
-    """Ap dung dung cau hinh RF baseline dang dung on dinh."""
+def cau_hinh_lora_rbs(rfm9x, he_so_trai_pho=7):
+    """Áp dụng RF; watchdog phải giữ đúng SF hiện tại của toàn hệ."""
     rfm9x.signal_bandwidth = 500000
-    rfm9x.spreading_factor = 7
+    rfm9x.spreading_factor = int(he_so_trai_pho)
     rfm9x.coding_rate = 5
     rfm9x.tx_power = 23
     # Dat radio ve RX ngay sau khoi tao/re-khoi tao.
     rfm9x.listen()
 
 
-def khoi_tao_lora_rbs(spi, cs, reset):
-    """Tao lai driver RFM9x va ap dung nguyen cau hinh RF hien tai."""
+def khoi_tao_lora_rbs(spi, cs, reset, he_so_trai_pho=7):
+    """Tạo lại driver RFM9x và giữ nguyên SF hiện tại khi watchdog re-init."""
     radio = adafruit_rfm9x.RFM9x(
         spi,
         cs,
@@ -1114,7 +1147,7 @@ def khoi_tao_lora_rbs(spi, cs, reset):
         TAN_SO_LORA,
         baudrate=1000000,
     )
-    cau_hinh_lora_rbs(radio)
+    cau_hinh_lora_rbs(radio, he_so_trai_pho)
     return radio
 
 
@@ -1131,24 +1164,12 @@ def phuc_hoi_rx_mem(rfm9x):
 
 def main():
 
-    print("====================================================")
-    print(" rBS - NATIVE 8 FRAME + ARQ ACK32 + FEC 8+1")
-    print(" SESSION_ID64 + VOICE SEQ32")
-    print(" INNER VOICE = 176 BYTE")
-    print(" INNER FEC   = 184 BYTE")
-    print(" RELAY VOICE = 180 BYTE")
-    print(" RELAY FEC   = 188 BYTE")
-    print(" FEC PARITY = XOR(ciphertext160 + original GCM tag8)")
-    print(" CR = 4/5 | SF7 | BW500k")
-    print(" FIRST HOP = STOP-AND-WAIT ARQ")
-    print(" SECOND HOP = PACKET FEC 8 DATA + 1 PARITY")
-    print(" FINAL = AUDIO_END -> END#1 -> DU PLAY_REPORT -> SU -> END#2/#3")
-    print(" SESSION = START -> DU READY -> MỚI CHO PHÉP VOICE")
-    print(" HMI = DU ACK TỰ ĐỘNG / NACK THỦ CÔNG -> SU -> XÁC NHẬN -> DU")
-    print(" V10.1 = V10 + rBS RX WATCHDOG TU PHUC HOI")
-    print(" LOG LINK = RSSI/SNR TB-MIN-MAX + SỐ GÓI + ARQ RETRY THEO SESSION")
-    print(f" PHASE2_RX_GUARD = {PHASE2_RX_GUARD * 1000:.1f} ms")
-    print("====================================================")
+    print(
+        "[HỆ THỐNG] rBS V11.1 | 433MHz | BW=500kHz | CR=4/5 | "
+        "RF thích nghi P_TX + SF7/SF8/SF9 | watchdog V10.1 được giữ nguyên"
+    )
+
+    bo_dieu_khien_rf = BoDieuKhienRF()
 
     CS = digitalio.DigitalInOut(board.D5)
     RESET = digitalio.DigitalInOut(board.D25)
@@ -1160,18 +1181,16 @@ def main():
     )
 
     try:
-        rfm9x = khoi_tao_lora_rbs(spi, CS, RESET)
+        rfm9x = khoi_tao_lora_rbs(spi, CS, RESET, bo_dieu_khien_rf.he_so_trai_pho_hien_tai)
 
     except RuntimeError as error:
         print(
-            "[rBS LỖI] Khởi tạo LoRa thất bại:",
+            "[LỖI] Khởi tạo LoRa rBS thất bại:",
             error,
         )
         return
 
-    print("[rBS] Khởi tạo LoRa THÀNH CÔNG")
-    print("[rBS] PHA 1 -> ĐANG NGHE SU")
-    print()
+    print("[HỆ THỐNG] LoRa rBS khởi tạo thành công | SF=7 | TX_rBS=23dBm")
 
     gps_manager = QuanLyGPSRBS()
 
@@ -1189,6 +1208,9 @@ def main():
     diag_session = None
     diag_hoan_tat_gan_nhat = None
 
+    # Mốc này dùng để không cho bộ điều khiển RF đổi cấu hình sát phiên thoại.
+    moc_hoat_dong_thoai_cuoi = time.monotonic()
+
     # Watchdog chi can biet lan cuoi radio nhan duoc BAT KY packet nao.
     # Trong he thong hien tai SU/DU co beacon dinh ky, vi vay neu im lang >20 s
     # thi re-arm RX; neu lap lai 2 lan lien tiep thi re-khoi tao driver/chip LoRa.
@@ -1196,8 +1218,8 @@ def main():
     so_lan_soft_lien_tiep = 0
 
     print(
-        f"[rBS WATCHDOG] BAT | IM_LANG={RX_WATCHDOG_IM_LANG_S:.0f}s | "
-        f"HARD_O_LAN={RX_WATCHDOG_HARD_O_LAN}"
+        f"[WATCHDOG] BẬT | IM_LẶNG={RX_WATCHDOG_IM_LANG_S:.0f}s | "
+        f"HARD_SAU={RX_WATCHDOG_HARD_O_LAN}_LẦN"
     )
 
     while True:
@@ -1228,6 +1250,14 @@ def main():
             thoi_diem_rx_cuoi = now
             so_lan_soft_lien_tiep = 0
         else:
+            # Nếu vừa đổi RF mà không nhận được beacon xác minh, bộ điều khiển
+            # tự quét SF7/SF8/SF9 để đưa toàn hệ về baseline an toàn.
+            if session_id_hien_tai is None and bo_dieu_khien_rf.kiem_tra_xac_minh(rfm9x):
+                thoi_diem_rx_cuoi = time.monotonic()
+                so_lan_soft_lien_tiep = 0
+                time.sleep(RX_IDLE_YIELD_S)
+                continue
+
             im_lang_s = now - thoi_diem_rx_cuoi
 
             if im_lang_s >= RX_WATCHDOG_IM_LANG_S:
@@ -1236,27 +1266,27 @@ def main():
                 if so_lan_soft_lien_tiep < RX_WATCHDOG_HARD_O_LAN:
                     try:
                         print(
-                            f"[rBS WATCHDOG] RX IM LANG {im_lang_s:.1f}s "
+                            f"[WATCHDOG] RX IM LẶNG {im_lang_s:.1f}s "
                             f"-> SOFT RE-ARM RX "
                             f"(LAN={so_lan_soft_lien_tiep})"
                         )
                         phuc_hoi_rx_mem(rfm9x)
                     except Exception as error:  # noqa: BLE001 - watchdog phai song qua loi driver
                         print(
-                            f"[rBS WATCHDOG][CANH BAO] SOFT RE-ARM LOI: {error}"
+                            f"[CẢNH BÁO] WATCHDOG soft re-arm lỗi: {error}"
                         )
 
                 else:
                     print(
-                        f"[rBS WATCHDOG] RX VAN IM SAU SOFT RE-ARM "
+                        f"[WATCHDOG] RX VẪN IM SAU SOFT RE-ARM "
                         f"-> HARD REINIT RFM9x"
                     )
                     try:
-                        rfm9x = khoi_tao_lora_rbs(spi, CS, RESET)
-                        print("[rBS WATCHDOG] HARD REINIT THANH CONG -> RX TRO LAI")
+                        rfm9x = khoi_tao_lora_rbs(spi, CS, RESET, bo_dieu_khien_rf.he_so_trai_pho_hien_tai)
+                        print("[WATCHDOG] HARD REINIT THÀNH CÔNG -> RX TRỞ LẠI")
                     except Exception as error:  # noqa: BLE001
                         print(
-                            f"[rBS WATCHDOG][LOI] HARD REINIT THAT BAI: {error}"
+                            f"[LỖI] WATCHDOG hard re-init thất bại: {error}"
                         )
                     so_lan_soft_lien_tiep = 0
 
@@ -1278,6 +1308,15 @@ def main():
 
                 if bao_cao_gps["la_dinh_ky"]:
                     gps_manager.in_bao_cao_dinh_ky(du_lieu_gps)
+                    bo_dieu_khien_rf.cap_nhat_du_lieu(du_lieu_gps)
+
+                    duoc_phep_dieu_chinh = (session_id_hien_tai is None)
+                    thoi_gian_ranh_s = time.monotonic() - moc_hoat_dong_thoai_cuoi
+                    bo_dieu_khien_rf.thu_dieu_chinh(
+                        rfm9x,
+                        duoc_phep_dieu_chinh,
+                        thoi_gian_ranh_s,
+                    )
                     continue
 
                 thong_ke_phien_gps = None
@@ -1333,10 +1372,9 @@ def main():
                     )
 
                 print(
-                    f"[rBS NHẬN PHẢN HỒI] "
-                    f"{'ACK TỰ ĐỘNG' if user_response['code'] == USER_RESPONSE_ACK else 'NACK THỦ CÔNG'} "
-                    f"từ DU | SESSION={user_response['session_id']:016X} | "
-                    f"{chuoi_rssi_snr(rssi_goi, snr_goi)}"
+                    f"[PHẢN HỒI] DU->rBS | "
+                    f"KẾT_QUẢ={'ACK_TỰ_ĐỘNG' if user_response['code'] == USER_RESPONSE_ACK else 'NACK_THỦ_CÔNG'} | "
+                    f"MÃ={user_response['session_id']:016X}"
                 )
                 time.sleep(USER_HMI_FORWARD_GUARD)
                 gui_user_response_cho_su(
@@ -1370,10 +1408,9 @@ def main():
                     )
 
                 print(
-                    f"[rBS NHẬN XÁC NHẬN] SU đã nhận "
-                    f"{'ACK' if user_confirm['code'] == USER_RESPONSE_ACK else 'NACK'} | "
-                    f"SESSION={user_confirm['session_id']:016X} | "
-                    f"{chuoi_rssi_snr(rssi_goi, snr_goi)}"
+                    f"[PHẢN HỒI] SU->rBS | "
+                    f"ĐÃ_NHẬN={'ACK' if user_confirm['code'] == USER_RESPONSE_ACK else 'NACK'} | "
+                    f"MÃ={user_confirm['session_id']:016X}"
                 )
                 time.sleep(USER_HMI_FORWARD_GUARD)
                 gui_user_confirm_cho_du(
@@ -1382,12 +1419,9 @@ def main():
                     user_confirm["code"],
                 )
 
-                if diag_hmi is not None:
-                    in_tong_ket_lien_ket(
-                        diag_hmi,
-                        "PHẢN HỒI DU ĐÃ ĐƯỢC SU XÁC NHẬN",
-                        gps_manager,
-                    )
+                # V11.1: không in lại tổng kết phiên ở USER_CONFIRM.
+                # Tổng kết đã được in đúng một lần khi AUDIO_END/fallback.
+                # Việc gọi lại ở đây trước kia làm log phiên thoại lặp 2-3 lần.
                 continue
 
             info = parse_packet_su(
@@ -1425,6 +1459,10 @@ def main():
                     print("[rBS] PHIÊN THOẠI KẾT THÚC BẰNG AUDIO_END")
 
                 if diag_session is not None:
+                    print(
+                        f"[PHIÊN THOẠI] HOÀN TẤT | MÃ={diag_session['session_id']:016X} | "
+                        f"ARQ_LẶP={diag_session['so_goi_trung_arq']}"
+                    )
                     in_tong_ket_lien_ket(diag_session, "AUDIO_END", gps_manager)
                     diag_hoan_tat_gan_nhat = diag_session
 
@@ -1438,8 +1476,9 @@ def main():
                     seen_keys,
                 ) = reset_session_state()
                 diag_session = None
+                moc_hoat_dong_thoai_cuoi = time.monotonic()
 
-                print("[rBS] CHỜ PHIÊN MỚI...")
+                print("[HỆ THỐNG] rBS sẵn sàng cho phiên tiếp theo")
                 print()
                 continue
 
@@ -1470,6 +1509,11 @@ def main():
                     seen_keys.clear()
 
                     diag_session = tao_chan_doan_session(session_moi)
+                    moc_hoat_dong_thoai_cuoi = time.monotonic()
+                    print(
+                        f"[PHIÊN THOẠI] BẮT ĐẦU | MÃ={session_moi:016X} | "
+                        f"SF={bo_dieu_khien_rf.he_so_trai_pho_hien_tai}"
+                    )
                     cap_nhat_thong_ke_lien_ket(
                         diag_session["link_su_rbs"],
                         rssi_goi,
@@ -1570,7 +1614,7 @@ def main():
                     session_da_gui = False
                     session_setup_failed = True
                     print(
-                        f"[rBS BẮT TAY] THẤT BẠI | SESSION={session_id_hien_tai:016X}"
+                        f"[PHIÊN THOẠI] BẮT TAY THẤT BẠI | MÃ={session_id_hien_tai:016X}"
                     )
 
                 in_tom_tat_chan_doan(diag_session)
@@ -1771,6 +1815,10 @@ def main():
                 )
 
             if diag_session is not None:
+                print(
+                    f"[PHIÊN THOẠI] HOÀN TẤT BẰNG DỰ PHÒNG | "
+                    f"MÃ={diag_session['session_id']:016X}"
+                )
                 in_tong_ket_lien_ket(diag_session, "FALLBACK HẾT THỜI GIAN AUDIO_END", gps_manager)
                 diag_hoan_tat_gan_nhat = diag_session
 
@@ -1784,8 +1832,9 @@ def main():
                 seen_keys,
             ) = reset_session_state()
             diag_session = None
+            moc_hoat_dong_thoai_cuoi = time.monotonic()
 
-            print("[rBS] CHỜ PHIÊN MỚI...")
+            print("[HỆ THỐNG] rBS sẵn sàng cho phiên tiếp theo")
             print()
 
 

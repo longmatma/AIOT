@@ -74,7 +74,15 @@ bool Gui_USER_CONFIRM_RBS(
 
 // Arduino LoRa library khoi tao PA_BOOST mac dinh 17 dBm.
 // Dat ro rang de rBS co P_TX xac dinh khi uoc luong kenh.
-#define CONG_SUAT_PHAT_SU_DBM 17
+#define CONG_SUAT_PHAT_MAC_DINH_SU_DBM 17
+
+// =====================================================
+// ĐIỀU KHIỂN RF TỪ rBS
+// rBS là bộ điều khiển trung tâm; SU chỉ áp dụng lệnh khi đang rảnh.
+// =====================================================
+void XuLy_DieuKhien_RF_SU();
+int8_t Lay_CongSuat_Phat_SU_dBm();
+uint8_t Lay_HeSo_TraiPho_SU();
 
 bool Gui_GPS_REPORT_SU(
     uint64_t ma_phien,

@@ -41,6 +41,16 @@
 #define TYPE_USER_CONFIRM   0x14
 #define TYPE_SESSION_READY  0x15
 
+// Điều khiển RF V11 từ rBS.
+#define TYPE_DIEU_KHIEN_RF  0x19
+#define TYPE_XAC_NHAN_RF    0x1A
+
+#define LENH_RF_CHUAN_BI     0x01
+#define LENH_RF_AP_DUNG      0x02
+#define LENH_RF_KHOI_PHUC    0x04
+#define PHIEN_BAN_LENH_RF     0x01
+#define ID_QUANG_BA_RF        0xFF
+
 // TYPE noi bo dua sang main.cpp.
 #define TYPE_AUDIO_END           0x04
 #define TYPE_USER_CONFIRM_LOCAL  0x06
@@ -63,6 +73,18 @@
 // RX task va PLAY_REPORT task cung dung mot SX1278.
 // Mutex ngan hai task cham SPI/radio cung luc.
 static SemaphoreHandle_t LoRa_Mutex = nullptr;
+
+// =====================================================
+// TRẠNG THÁI ĐIỀU KHIỂN RF V11
+// =====================================================
+static int8_t cong_suat_phat_du_hien_tai_dbm = CONG_SUAT_PHAT_MAC_DINH_DU_DBM;
+static uint8_t he_so_trai_pho_du_hien_tai = 7;
+
+static bool co_cau_hinh_rf_cho_ap_dung_du = false;
+static uint16_t ma_lenh_rf_cho_ap_dung_du = 0;
+static int8_t cong_suat_du_cho_ap_dung_dbm = CONG_SUAT_PHAT_MAC_DINH_DU_DBM;
+static uint8_t sf_du_cho_ap_dung = 7;
+static uint32_t moc_ap_dung_rf_du_ms = 0;
 
 
 // =====================================================
@@ -115,13 +137,13 @@ void KhoiTao_LoRa_RX()
         }
     }
 
-    LoRa.setSpreadingFactor(7);
+    LoRa.setSpreadingFactor(he_so_trai_pho_du_hien_tai);
     LoRa.setSignalBandwidth(500E3);
     LoRa.setCodingRate4(5);
     LoRa.enableCrc();
 
     // Dat ro cong suat de rBS tinh he so kenh tu RSSI.
-    LoRa.setTxPower(CONG_SUAT_PHAT_DU_DBM);
+    LoRa.setTxPower(cong_suat_phat_du_hien_tai_dbm);
 
     pinMode(
         LORA_DIO0,
@@ -130,9 +152,151 @@ void KhoiTao_LoRa_RX()
 
     LoRa.receive();
 
-    Serial.println(
-        "Khoi tao LoRa RX THANH CONG!"
+    Serial.printf(
+        "Khoi tao LoRa RX THANH CONG! | SF=%u | P_TX=%d dBm\n",
+        he_so_trai_pho_du_hien_tai,
+        cong_suat_phat_du_hien_tai_dbm
     );
+}
+
+
+// =====================================================
+// API TRẠNG THÁI RF HIỆN TẠI
+// =====================================================
+int8_t Lay_CongSuat_Phat_DU_dBm()
+{
+    return cong_suat_phat_du_hien_tai_dbm;
+}
+
+uint8_t Lay_HeSo_TraiPho_DU()
+{
+    return he_so_trai_pho_du_hien_tai;
+}
+
+
+static bool DU_ApDung_CauHinh_RF(int8_t cong_suat_dbm, uint8_t sf)
+{
+    if (cong_suat_dbm < 8 || cong_suat_dbm > 20)
+        return false;
+    if (sf < 7 || sf > 9)
+        return false;
+
+    LoRa.idle();
+    LoRa.setTxPower(cong_suat_dbm);
+    LoRa.setSpreadingFactor(sf);
+    LoRa.receive();
+
+    cong_suat_phat_du_hien_tai_dbm = cong_suat_dbm;
+    he_so_trai_pho_du_hien_tai = sf;
+
+    Serial.printf(
+        "[DU RF] DA AP DUNG | P_TX=%d dBm | SF=%u\n",
+        cong_suat_phat_du_hien_tai_dbm,
+        he_so_trai_pho_du_hien_tai
+    );
+    return true;
+}
+
+
+static void DU_KiemTra_Moc_ApDung_RF()
+{
+    if (
+        co_cau_hinh_rf_cho_ap_dung_du
+        && (int32_t)(millis() - moc_ap_dung_rf_du_ms) >= 0
+    )
+    {
+        DU_ApDung_CauHinh_RF(
+            cong_suat_du_cho_ap_dung_dbm,
+            sf_du_cho_ap_dung
+        );
+        co_cau_hinh_rf_cho_ap_dung_du = false;
+    }
+}
+
+
+static void DU_Gui_XacNhan_RF(uint16_t ma_lenh)
+{
+    uint8_t goi_xac_nhan[8] = {
+        ID_TRAM_RBS,
+        ID_TRAM_DU,
+        TYPE_XAC_NHAN_RF,
+        0x01,
+        (uint8_t)((ma_lenh >> 8) & 0xFF),
+        (uint8_t)(ma_lenh & 0xFF),
+        (uint8_t)cong_suat_phat_du_hien_tai_dbm,
+        he_so_trai_pho_du_hien_tai
+    };
+
+    LoRa.idle();
+    LoRa.beginPacket();
+    LoRa.write(goi_xac_nhan, sizeof(goi_xac_nhan));
+    LoRa.endPacket();
+    LoRa.receive();
+}
+
+
+// Trả true nếu packet đã được xử lý hoàn toàn như lệnh RF.
+static bool DU_XuLy_Goi_DieuKhien_RF(const uint8_t *goi_tin, size_t do_dai)
+{
+    if (goi_tin == nullptr || do_dai != 12)
+        return false;
+
+    bool dung_dich = goi_tin[0] == ID_TRAM_DU || goi_tin[0] == ID_QUANG_BA_RF;
+    if (
+        !dung_dich
+        || goi_tin[1] != ID_TRAM_RBS
+        || goi_tin[2] != TYPE_DIEU_KHIEN_RF
+        || goi_tin[4] != PHIEN_BAN_LENH_RF
+    )
+    {
+        return false;
+    }
+
+    uint8_t lenh = goi_tin[3];
+    uint16_t ma_lenh = ((uint16_t)goi_tin[5] << 8) | goi_tin[6];
+    int8_t cong_suat_du_moi = (int8_t)goi_tin[8];
+    uint8_t sf_moi = goi_tin[9];
+    uint32_t do_tre_ms = (uint32_t)goi_tin[10] * 100UL;
+
+    if (
+        ma_lenh == 0
+        || cong_suat_du_moi < 8 || cong_suat_du_moi > 20
+        || sf_moi < 7 || sf_moi > 9
+    )
+    {
+        return true;
+    }
+
+    if (lenh == LENH_RF_CHUAN_BI)
+    {
+        ma_lenh_rf_cho_ap_dung_du = ma_lenh;
+        cong_suat_du_cho_ap_dung_dbm = cong_suat_du_moi;
+        sf_du_cho_ap_dung = sf_moi;
+        DU_Gui_XacNhan_RF(ma_lenh);
+        return true;
+    }
+
+    if (
+        lenh == LENH_RF_AP_DUNG
+        && ma_lenh_rf_cho_ap_dung_du == ma_lenh
+    )
+    {
+        co_cau_hinh_rf_cho_ap_dung_du = true;
+        moc_ap_dung_rf_du_ms = millis() + max((uint32_t)200UL, do_tre_ms);
+        return true;
+    }
+
+    if (lenh == LENH_RF_KHOI_PHUC)
+    {
+        ma_lenh_rf_cho_ap_dung_du = ma_lenh;
+        cong_suat_du_cho_ap_dung_dbm = CONG_SUAT_PHAT_MAC_DINH_DU_DBM;
+        sf_du_cho_ap_dung = 7;
+        co_cau_hinh_rf_cho_ap_dung_du = true;
+        moc_ap_dung_rf_du_ms = millis() + max((uint32_t)200UL, do_tre_ms);
+        return true;
+    }
+
+    return true;
 }
 
 
@@ -172,6 +336,10 @@ bool Nhan_GoiTin_LoRa(
         == LOW
     )
     {
+        // Chỉ đổi SF khi không có RX_DONE đang chờ xử lý.
+        // Nhờ vậy COMMIT không làm mất packet vừa tới ở SF cũ.
+        DU_KiemTra_Moc_ApDung_RF();
+
         xSemaphoreGive(
             LoRa_Mutex
         );
@@ -227,6 +395,13 @@ bool Nhan_GoiTin_LoRa(
             LoRa_Mutex
         );
 
+        return false;
+    }
+
+    // Lệnh điều khiển RF được xử lý ngay trong lớp radio, không đưa vào queue audio.
+    if (DU_XuLy_Goi_DieuKhien_RF(raw_packet, raw_len))
+    {
+        xSemaphoreGive(LoRa_Mutex);
         return false;
     }
 
@@ -728,6 +903,9 @@ static bool Gui_Goi_ViTri_DU(
     if (du_lieu_gps.do_cao_hop_le) co_hieu |= 0x02;
     if (du_lieu_gps.toc_do_hop_le) co_hieu |= 0x04;
     if (du_lieu_gps.hdop_hop_le) co_hieu |= 0x08;
+
+    // 4 bit cao mang SF hien tai: SF7->1, SF8->2, SF9->3.
+    co_hieu |= (uint8_t)(((Lay_HeSo_TraiPho_DU() - 6) & 0x0F) << 4);
     goi_tin[3] = co_hieu;
 
     DU_Ghi_U64_BE(&goi_tin[4], ma_tham_chieu);
@@ -748,7 +926,7 @@ static bool Gui_Goi_ViTri_DU(
     DU_Ghi_U32_BE(&goi_tin[20], (uint32_t)do_cao_cm);
     DU_Ghi_U32_BE(&goi_tin[24], toc_do_cm_s);
     goi_tin[28] = du_lieu_gps.so_ve_tinh;
-    goi_tin[29] = (uint8_t)(int8_t)CONG_SUAT_PHAT_DU_DBM;
+    goi_tin[29] = (uint8_t)Lay_CongSuat_Phat_DU_dBm();
     goi_tin[30] = (hdop_x100 >> 8) & 0xFF;
     goi_tin[31] = hdop_x100 & 0xFF;
     DU_Ghi_U32_BE(&goi_tin[32], du_lieu_gps.tuoi_fix_ms);
@@ -767,7 +945,7 @@ static bool Gui_Goi_ViTri_DU(
         ? "VI_TRI_DINH_KY" : "GPS_PHIEN";
 
     Serial.printf(
-        "[DU GPS TX] %s -> rBS | MA=%016llX | HOP_LE=%u | VI_DO=%.7f | KINH_DO=%.7f | DO_CAO=%.1fm | TOC_DO=%.2fm/s | VE_TINH=%u | HDOP=%.2f | P_TX=%d dBm | TX=%s\n",
+        "[DU GPS TX] %s -> rBS | MA=%016llX | HOP_LE=%u | VI_DO=%.7f | KINH_DO=%.7f | DO_CAO=%.1fm | TOC_DO=%.2fm/s | VE_TINH=%u | HDOP=%.2f | P_TX=%d dBm | SF=%u | TX=%s\n",
         ten_loai,
         (unsigned long long)ma_tham_chieu,
         du_lieu_gps.gps_hop_le ? 1 : 0,
@@ -777,7 +955,8 @@ static bool Gui_Goi_ViTri_DU(
         du_lieu_gps.toc_do_m_s,
         du_lieu_gps.so_ve_tinh,
         du_lieu_gps.hdop,
-        CONG_SUAT_PHAT_DU_DBM,
+        Lay_CongSuat_Phat_DU_dBm(),
+        Lay_HeSo_TraiPho_DU(),
         ket_qua_tx == 1 ? "OK" : "FAIL"
     );
 

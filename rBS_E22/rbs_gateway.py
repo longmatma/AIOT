@@ -1,11 +1,8 @@
+import os
 import time
-import board
-import busio
-import digitalio
-import adafruit_rfm9x
 import builtins
 
-from dieu_khien_rf import BoDieuKhienRF
+from stm32_e22_bridge import STM32E22Bridge, BridgeError
 from gps_rbs import (
     QuanLyGPSRBS,
     phan_tich_bao_cao_gps,
@@ -38,6 +35,7 @@ def print(*args, **kwargs):  # noqa: A001 - chủ đích lọc log legacy trong 
         "[WATCHDOG]",
         "[CẢNH BÁO]",
         "[LỖI]",
+        "[STM32]",
     )
 
     if (
@@ -131,109 +129,39 @@ def cap_nhat_thong_ke_lien_ket(thong_ke, rssi, snr, loai_goi):
         )
 
 
-def _fmt_tb(sum_value, count, don_vi):
-    if count <= 0:
-        return "N/A"
-    return f"{sum_value / count:.1f} {don_vi}"
+def _gia_tri_trung_binh(thong_ke, khoa_tong, khoa_dem):
+    so_mau = int(thong_ke.get(khoa_dem, 0))
+    if so_mau <= 0:
+        return None
+    return float(thong_ke.get(khoa_tong, 0.0)) / so_mau
 
 
-def _fmt_minmax(value, don_vi):
-    if value is None:
-        return "N/A"
-    return f"{value:.1f} {don_vi}"
-
-
-def _chuoi_dem_theo_loai(thong_ke):
-    if not thong_ke["theo_loai"]:
-        return "không có"
-    return ", ".join(
-        f"{ten}={so_luong}"
-        for ten, so_luong in sorted(thong_ke["theo_loai"].items())
-    )
-
-
-def in_mot_lien_ket(ten, thong_ke):
-    print(f"[{ten}]")
-    print(
-        f"  GÓI NHẬN TẠI rBS = {thong_ke['so_goi_rx']} | "
-        f"CHI TIẾT: {_chuoi_dem_theo_loai(thong_ke)}"
-    )
-    print(
-        "  RSSI: "
-        f"TB={_fmt_tb(thong_ke['rssi_sum'], thong_ke['rssi_count'], 'dBm')} | "
-        f"MIN={_fmt_minmax(thong_ke['rssi_min'], 'dBm')} | "
-        f"MAX={_fmt_minmax(thong_ke['rssi_max'], 'dBm')} | "
-        f"MẪU={thong_ke['rssi_count']}"
-    )
-    print(
-        "  SNR : "
-        f"TB={_fmt_tb(thong_ke['snr_sum'], thong_ke['snr_count'], 'dB')} | "
-        f"MIN={_fmt_minmax(thong_ke['snr_min'], 'dB')} | "
-        f"MAX={_fmt_minmax(thong_ke['snr_max'], 'dB')} | "
-        f"MẪU={thong_ke['snr_count']}"
-    )
+def _fmt_link(value, unit):
+    return "N/A" if value is None else f"{value:.1f}{unit}"
 
 
 def in_tong_ket_lien_ket(diag, ly_do, gps_manager=None):
+    """Một dòng tổng kết RF đủ dùng để test thoại/khoảng cách, tránh spam log."""
     if diag is None:
         return
 
-    print()
-    print("====================================================")
-    print(" TỔNG KẾT CHẤT LƯỢNG LIÊN KẾT THEO SESSION")
-    print("====================================================")
-    print(f"SESSION = {diag['session_id']:016X}")
-    print(f"KẾT THÚC/CHỐT SỐ LIỆU DO = {ly_do}")
-    print("CẤU HÌNH = 433 MHz | SF7 | BW500 kHz | CR 4/5 | rBS TX=23 dBm")
-    print()
-
-    in_mot_lien_ket("SU -> rBS", diag["link_su_rbs"])
-    print(
-        f"  ARQ RETRY QUAN SÁT TẠI rBS = {diag['so_goi_trung_arq']} | "
-        f"SU GỬI LẠI SESSION_START = {diag['so_lan_su_gui_lai_start']}"
-    )
-    print(
-        "  LƯU Ý: gói ARQ trùng có thể do DATA SU->rBS cần gửi lại, "
-        "hoặc do ACK rBS->SU bị mất; không được coi trực tiếp là PER SU->rBS."
-    )
-    print()
-
-    in_mot_lien_ket("DU -> rBS", diag["link_du_rbs"])
-    print(
-        f"  SESSION_START rBS->DU ĐÃ THỬ = {diag['so_lan_start_toi_du']} | "
-        f"SESSION_READY DU->rBS = {1 if diag['da_nhan_ready_tu_du'] else 0}"
-    )
-    print()
-
     su = diag["link_su_rbs"]
     du = diag["link_du_rbs"]
-    if su["rssi_count"] > 0 and du["rssi_count"] > 0:
-        su_avg = su["rssi_sum"] / su["rssi_count"]
-        du_avg = du["rssi_sum"] / du["rssi_count"]
-        print(
-            f"[SO SÁNH RSSI TB] SU->rBS={su_avg:.1f} dBm | "
-            f"DU->rBS={du_avg:.1f} dBm | CHÊNH={abs(su_avg-du_avg):.1f} dB"
-        )
-    if su["snr_count"] > 0 and du["snr_count"] > 0:
-        su_avg = su["snr_sum"] / su["snr_count"]
-        du_avg = du["snr_sum"] / du["snr_count"]
-        print(
-            f"[SO SÁNH SNR TB]  SU->rBS={su_avg:.1f} dB | "
-            f"DU->rBS={du_avg:.1f} dB | CHÊNH={abs(su_avg-du_avg):.1f} dB"
-        )
+    su_rssi = _gia_tri_trung_binh(su, "rssi_sum", "rssi_count")
+    su_snr = _gia_tri_trung_binh(su, "snr_sum", "snr_count")
+    du_rssi = _gia_tri_trung_binh(du, "rssi_sum", "rssi_count")
+    du_snr = _gia_tri_trung_binh(du, "snr_sum", "snr_count")
 
     print(
-        "[GHI CHÚ] RSSI/SNR dùng để đánh giá và so sánh chất lượng link. "
-        "Không quy đổi trực tiếp một giá trị RSSI thành khoảng cách mét nếu chưa hiệu chuẩn thực địa."
+        f"[PHIÊN THOẠI] LIÊN KẾT | MÃ={diag['session_id']:016X} | "
+        f"SU->rBS RSSI_TB={_fmt_link(su_rssi, 'dBm')} SNR_TB={_fmt_link(su_snr, 'dB')} | "
+        f"DU->rBS RSSI_TB={_fmt_link(du_rssi, 'dBm')} SNR_TB={_fmt_link(du_snr, 'dB')} | "
+        f"ARQ_LẶP={diag['so_goi_trung_arq']} | KẾT_THÚC={ly_do}"
     )
 
     if gps_manager is not None:
-        print()
         gps_manager.in_tom_tat(diag["session_id"])
         gps_manager.ghi_csv_session(diag, ly_do)
-
-    print("====================================================")
-    print()
 
 
 def tao_chan_doan_session(session_id):
@@ -274,6 +202,12 @@ ID_TRAM_DU = 0x02
 ID_TRAM_RBS = 0x03
 
 TAN_SO_LORA = 433.0
+TAN_SO_LORA_HZ = 433_000_000
+BANG_THONG_LORA_HZ = 500_000
+HE_SO_TRAI_PHO_CO_DINH = 7
+MA_HOA_KENH_MAU_SO = 5  # CR 4/5
+CONG_SUAT_RBS_DBM = 30  # E22-400M30S: dùng mức công suất tối đa của module
+
 
 TYPE_VOICE = 0x01
 TYPE_SESSION_START = 0x02
@@ -327,7 +261,7 @@ PLAY_REPORT_FORWARD_GUARD = 0.008
 PHASE2_RX_GUARD = 0.008
 READY_GUARD = 0.010
 
-# V10.1 - RX watchdog cho rBS.
+# RX watchdog cho rBS qua STM32 bridge.
 # DU/SU co beacon dinh ky ~5 s, nen 20 s im lang la bat thuong trong che do van hanh.
 # Khong thay doi protocol/ARQ/FEC/AES hay cac guard da on dinh.
 RX_WATCHDOG_IM_LANG_S = 20.0
@@ -1125,37 +1059,32 @@ def reset_session_state():
 
 
 # ============================================================
-# V10.1 - KHOI TAO / TU PHUC HOI LORA RX
+# E22-400M30S QUA STM32 UART BRIDGE
 # ============================================================
 
-def cau_hinh_lora_rbs(rfm9x, he_so_trai_pho=7):
-    """Áp dụng RF; watchdog phải giữ đúng SF hiện tại của toàn hệ."""
-    rfm9x.signal_bandwidth = 500000
-    rfm9x.spreading_factor = int(he_so_trai_pho)
-    rfm9x.coding_rate = 5
-    rfm9x.tx_power = 23
-    # Dat radio ve RX ngay sau khoi tao/re-khoi tao.
-    rfm9x.listen()
+def khoi_tao_lora_rbs():
+    """Mở UART tới STM32; STM32 sở hữu SPI/BUSY/DIO/RESET của E22."""
+    port = os.environ.get("RBS_STM_UART", "/dev/serial0")
+    baud = int(os.environ.get("RBS_STM_BAUD", "460800"))
 
-
-def khoi_tao_lora_rbs(spi, cs, reset, he_so_trai_pho=7):
-    """Tạo lại driver RFM9x và giữ nguyên SF hiện tại khi watchdog re-init."""
-    radio = adafruit_rfm9x.RFM9x(
-        spi,
-        cs,
-        reset,
-        TAN_SO_LORA,
-        baudrate=1000000,
+    return STM32E22Bridge(
+        port=port,
+        baudrate=baud,
+        frequency_hz=TAN_SO_LORA_HZ,
+        bandwidth_hz=BANG_THONG_LORA_HZ,
+        spreading_factor=HE_SO_TRAI_PHO_CO_DINH,
+        coding_rate_denominator=MA_HOA_KENH_MAU_SO,
+        tx_power_dbm=CONG_SUAT_RBS_DBM,
+        preamble_symbols=8,
+        sync_word=0x12,
+        crc_enabled=True,
+        iq_inverted=False,
     )
-    cau_hinh_lora_rbs(radio, he_so_trai_pho)
-    return radio
 
 
-def phuc_hoi_rx_mem(rfm9x):
-    """Soft re-arm: khong reset chip, chi dua RX ve STANDBY roi RX lien tuc."""
-    rfm9x.idle()
-    time.sleep(0.002)
-    rfm9x.listen()
+def phuc_hoi_rx_mem(radio):
+    """Yêu cầu STM32 đưa E22 về RX liên tục, không reset toàn hệ thống."""
+    radio.listen()
 
 
 # ============================================================
@@ -1165,32 +1094,21 @@ def phuc_hoi_rx_mem(rfm9x):
 def main():
 
     print(
-        "[HỆ THỐNG] rBS V11.1 | 433MHz | BW=500kHz | CR=4/5 | "
-        "RF thích nghi P_TX + SF7/SF8/SF9 | watchdog V10.1 được giữ nguyên"
+        "[HỆ THỐNG] rBS E22-400M30S + STM32 BRIDGE | "
+        "433MHz | BW=500kHz | CR=4/5 | SF7 cố định | TX_rBS=30dBm"
     )
-
-    bo_dieu_khien_rf = BoDieuKhienRF()
-
-    CS = digitalio.DigitalInOut(board.D5)
-    RESET = digitalio.DigitalInOut(board.D25)
-
-    spi = busio.SPI(
-        board.SCK,
-        MOSI=board.MOSI,
-        MISO=board.MISO,
+    print(
+        f"[HỆ THỐNG] Pi->STM32 UART={os.environ.get('RBS_STM_UART', '/dev/serial0')} | "
+        f"baud={os.environ.get('RBS_STM_BAUD', '460800')} | STM32->E22 bằng SPI"
     )
 
     try:
-        rfm9x = khoi_tao_lora_rbs(spi, CS, RESET, bo_dieu_khien_rf.he_so_trai_pho_hien_tai)
-
-    except RuntimeError as error:
-        print(
-            "[LỖI] Khởi tạo LoRa rBS thất bại:",
-            error,
-        )
+        rfm9x = khoi_tao_lora_rbs()
+    except (RuntimeError, BridgeError, OSError) as error:
+        print("[LỖI] Không kết nối được STM32/E22:", error)
         return
 
-    print("[HỆ THỐNG] LoRa rBS khởi tạo thành công | SF=7 | TX_rBS=23dBm")
+    print("[HỆ THỐNG] E22 rBS sẵn sàng | SF7 cố định | TX_rBS=30 dBm")
 
     gps_manager = QuanLyGPSRBS()
 
@@ -1207,9 +1125,6 @@ def main():
     t_ack_end_us = None
     diag_session = None
     diag_hoan_tat_gan_nhat = None
-
-    # Mốc này dùng để không cho bộ điều khiển RF đổi cấu hình sát phiên thoại.
-    moc_hoat_dong_thoai_cuoi = time.monotonic()
 
     # Watchdog chi can biet lan cuoi radio nhan duoc BAT KY packet nao.
     # Trong he thong hien tai SU/DU co beacon dinh ky, vi vay neu im lang >20 s
@@ -1250,14 +1165,6 @@ def main():
             thoi_diem_rx_cuoi = now
             so_lan_soft_lien_tiep = 0
         else:
-            # Nếu vừa đổi RF mà không nhận được beacon xác minh, bộ điều khiển
-            # tự quét SF7/SF8/SF9 để đưa toàn hệ về baseline an toàn.
-            if session_id_hien_tai is None and bo_dieu_khien_rf.kiem_tra_xac_minh(rfm9x):
-                thoi_diem_rx_cuoi = time.monotonic()
-                so_lan_soft_lien_tiep = 0
-                time.sleep(RX_IDLE_YIELD_S)
-                continue
-
             im_lang_s = now - thoi_diem_rx_cuoi
 
             if im_lang_s >= RX_WATCHDOG_IM_LANG_S:
@@ -1278,16 +1185,13 @@ def main():
 
                 else:
                     print(
-                        f"[WATCHDOG] RX VẪN IM SAU SOFT RE-ARM "
-                        f"-> HARD REINIT RFM9x"
+                        f"[WATCHDOG] RX vẫn im -> kết nối lại STM32/E22"
                     )
                     try:
-                        rfm9x = khoi_tao_lora_rbs(spi, CS, RESET, bo_dieu_khien_rf.he_so_trai_pho_hien_tai)
-                        print("[WATCHDOG] HARD REINIT THÀNH CÔNG -> RX TRỞ LẠI")
+                        rfm9x.reconnect()
+                        print("[WATCHDOG] STM32/E22 kết nối lại thành công")
                     except Exception as error:  # noqa: BLE001
-                        print(
-                            f"[LỖI] WATCHDOG hard re-init thất bại: {error}"
-                        )
+                        print(f"[LỖI] WATCHDOG reconnect thất bại: {error}")
                     so_lan_soft_lien_tiep = 0
 
                 # Bat dau mot cua so watchdog moi sau moi lan phuc hoi.
@@ -1307,16 +1211,8 @@ def main():
                 du_lieu_gps = gps_manager.cap_nhat(bao_cao_gps, rssi_goi, snr_goi)
 
                 if bao_cao_gps["la_dinh_ky"]:
-                    gps_manager.in_bao_cao_dinh_ky(du_lieu_gps)
-                    bo_dieu_khien_rf.cap_nhat_du_lieu(du_lieu_gps)
-
-                    duoc_phep_dieu_chinh = (session_id_hien_tai is None)
-                    thoi_gian_ranh_s = time.monotonic() - moc_hoat_dong_thoai_cuoi
-                    bo_dieu_khien_rf.thu_dieu_chinh(
-                        rfm9x,
-                        duoc_phep_dieu_chinh,
-                        thoi_gian_ranh_s,
-                    )
+                    # Giữ telemetry/CSV để đo khoảng cách và chất lượng link,
+                    # nhưng không còn điều khiển P_TX/SF tự động.
                     continue
 
                 thong_ke_phien_gps = None
@@ -1476,7 +1372,6 @@ def main():
                     seen_keys,
                 ) = reset_session_state()
                 diag_session = None
-                moc_hoat_dong_thoai_cuoi = time.monotonic()
 
                 print("[HỆ THỐNG] rBS sẵn sàng cho phiên tiếp theo")
                 print()
@@ -1509,10 +1404,9 @@ def main():
                     seen_keys.clear()
 
                     diag_session = tao_chan_doan_session(session_moi)
-                    moc_hoat_dong_thoai_cuoi = time.monotonic()
                     print(
                         f"[PHIÊN THOẠI] BẮT ĐẦU | MÃ={session_moi:016X} | "
-                        f"SF={bo_dieu_khien_rf.he_so_trai_pho_hien_tai}"
+                        f"SF={HE_SO_TRAI_PHO_CO_DINH}"
                     )
                     cap_nhat_thong_ke_lien_ket(
                         diag_session["link_su_rbs"],
@@ -1832,7 +1726,6 @@ def main():
                 seen_keys,
             ) = reset_session_state()
             diag_session = None
-            moc_hoat_dong_thoai_cuoi = time.monotonic()
 
             print("[HỆ THỐNG] rBS sẵn sàng cho phiên tiếp theo")
             print()

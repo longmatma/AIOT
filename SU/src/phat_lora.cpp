@@ -35,38 +35,11 @@ static const uint32_t POST_READY_TX_GUARD_MS = 8;
 
 
 // =====================================================
-// ĐIỀU KHIỂN RF V11 TỪ rBS
-//
-// Packet physical 12B (RadioHead-compatible):
-// [0] DST = SU hoặc 0xFF broadcast
-// [1] SRC = rBS
-// [2] TYPE_DIEU_KHIEN_RF = 0x19
-// [3] LENH: 1=CHUAN_BI, 2=AP_DUNG, 4=KHOI_PHUC
-// [4] PHIEN_BAN = 1
-// [5..6] MA_LENH16
-// [7] P_TX_SU int8
-// [8] P_TX_DU int8
-// [9] SF chung
-// [10] do tre ap dung, don vi 100 ms
-// [11] reserved
-//
-// SU ACK CHUAN_BI bằng packet 8B ở SF hiện tại rồi mới chờ COMMIT.
-// Đây là cơ chế 2 pha để tránh rBS/SU/DU đổi SF lệch nhau.
+// RF CỐ ĐỊNH
+// Bản này quay lại mục tiêu truyền thoại/đo khoảng cách; không đổi P_TX/SF runtime.
 // =====================================================
-static const uint8_t TYPE_DIEU_KHIEN_RF = 0x19;
-static const uint8_t TYPE_XAC_NHAN_RF = 0x1A;
-static const uint8_t LENH_RF_CHUAN_BI = 0x01;
-static const uint8_t LENH_RF_AP_DUNG = 0x02;
-static const uint8_t LENH_RF_KHOI_PHUC = 0x04;
-static const uint8_t PHIEN_BAN_LENH_RF = 0x01;
-static const uint8_t ID_QUANG_BA_RF = 0xFF;
-
-static int8_t cong_suat_phat_su_hien_tai_dbm = CONG_SUAT_PHAT_MAC_DINH_SU_DBM;
-static uint8_t he_so_trai_pho_su_hien_tai = 7;
-
-static uint16_t ma_lenh_rf_cho_ap_dung = 0;
-static int8_t cong_suat_su_cho_ap_dung_dbm = CONG_SUAT_PHAT_MAC_DINH_SU_DBM;
-static uint8_t sf_cho_ap_dung = 7;
+static const int8_t CONG_SUAT_SU_DBM = CONG_SUAT_PHAT_SU_DBM;
+static const uint8_t SF_SU = HE_SO_TRAI_PHO_SU;
 
 
 // =====================================================
@@ -104,7 +77,7 @@ void KhoiTao_LoRa()
         }
     }
 
-    LoRa.setSpreadingFactor(he_so_trai_pho_su_hien_tai);
+    LoRa.setSpreadingFactor(SF_SU);
     LoRa.setSignalBandwidth(500E3);
 
     // GIỮ CR 4/5.
@@ -115,14 +88,14 @@ void KhoiTao_LoRa()
     LoRa.enableCrc();
 
     // Dat ro cong suat de tinh he so kenh tai rBS.
-    LoRa.setTxPower(cong_suat_phat_su_hien_tai_dbm);
+    LoRa.setTxPower(CONG_SUAT_SU_DBM);
 
     LoRa.idle();
 
     Serial.printf(
         "Khoi tao LoRa THANH CONG! | SF=%u | BW500 | CR4/5 | P_TX=%d dBm\n",
-        he_so_trai_pho_su_hien_tai,
-        cong_suat_phat_su_hien_tai_dbm
+        SF_SU,
+        CONG_SUAT_SU_DBM
     );
 }
 
@@ -668,156 +641,16 @@ bool Gui_USER_CONFIRM_RBS(
 
 
 // =====================================================
-// API TRẠNG THÁI RF HIỆN TẠI
+// RF cố định - getter chỉ phục vụ telemetry/GPS.
 // =====================================================
 int8_t Lay_CongSuat_Phat_SU_dBm()
 {
-    return cong_suat_phat_su_hien_tai_dbm;
+    return CONG_SUAT_SU_DBM;
 }
 
 uint8_t Lay_HeSo_TraiPho_SU()
 {
-    return he_so_trai_pho_su_hien_tai;
-}
-
-
-// =====================================================
-// ÁP DỤNG RF TẠI SU
-// Chỉ chấp nhận miền đã quy hoạch cho V11: P_TX 8..20 dBm, SF7..SF9.
-// =====================================================
-static bool SU_ApDung_CauHinh_RF(int8_t cong_suat_dbm, uint8_t sf)
-{
-    if (cong_suat_dbm < 8 || cong_suat_dbm > 20)
-        return false;
-
-    if (sf < 7 || sf > 9)
-        return false;
-
-    LoRa.idle();
-    LoRa.setTxPower(cong_suat_dbm);
-    LoRa.setSpreadingFactor(sf);
-    LoRa.receive();
-
-    cong_suat_phat_su_hien_tai_dbm = cong_suat_dbm;
-    he_so_trai_pho_su_hien_tai = sf;
-
-    Serial.printf(
-        "[SU RF] DA AP DUNG | P_TX=%d dBm | SF=%u\n",
-        cong_suat_phat_su_hien_tai_dbm,
-        he_so_trai_pho_su_hien_tai
-    );
-
-    return true;
-}
-
-
-static void SU_Gui_XacNhan_RF(uint16_t ma_lenh)
-{
-    // Physical 8B:
-    // DST rBS | SRC SU | TYPE 0x1A | KQ=1 | MA_LENH16 | P_TX | SF.
-    uint8_t goi_xac_nhan[8] = {
-        ID_RBS_READY,
-        ID_SU_READY,
-        TYPE_XAC_NHAN_RF,
-        0x01,
-        (uint8_t)((ma_lenh >> 8) & 0xFF),
-        (uint8_t)(ma_lenh & 0xFF),
-        (uint8_t)cong_suat_phat_su_hien_tai_dbm,
-        he_so_trai_pho_su_hien_tai
-    };
-
-    Phat_GoiTin_LoRa(goi_xac_nhan, sizeof(goi_xac_nhan));
-    LoRa.receive();
-}
-
-
-// =====================================================
-// XỬ LÝ LỆNH RF KHI SU ĐANG IDLE
-// Chỉ chạy khi SU idle; COMMIT có thể giữ SU tối đa ~0.8 s để đổi SF đồng bộ.
-// =====================================================
-void XuLy_DieuKhien_RF_SU()
-{
-    int packet_size = LoRa.parsePacket();
-    if (packet_size <= 0)
-        return;
-
-    uint8_t goi_tin[64] = {};
-    size_t n = 0;
-    while (LoRa.available() && n < sizeof(goi_tin))
-        goi_tin[n++] = (uint8_t)LoRa.read();
-    while (LoRa.available())
-        LoRa.read();
-
-    LoRa.receive();
-
-    if (packet_size != 12 || n != 12)
-        return;
-
-    bool dung_dich = goi_tin[0] == ID_SU_READY || goi_tin[0] == ID_QUANG_BA_RF;
-    if (
-        !dung_dich
-        || goi_tin[1] != ID_RBS_READY
-        || goi_tin[2] != TYPE_DIEU_KHIEN_RF
-        || goi_tin[4] != PHIEN_BAN_LENH_RF
-    )
-    {
-        return;
-    }
-
-    uint8_t lenh = goi_tin[3];
-    uint16_t ma_lenh = ((uint16_t)goi_tin[5] << 8) | goi_tin[6];
-    int8_t cong_suat_su_moi = (int8_t)goi_tin[7];
-    uint8_t sf_moi = goi_tin[9];
-    uint32_t do_tre_ms = (uint32_t)goi_tin[10] * 100UL;
-
-    if (
-        ma_lenh == 0
-        || cong_suat_su_moi < 8 || cong_suat_su_moi > 20
-        || sf_moi < 7 || sf_moi > 9
-    )
-    {
-        return;
-    }
-
-    if (lenh == LENH_RF_CHUAN_BI)
-    {
-        ma_lenh_rf_cho_ap_dung = ma_lenh;
-        cong_suat_su_cho_ap_dung_dbm = cong_suat_su_moi;
-        sf_cho_ap_dung = sf_moi;
-
-        // ACK tại cấu hình CŨ; rBS chỉ COMMIT nếu cả SU và DU đều ACK.
-        SU_Gui_XacNhan_RF(ma_lenh);
-        return;
-    }
-
-    if (
-        lenh == LENH_RF_AP_DUNG
-        && ma_lenh_rf_cho_ap_dung == ma_lenh
-    )
-    {
-        // SU không có RX task riêng. Vì vậy sau khi nhận COMMIT, giữ main ở trạng
-        // thái idle trong đúng khoảng trì hoãn rồi áp dụng ngay. Cách này tránh
-        // trường hợp người dùng bấm PTT giữa COMMIT và mốc đổi SF làm SU đổi muộn.
-        delay(max((uint32_t)200UL, do_tre_ms));
-        SU_ApDung_CauHinh_RF(
-            cong_suat_su_cho_ap_dung_dbm,
-            sf_cho_ap_dung
-        );
-        return;
-    }
-
-    // Lệnh khôi phục được phép tự chứa cấu hình, kể cả khi PREPARE trước đó mất.
-    if (lenh == LENH_RF_KHOI_PHUC)
-    {
-        ma_lenh_rf_cho_ap_dung = ma_lenh;
-        cong_suat_su_cho_ap_dung_dbm = CONG_SUAT_PHAT_MAC_DINH_SU_DBM;
-        sf_cho_ap_dung = 7;
-        delay(max((uint32_t)200UL, do_tre_ms));
-        SU_ApDung_CauHinh_RF(
-            cong_suat_su_cho_ap_dung_dbm,
-            sf_cho_ap_dung
-        );
-    }
+    return SF_SU;
 }
 
 

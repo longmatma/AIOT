@@ -155,6 +155,12 @@ class STM32E22Bridge:
     # Kết nối / cấu hình
     # ------------------------------------------------------------------
     def connect(self) -> None:
+        # Reconnect phải bắt đầu từ trạng thái parser sạch. Frame cũ còn sót
+        # không được phép ảnh hưởng phiên UART/radio mới.
+        self._rx_queue.clear()
+        self._event_queue.clear()
+        self._rx_buffer.clear()
+
         if serial is None:
             raise BridgeError(
                 "Thiếu pyserial. Cài trên Raspberry Pi bằng: sudo apt install python3-serial"
@@ -176,6 +182,13 @@ class STM32E22Bridge:
 
     def reconnect(self) -> None:
         self.connect()
+
+    def reset_radio(self) -> None:
+        """Reset cứng E22 qua STM32 rồi trở lại RX với cấu hình đã lưu."""
+        self._command(CMD_RADIO_RESET, b"", timeout=1.5, expected=(EVT_ACK,))
+        self._rx_queue.clear()
+        self._event_queue.clear()
+        self._rx_buffer.clear()
 
     def close(self) -> None:
         if self._ser is not None:

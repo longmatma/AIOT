@@ -1,0 +1,23 @@
+[Unit]
+Description=rBS LoRa Gateway - VEDC 2026
+Documentation=man:systemd.service(5)
+After=local-fs.target
+ConditionPathExists=/home/admin/rbs_gateway.py
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=admin
+WorkingDirectory=/home/admin
+Environment=PYTHONUNBUFFERED=1
+Environment=RBS_STM_UART=/dev/serial0
+Environment=RBS_STM_BAUD=115200
+ExecStartPre=/bin/sleep 2
+ExecStart=/usr/bin/python3 /home/admin/rbs_gateway.py
+Restart=always
+RestartSec=2
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

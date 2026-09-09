@@ -15,34 +15,72 @@ from gps_rbs import (
 
 
 # ============================================================
-# LỌC LOG V11.1
+# LOG VẬN HÀNH TỐI GIẢN
 #
-# File gateway cũ có rất nhiều log chẩn đoán/timing hữu ích khi debug.
-# Không xóa logic đó để tránh ảnh hưởng transport đã ổn định; thay vào đó
-# chỉ cho hiện các nhóm log chính ở chế độ vận hành bình thường.
+# Mặc định chỉ in những sự kiện cần thiết để giảm I/O journal:
+# - khởi động / radio sẵn sàng
+# - bắt đầu / hoàn tất / thất bại phiên thoại
+# - phản hồi cuối phiên
+# - cảnh báo / lỗi
+# - watchdog khi phải HARD RESET / reconnect
+#
+# Toàn bộ log legacy vẫn còn trong code. Khi cần debug chỉ cần chạy với:
+#   RBS_LOG_DEBUG=1
+# mà không phải sửa lại source.
 # ============================================================
 _in_goc = builtins.print
+_LOG_DEBUG = os.environ.get("RBS_LOG_DEBUG", "0").strip().lower() in {
+    "1", "true", "yes", "on"
+}
 
-def print(*args, **kwargs):  # noqa: A001 - chủ đích lọc log legacy trong module này
-    noi_dung = " ".join(str(x) for x in args)
-    if not noi_dung:
+
+def _la_log_quan_trong(noi_dung: str) -> bool:
+    if noi_dung.startswith("[LỖI]") or noi_dung.startswith("[CẢNH BÁO]"):
+        return True
+
+    if noi_dung.startswith("[PHẢN HỒI]"):
+        return True
+
+    if noi_dung.startswith("[PHIÊN THOẠI]"):
+        return any(
+            cum in noi_dung
+            for cum in (
+                "BẮT ĐẦU",
+                "HOÀN TẤT",
+                "BẮT TAY THẤT BẠI",
+            )
+        )
+
+    if noi_dung.startswith("[HỆ THỐNG]"):
+        return (
+            "rBS E22-400M30S + STM32 BRIDGE" in noi_dung
+            or "Pi->STM32 UART=" in noi_dung
+            or "E22 rBS sẵn sàng" in noi_dung
+        )
+
+    if noi_dung.startswith("[WATCHDOG]"):
+        return any(
+            cum in noi_dung
+            for cum in (
+                "BẬT",
+                "HARD RESET",
+                "reconnect",
+            )
+        )
+
+    return False
+
+
+def print(*args, **kwargs):  # noqa: A001 - lọc log legacy trong module này
+    if _LOG_DEBUG:
+        _in_goc(*args, **kwargs)
         return
 
-    cac_tien_to_duoc_hien = (
-        "[HỆ THỐNG]",
-        "[PHIÊN THOẠI]",
-        "[PHẢN HỒI]",
-        "[WATCHDOG]",
-        "[CẢNH BÁO]",
-        "[LỖI]",
-        "[STM32]",
-    )
+    if not args:
+        return
 
-    if (
-        noi_dung.startswith(cac_tien_to_duoc_hien)
-        or "LỖI" in noi_dung
-        or "CẢNH BÁO" in noi_dung
-    ):
+    noi_dung = " ".join(str(x) for x in args)
+    if noi_dung and _la_log_quan_trong(noi_dung):
         _in_goc(*args, **kwargs)
 
 
@@ -1063,13 +1101,12 @@ def reset_session_state():
 # ============================================================
 
 def khoi_tao_lora_rbs():
-    """Mở UART tới STM32; STM32 sở hữu SPI/BUSY/DIO/RESET của E22."""
-    port = os.environ.get("RBS_STM_UART", "/dev/serial0")
-    baud = int(os.environ.get("RBS_STM_BAUD", "460800"))
+    """Mở UART tới STM32; STM32 sở hữu SPI/BUSY/DIO/RESET của E22.
 
+    Port/baud để STM32E22Bridge (hoặc biến môi trường) làm nguồn cấu hình duy nhất,
+    tránh lệch baud giữa gateway và bridge.
+    """
     return STM32E22Bridge(
-        port=port,
-        baudrate=baud,
         frequency_hz=TAN_SO_LORA_HZ,
         bandwidth_hz=BANG_THONG_LORA_HZ,
         spreading_factor=HE_SO_TRAI_PHO_CO_DINH,
@@ -1097,17 +1134,16 @@ def main():
         "[HỆ THỐNG] rBS E22-400M30S + STM32 BRIDGE | "
         "433MHz | BW=500kHz | CR=4/5 | SF7 cố định | TX_rBS=30dBm"
     )
-    print(
-        f"[HỆ THỐNG] Pi->STM32 UART={os.environ.get('RBS_STM_UART', '/dev/serial0')} | "
-        f"baud={os.environ.get('RBS_STM_BAUD', '460800')} | STM32->E22 bằng SPI"
-    )
-
     try:
         rfm9x = khoi_tao_lora_rbs()
     except (RuntimeError, BridgeError, OSError) as error:
         print("[LỖI] Không kết nối được STM32/E22:", error)
         return
 
+    print(
+        f"[HỆ THỐNG] Pi->STM32 UART={rfm9x.port} | baud={rfm9x.baudrate} | "
+        "STM32->E22 bằng SPI"
+    )
     print("[HỆ THỐNG] E22 rBS sẵn sàng | SF7 cố định | TX_rBS=30 dBm")
 
     gps_manager = QuanLyGPSRBS()
@@ -1184,14 +1220,22 @@ def main():
                         )
 
                 else:
-                    print(
-                        f"[WATCHDOG] RX vẫn im -> kết nối lại STM32/E22"
-                    )
+                    print("[WATCHDOG] RX vẫn im -> HARD RESET E22 qua STM32")
                     try:
-                        rfm9x.reconnect()
-                        print("[WATCHDOG] STM32/E22 kết nối lại thành công")
-                    except Exception as error:  # noqa: BLE001
-                        print(f"[LỖI] WATCHDOG reconnect thất bại: {error}")
+                        rfm9x.reset_radio()
+                        print("[WATCHDOG] HARD RESET E22 thành công -> RX trở lại")
+                    except Exception as reset_error:  # noqa: BLE001
+                        print(
+                            f"[CẢNH BÁO] HARD RESET E22 lỗi: {reset_error} -> "
+                            "thử reconnect UART/STM32"
+                        )
+                        try:
+                            rfm9x.reconnect()
+                            print("[WATCHDOG] STM32/E22 reconnect thành công")
+                        except Exception as reconnect_error:  # noqa: BLE001
+                            print(
+                                f"[LỖI] WATCHDOG reconnect thất bại: {reconnect_error}"
+                            )
                     so_lan_soft_lien_tiep = 0
 
                 # Bat dau mot cua so watchdog moi sau moi lan phuc hoi.

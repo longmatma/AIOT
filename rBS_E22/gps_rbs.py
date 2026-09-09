@@ -1,6 +1,8 @@
 import csv
 import math
+import os
 import time
+import builtins
 from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
@@ -24,8 +26,8 @@ from statistics import median
 # Đây là tọa độ TẠM lấy từ SU/DU khi đặt cạnh rBS.
 # Khi có phép đo ngoài trời tốt hơn chỉ cần sửa đúng 2 biến này.
 # ============================================================
-VI_DO_RBS = 20.9810400
-KINH_DO_RBS = 105.7996883
+VI_DO_RBS = 20.9807467
+KINH_DO_RBS = 105.7962650
 
 # ============================================================
 # LOẠI GÓI / ID
@@ -43,8 +45,8 @@ MA_TRAM_RBS = 0x03
 # 4 bit cao của byte flags (byte 3) mã hóa SF:
 #   1 -> SF7, 2 -> SF8, 3 -> SF9.
 CONG_SUAT_PHAT_MAC_DINH_DBM = {
-    MA_TRAM_SU: 17.0,
-    MA_TRAM_DU: 17.0,
+    MA_TRAM_SU: 20.0,
+    MA_TRAM_DU: 20.0,
 }
 HE_SO_TRAI_PHO_MAC_DINH = 7
 
@@ -58,8 +60,22 @@ GPS_SO_MAU_LOC = 3
 GPS_MAU_TOI_DA_CU_S = 20.0
 
 # Dùng file mới để không trộn header V10 với V11.
-DUONG_DAN_CSV_PHIEN = Path('/home/admin/rbs_phien_v11.csv')
-DUONG_DAN_CSV_DINH_KY = Path('/home/admin/rbs_lien_ket_dinh_ky_v11.csv')
+THU_MUC_HOME = Path.home()
+DUONG_DAN_CSV_PHIEN = THU_MUC_HOME / 'rbs_phien_v11.csv'
+DUONG_DAN_CSV_DINH_KY = THU_MUC_HOME / 'rbs_lien_ket_dinh_ky_v11.csv'
+
+
+# GPS/telemetry vẫn được xử lý và ghi CSV đầy đủ, nhưng mặc định không in
+# ra journal để tránh spam log trong lúc relay thoại. Bật lại khi cần debug:
+#   RBS_LOG_DEBUG=1
+_in_goc = builtins.print
+_LOG_DEBUG = os.environ.get("RBS_LOG_DEBUG", "0").strip().lower() in {
+    "1", "true", "yes", "on"
+}
+
+def _log_gps(*args, **kwargs):
+    if _LOG_DEBUG:
+        _in_goc(*args, **kwargs)
 
 
 def _doc_u32(du_lieu):
@@ -184,11 +200,11 @@ class QuanLyGPSRBS:
             MA_TRAM_DU: self._tao_thong_ke_beacon(),
         }
 
-        print(
+        _log_gps(
             f'[HỆ THỐNG] Tọa độ rBS cố định = '
             f'{VI_DO_RBS:.7f}, {KINH_DO_RBS:.7f} (tọa độ tạm để thử nghiệm)'
         )
-        print(
+        _log_gps(
             '[HỆ THỐNG] Bộ lọc GPS = '
             f'>={GPS_MIN_VE_TINH_2D} vệ tinh | '
             f'HDOP<={GPS_HDOP_TOI_DA_2D:.1f} | '
@@ -391,7 +407,7 @@ class QuanLyGPSRBS:
 
         # PDR vẫn được tính và giữ nội bộ/CSV để bộ điều khiển RF sử dụng,
         # nhưng không in ở log vận hành bình thường để log gọn hơn.
-        print(
+        _log_gps(
             f'[LIÊN KẾT] {ten}->rBS | '
             f'VĨ_ĐỘ={vi_do_text} | KINH_ĐỘ={kinh_do_text} | '
             f'GPS={gps_text} | KC_rBS={_dinh_dang_so(khoang_cach_m, 1, "m")} | '
@@ -447,7 +463,7 @@ class QuanLyGPSRBS:
             du_lieu = self.lay(ma_phien, nguon)
             ten = _ten_thiet_bi(nguon)
             if not du_lieu:
-                print(f'[PHIÊN THOẠI] {ten}: chưa có GPS trong phiên')
+                _log_gps(f'[PHIÊN THOẠI] {ten}: chưa có GPS trong phiên')
                 continue
 
             gps_tin_cay = self._gps_du_tin_cay_2d(du_lieu)
@@ -463,7 +479,7 @@ class QuanLyGPSRBS:
                 else 'N/A'
             )
 
-            print(
+            _log_gps(
                 f'[PHIÊN THOẠI] {ten}->rBS | '
                 f'VĨ_ĐỘ={vi_do_text} | KINH_ĐỘ={kinh_do_text} | '
                 f'GPS={"TỐT" if gps_tin_cay else "CHƯA_TỐT"} | '

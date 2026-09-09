@@ -74,7 +74,7 @@ bool Gui_USER_CONFIRM_RBS(
 
 // RF cố định cho bản dựng lại đường thoại.
 // Không còn nhận lệnh thay đổi công suất/SF từ rBS.
-#define CONG_SUAT_PHAT_SU_DBM 17
+#define CONG_SUAT_PHAT_SU_DBM 20
 #define HE_SO_TRAI_PHO_SU 7
 
 int8_t Lay_CongSuat_Phat_SU_dBm();

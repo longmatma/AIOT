@@ -38,7 +38,7 @@ bool Gui_USER_RESPONSE_RBS(
 #define TYPE_GPS_REPORT 0x17
 #define TYPE_VI_TRI_DINH_KY 0x18
 #define SIZE_GPS_REPORT 44
-#define CONG_SUAT_PHAT_DU_DBM 17
+#define CONG_SUAT_PHAT_DU_DBM 20
 #define HE_SO_TRAI_PHO_DU 7
 
 // Getter chỉ phục vụ telemetry/GPS; RF cố định, không đổi runtime.

@@ -1,0 +1,54 @@
+BỘ VẬT LIỆU SIONNA RT — 433 MHz (BẢN FIXED)
+================================================
+
+Lỗi đã sửa:
+  ITURadioMaterial('concrete') không hỗ trợ trực tiếp 433 MHz vì
+  dải danh định concrete bắt đầu từ 1 GHz. Bản FIXED dùng RadioMaterial
+  với epsilon_r và conductivity cố định tại 433 MHz.
+
+Công thức ITU-R P.2040:
+  epsilon_r = a * f_GHz^b
+  sigma     = c * f_GHz^d
+  với f_GHz = 0.433
+
+Vật liệu:
+1) Tòa nhà / tường bê tông
+   eps_r  = 5.24
+   sigma  = 0.0240051 S/m
+   Lưu ý: ngoại suy dưới dải ITU danh định.
+
+2) Mặt đất khô vừa
+   eps_r  = 16.3096
+   sigma  = 0.00894424 S/m
+   Lưu ý: ngoại suy dưới dải ITU danh định.
+
+3) Thân cây / tán cây (wood proxy)
+   eps_r  = 1.99
+   sigma  = 0.00191640 S/m
+   433 MHz nằm trong dải ITU của wood.
+
+4) ATM / vật kim loại
+   eps_r  = 1.0
+   sigma  = 1e7 S/m
+   Dùng làm proxy dẫn điện cao.
+
+Mapping:
+  Buildings*       -> mat-building
+  Boundary_Walls*  -> mat-boundary-wall
+  Ground_Aerial    -> mat-ground
+  Roads_Paved*     -> mat-road (concrete proxy)
+  Tree_Trunks*     -> mat-tree-trunk
+  Tree_Canopies*   -> mat-tree-canopy (wood/foliage proxy)
+  ATM_Kiosk        -> mat-atm-metal
+  Sports_Courts*   -> mat-sports-court
+
+Hệ trục:
+  File GLB hiện tại có chiều cao ở Y.
+  run_campus_sionna_433mhz_FIXED.py tự xoay +90 độ quanh X để:
+    X/Y = mặt đất
+    Z   = chiều cao
+
+Sau khi sửa, kích thước kỳ vọng xấp xỉ:
+  X ~ 190 m
+  Y ~ 105 m
+  Z ~ 51 m

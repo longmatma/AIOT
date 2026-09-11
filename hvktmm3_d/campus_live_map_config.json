@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "image_file": "campus_live_background.png",
+  "image_width_px": 2400,
+  "image_height_px": 1700,
+  "camera_center_x_m": 0.08698654174804688,
+  "camera_center_y_m": 0.0,
+  "visible_width_m": 224.40528823852537,
+  "visible_height_m": 158.95374583562213,
+  "scene_min_x_m": -95.0,
+  "scene_max_x_m": 95.1739730834961,
+  "scene_min_y_m": -52.499996185302734,
+  "scene_max_y_m": 52.499996185302734,
+  "padding": 1.18,
+  "coordinate_note": "scene +X = image right, scene +Y = image up"
+}

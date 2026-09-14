@@ -55,4 +55,15 @@ bool Gui_VI_TRI_DINH_KY_DU(
     const DuLieuGPS_DU &du_lieu_gps
 );
 
+
+// =====================================================
+// DO KENH THAT SU -> DU
+// DU nghe ke beacon VI_TRI_DINH_KY 0x18 cua SU, do RSSI/SNR,
+// sau do gui mot bao cao nho ve rBS. KHONG xu ly data/voice SU truc tiep.
+// =====================================================
+#define TYPE_BAO_CAO_KENH_SU_DU 0x19
+#define SIZE_BAO_CAO_KENH_SU_DU 20
+
+bool Gui_BaoCao_Kenh_SU_DU_DangCho();
+
 #endif

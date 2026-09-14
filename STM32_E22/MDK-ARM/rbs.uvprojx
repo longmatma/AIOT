@@ -495,11 +495,6 @@
           <GroupName>mylib</GroupName>
           <Files>
             <File>
-              <FileName>crc16.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>..\mylib\crc16.c</FilePath>
-            </File>
-            <File>
               <FileName>crc16.h</FileName>
               <FileType>5</FileType>
               <FilePath>..\mylib\crc16.h</FilePath>
@@ -518,6 +513,11 @@
               <FileName>pi_bridge.c</FileName>
               <FileType>1</FileType>
               <FilePath>..\mylib\pi_bridge.c</FilePath>
+            </File>
+            <File>
+              <FileName>crc16.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\mylib\crc16.c</FilePath>
             </File>
             <File>
               <FileName>pi_bridge.h</FileName>

@@ -33,6 +33,34 @@
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 
+/*
+ * SELF-HEALING V1 - STM32 IWDG
+ *
+ * IWDG nominal timeout:
+ *   LSI ~= 40 kHz, prescaler = 64, reload = 2499
+ *   T ~= (2499 + 1) * 64 / 40000 ~= 4.0 s
+ *
+ * LSI on STM32F1 is not precision-calibrated, so the real timeout can vary.
+ *
+ * Set to 1 for ONE-SHOT watchdog verification:
+ * - First boot: after 10 s, firmware intentionally stops refreshing IWDG.
+ * - IWDG resets the STM32.
+ * - After the IWDG reset, firmware detects RCC_FLAG_IWDGRST and DOES NOT
+ *   intentionally stop feeding again, so the bridge returns to normal.
+ *
+ * After successful test, set this back to 0 and flash the production build.
+ */
+#define IWDG_SELF_TEST                    0U
+#define IWDG_SELF_TEST_DELAY_MS       10000U
+
+#define IWDG_KR_ENABLE_ACCESS        0x5555U
+#define IWDG_KR_RELOAD               0xAAAAU
+#define IWDG_KR_START                0xCCCCU
+
+/* PR=4 means divider /64 on STM32F1 IWDG. */
+#define IWDG_PR_DIV64                     4U
+#define IWDG_RELOAD_4S_NOMINAL         2499U
+
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -47,6 +75,10 @@ UART_HandleTypeDef huart1;
 
 /* USER CODE BEGIN PV */
 static E22_RadioEvent_t g_radio_event;
+
+/* Watchdog/reset diagnostics kept in RAM for debugger inspection. */
+static uint8_t g_boot_was_iwdg_reset = 0U;
+static uint32_t g_iwdg_start_tick_ms = 0U;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -60,6 +92,50 @@ static void MX_USART1_UART_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
+/*
+ * Start STM32F103 independent watchdog without depending on CubeMX IWDG/HAL
+ * configuration. This keeps the patch local to USER CODE sections.
+ *
+ * IMPORTANT:
+ * - IWDG cannot be stopped after it is started; only a reset stops/restarts it.
+ * - Refresh only from the healthy main loop. Error_Handler deliberately does
+ *   NOT refresh it, so a fatal firmware lock will self-recover by reset.
+ */
+static void RBS_IWDG_Start(void)
+{
+  uint32_t wait_start;
+
+  /* Start IWDG (LSI is started by hardware). */
+  IWDG->KR = IWDG_KR_START;
+
+  /* Allow PR/RLR update. */
+  IWDG->KR = IWDG_KR_ENABLE_ACCESS;
+  IWDG->PR = IWDG_PR_DIV64;
+  IWDG->RLR = IWDG_RELOAD_4S_NOMINAL;
+
+  /*
+   * PR/RLR updates need a few LSI cycles. Bound the wait so this helper
+   * itself can never become an infinite software lock.
+   */
+  wait_start = HAL_GetTick();
+  while (IWDG->SR != 0U)
+  {
+    if ((HAL_GetTick() - wait_start) > 50U)
+    {
+      break;
+    }
+  }
+
+  /* Load the new counter immediately. */
+  IWDG->KR = IWDG_KR_RELOAD;
+  g_iwdg_start_tick_ms = HAL_GetTick();
+}
+
+static inline void RBS_IWDG_Refresh(void)
+{
+  IWDG->KR = IWDG_KR_RELOAD;
+}
 
 /* USER CODE END 0 */
 
@@ -80,6 +156,14 @@ int main(void)
   HAL_Init();
 
   /* USER CODE BEGIN Init */
+
+  /*
+   * Read reset cause before clearing RCC reset flags.
+   * Useful for watchdog self-test and later fault diagnostics.
+   */
+  g_boot_was_iwdg_reset =
+      (__HAL_RCC_GET_FLAG(RCC_FLAG_IWDGRST) != RESET) ? 1U : 0U;
+  __HAL_RCC_CLEAR_RESET_FLAGS();
 
   /* USER CODE END Init */
 
@@ -111,6 +195,13 @@ int main(void)
     Error_Handler();
   }
 
+  /*
+   * Start watchdog only after UART bridge + E22 basic initialization PASS.
+   * From this point, a dead main loop / fatal Error_Handler will recover
+   * automatically by MCU reset.
+   */
+  RBS_IWDG_Start();
+
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -129,6 +220,21 @@ int main(void)
     {
       PiBridge_HandleRadioEvent(&g_radio_event);
     }
+
+    /*
+     * Feed IWDG only after the main service cycle completes.
+     * If PiBridge_Process(), radio handling, or firmware locks permanently,
+     * this line is no longer reached and IWDG resets the STM32.
+     */
+#if IWDG_SELF_TEST
+    if (g_boot_was_iwdg_reset ||
+        ((HAL_GetTick() - g_iwdg_start_tick_ms) < IWDG_SELF_TEST_DELAY_MS))
+    {
+      RBS_IWDG_Refresh();
+    }
+#else
+    RBS_IWDG_Refresh();
+#endif
 
   }
   /* USER CODE END 3 */

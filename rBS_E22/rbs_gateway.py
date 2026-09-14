@@ -1,6 +1,12 @@
 import os
 import time
 import builtins
+import csv
+import math
+import socket
+import threading
+from pathlib import Path
+from datetime import datetime, timezone
 
 from stm32_e22_bridge import STM32E22Bridge, BridgeError
 from gps_rbs import (
@@ -65,8 +71,14 @@ def _la_log_quan_trong(noi_dung: str) -> bool:
                 "BẬT",
                 "HARD RESET",
                 "reconnect",
+                "TỰ PHỤC HỒI",
+                "RECONFIG",
+                "RE-ARM",
             )
         )
+
+    if noi_dung.startswith("[SYSTEMD WDT]"):
+        return True
 
     return False
 
@@ -82,6 +94,200 @@ def print(*args, **kwargs):  # noqa: A001 - lọc log legacy trong module này
     noi_dung = " ".join(str(x) for x in args)
     if noi_dung and _la_log_quan_trong(noi_dung):
         _in_goc(*args, **kwargs)
+
+
+
+# ============================================================
+# SELF-HEAL V2 - SYSTEMD SERVICE WATCHDOG
+#
+# Mục tiêu:
+#   - Python crash -> systemd Restart=always đã xử lý.
+#   - Python còn process nhưng main loop bị treo/deadlock -> systemd WatchdogSec
+#     phải phát hiện và restart service.
+#
+# Cách làm:
+#   - main loop gọi progress() ở mỗi vòng xử lý.
+#   - một thread rất nhẹ chỉ gửi WATCHDOG=1 khi main loop còn tiến triển.
+#   - nếu main loop đứng quá RBS_SYSTEMD_MAIN_STALL_S, thread NGỪNG báo sống.
+#   - systemd hết WatchdogSec -> kill + restart service.
+#
+# Không cài thêm package Python; sd_notify được gửi trực tiếp qua NOTIFY_SOCKET.
+# ============================================================
+
+RBS_SYSTEMD_MAIN_STALL_S = float(
+    os.environ.get(
+        "RBS_SYSTEMD_MAIN_STALL_S",
+        "12.0",
+    )
+)
+
+
+class SystemdServiceWatchdog:
+    def __init__(self):
+        self._notify_socket = os.environ.get(
+            "NOTIFY_SOCKET",
+            "",
+        )
+
+        watchdog_usec_text = os.environ.get(
+            "WATCHDOG_USEC",
+            "0",
+        )
+
+        try:
+            watchdog_usec = int(
+                watchdog_usec_text
+            )
+        except (TypeError, ValueError):
+            watchdog_usec = 0
+
+        self.enabled = bool(
+            self._notify_socket
+            and watchdog_usec > 0
+        )
+
+        self._watchdog_period_s = (
+            watchdog_usec / 1_000_000.0
+            if watchdog_usec > 0
+            else 0.0
+        )
+
+        # Gửi keepalive nhanh hơn nhiều so với WatchdogSec.
+        self._notify_interval_s = (
+            max(
+                1.0,
+                min(
+                    5.0,
+                    self._watchdog_period_s / 3.0,
+                ),
+            )
+            if self.enabled
+            else 5.0
+        )
+
+        self._last_main_progress = (
+            time.monotonic()
+        )
+
+        self._lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._thread = None
+        self._stall_logged = False
+
+    def _send_notify(self, message: str) -> bool:
+        if not self.enabled:
+            return False
+
+        address = self._notify_socket
+
+        # systemd dùng '@name' để biểu diễn abstract UNIX socket.
+        if address.startswith("@"):
+            address = (
+                "\0"
+                +
+                address[1:]
+            )
+
+        sock = socket.socket(
+            socket.AF_UNIX,
+            socket.SOCK_DGRAM,
+        )
+
+        try:
+            sock.connect(address)
+            sock.sendall(
+                message.encode(
+                    "utf-8",
+                    errors="strict",
+                )
+            )
+            return True
+        except OSError:
+            return False
+        finally:
+            sock.close()
+
+    def progress(self):
+        with self._lock:
+            self._last_main_progress = (
+                time.monotonic()
+            )
+            self._stall_logged = False
+
+    def status(self, text_status: str):
+        if self.enabled:
+            self._send_notify(
+                f"STATUS={text_status}"
+            )
+
+    def ready(self):
+        if self.enabled:
+            self._send_notify(
+                "READY=1\n"
+                "STATUS=rBS gateway running"
+            )
+
+    def _run(self):
+        while not self._stop_event.wait(
+            self._notify_interval_s
+        ):
+            with self._lock:
+                age_s = (
+                    time.monotonic()
+                    -
+                    self._last_main_progress
+                )
+
+                stall_logged = (
+                    self._stall_logged
+                )
+
+            if (
+                age_s
+                <=
+                RBS_SYSTEMD_MAIN_STALL_S
+            ):
+                self._send_notify(
+                    "WATCHDOG=1"
+                )
+                continue
+
+            # Cố ý KHÔNG gửi WATCHDOG=1.
+            # systemd sẽ xử lý process treo.
+            if not stall_logged:
+                print(
+                    f"[SYSTEMD WDT] MAIN LOOP KHONG TIEN TRIEN "
+                    f"{age_s:.1f}s -> NGUNG HEARTBEAT, "
+                    "CHO SYSTEMD RESTART SERVICE"
+                )
+
+                with self._lock:
+                    self._stall_logged = True
+
+    def start(self):
+        if not self.enabled:
+            print(
+                "[SYSTEMD WDT] KHONG CO NOTIFY_SOCKET/WATCHDOG_USEC "
+                "-> che do systemd watchdog khong kich hoat"
+            )
+            return
+
+        self._thread = threading.Thread(
+            target=self._run,
+            name="rbs-systemd-watchdog",
+            daemon=True,
+        )
+        self._thread.start()
+
+        print(
+            f"[SYSTEMD WDT] BAT | "
+            f"WATCHDOG_SEC={self._watchdog_period_s:.1f}s | "
+            f"MAIN_STALL={RBS_SYSTEMD_MAIN_STALL_S:.1f}s | "
+            f"HEARTBEAT={self._notify_interval_s:.1f}s"
+        )
+
+    def stop(self):
+        self._stop_event.set()
 
 
 def now_us():
@@ -282,6 +488,11 @@ USER_RESPONSE_ACK = 0x01
 USER_RESPONSE_NACK = 0x02
 USER_HMI_FORWARD_GUARD = 0.008
 
+# Measurement-only DU -> rBS: DU nghe ke beacon dinh ky cua SU de do kenh SU->DU.
+TYPE_BAO_CAO_KENH_SU_DU = 0x19
+SIZE_BAO_CAO_KENH_SU_DU = 20
+DUONG_DAN_CSV_KENH_SU_DU = Path(__file__).resolve().parent / "rbs_kenh_su_du.csv"
+
 # SESSION_START -> SESSION_READY handshake.
 # rBS tu retry SESSION_START toi DU toi da 3 lan.
 SESSION_MAX_ATTEMPTS = 3
@@ -302,13 +513,96 @@ READY_GUARD = 0.010
 # RX watchdog cho rBS qua STM32 bridge.
 # DU/SU co beacon dinh ky ~5 s, nen 20 s im lang la bat thuong trong che do van hanh.
 # Khong thay doi protocol/ARQ/FEC/AES hay cac guard da on dinh.
-RX_WATCHDOG_IM_LANG_S = 20.0
-RX_WATCHDOG_HARD_O_LAN = 2
+# SELF-HEAL V1:
+# SU/DU đang phát beacon/telemetry khoảng 5 s/lần. Sau 15 s không thấy packet,
+# chỉ kiểm tra trạng thái bridge/radio; KHÔNG hard-reset E22 chỉ vì im sóng.
+RX_WATCHDOG_IM_LANG_S = 15.0
 RX_IDLE_YIELD_S = 0.001
 
 # Explicit AUDIO_END là đường bình thường.
 # Fallback để dài hơn ARQ retry, không ảnh hưởng latency bình thường.
 END_OF_AUDIO_IDLE = 1.500
+
+
+# ============================================================
+# KENH THAT SU -> DU
+# DU nghe ke packet 0x18 cua SU va bao RSSI do duoc ve rBS.
+# ============================================================
+def _i16_be(data):
+    return int.from_bytes(bytes(data), byteorder="big", signed=True)
+
+
+def tinh_kenh_tu_rssi_pt(rssi_dbm, pt_dbm):
+    """Dung dung 2 cong thuc do that: RSSI->Pr, Pr=Pt|H|^2."""
+    pr_mw = 10.0 ** (float(rssi_dbm) / 10.0)
+    pt_mw = 10.0 ** (float(pt_dbm) / 10.0)
+    h2 = pr_mw / pt_mw
+    h_abs = math.sqrt(max(h2, 0.0))
+    h_db = 10.0 * math.log10(h2) if h2 > 0.0 else None
+    return pr_mw, pt_mw, h2, h_abs, h_db
+
+
+def parse_bao_cao_kenh_su_du(packet_bytes):
+    if packet_bytes is None:
+        return None
+    p = bytes(packet_bytes)
+    if len(p) != SIZE_BAO_CAO_KENH_SU_DU:
+        return None
+    if p[0] != ID_TRAM_RBS or p[1] != ID_TRAM_DU or p[2] != TYPE_BAO_CAO_KENH_SU_DU or p[3] != 1:
+        return None
+
+    stt_su = int.from_bytes(p[4:12], byteorder="big", signed=False)
+    rssi_dbm = _i16_be(p[12:14]) / 10.0
+    snr_db = _i16_be(p[14:16]) / 10.0
+    pt_su_dbm = int.from_bytes(p[16:17], byteorder="big", signed=True)
+    sf_su = int(p[17])
+    pr_mw, pt_mw, h2, h_abs, h_db = tinh_kenh_tu_rssi_pt(rssi_dbm, pt_su_dbm)
+    return {
+        "stt_su": stt_su,
+        "rssi_dbm": rssi_dbm,
+        "snr_db": snr_db,
+        "pt_su_dbm": pt_su_dbm,
+        "sf_su": sf_su,
+        "pr_mw": pr_mw,
+        "pt_mw": pt_mw,
+        "h2": h2,
+        "h_abs": h_abs,
+        "h_db": h_db,
+    }
+
+
+def ghi_csv_kenh_su_du(mau):
+    if mau is None:
+        return
+    dong = {
+        "Thoi_gian_rBS_nhan_UTC": datetime.now(timezone.utc).isoformat(),
+        "Lien_ket": "SU-DU",
+        "Nguon_do": "DU_nghe_beacon_SU",
+        "STT_beacon_SU": mau["stt_su"],
+        "RSSI_SU_DU_dBm": mau["rssi_dbm"],
+        "SNR_SU_DU_dB": mau["snr_db"],
+        "P_TX_SU_dBm": mau["pt_su_dbm"],
+        "P_r_mW": mau["pr_mw"],
+        "P_t_mW": mau["pt_mw"],
+        "H_abs_binh_phuong": mau["h2"],
+        "H_abs": mau["h_abs"],
+        "H_dB": mau["h_db"],
+        "SF_SU": mau["sf_su"],
+    }
+    DUONG_DAN_CSV_KENH_SU_DU.parent.mkdir(parents=True, exist_ok=True)
+    new_file = not DUONG_DAN_CSV_KENH_SU_DU.exists() or DUONG_DAN_CSV_KENH_SU_DU.stat().st_size == 0
+    with DUONG_DAN_CSV_KENH_SU_DU.open("a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=list(dong.keys()))
+        if new_file:
+            writer.writeheader()
+        writer.writerow(dong)
+
+    # Log nay duoc coi la quan trong de test kenh that.
+    _in_goc(
+        f"[KENH THAT SU-DU] RSSI={mau['rssi_dbm']:.1f} dBm | "
+        f"P_TX={mau['pt_su_dbm']} dBm | |H|^2={mau['h2']:.3e} | "
+        f"|H|={mau['h_abs']:.3e} | H={mau['h_db']:.1f} dB"
+    )
 
 
 # ============================================================
@@ -633,6 +927,12 @@ def thiet_lap_session_voi_du(rfm9x, goi_session, session_id, diag_session=None, 
                 du_lieu_gps = gps_manager.cap_nhat(bao_cao_gps, rssi, snr) if gps_manager is not None else bao_cao_gps
 
                 if bao_cao_gps["la_dinh_ky"]:
+                    ten_tb = "SU" if bao_cao_gps["nguon"] == MA_GPS_SU else "DU"
+                    print(
+                        f"[CHẨN ĐOÁN GPS ĐỊNH KỲ] NHẬN 0x18 từ {ten_tb} "
+                        f"| STT={bao_cao_gps['so_thu_tu_bao_cao']} "
+                        f"| SIZE={len(p)}B | {chuoi_rssi_snr(rssi, snr)}"
+                    )
                     if gps_manager is not None:
                         gps_manager.in_bao_cao_dinh_ky(du_lieu_gps)
                     continue
@@ -1146,6 +1446,11 @@ def main():
     )
     print("[HỆ THỐNG] E22 rBS sẵn sàng | SF7 cố định | TX_rBS=30 dBm")
 
+    systemd_wdt = SystemdServiceWatchdog()
+    systemd_wdt.start()
+    systemd_wdt.progress()
+    systemd_wdt.ready()
+
     gps_manager = QuanLyGPSRBS()
 
     (
@@ -1162,18 +1467,23 @@ def main():
     diag_session = None
     diag_hoan_tat_gan_nhat = None
 
-    # Watchdog chi can biet lan cuoi radio nhan duoc BAT KY packet nao.
-    # Trong he thong hien tai SU/DU co beacon dinh ky, vi vay neu im lang >20 s
-    # thi re-arm RX; neu lap lai 2 lan lien tiep thi re-khoi tao driver/chip LoRa.
+    # SELF-HEAL V1:
+    # Im sóng chỉ là tín hiệu để KIỂM TRA health, không phải bằng chứng E22 chết.
+    # Khi STM32 reboot do IWDG, START_RX sẽ fail vì s_configured=0; bridge
+    # ensure_ready() sẽ tự PING -> CONFIG -> START_RX mà không cần restart service.
     thoi_diem_rx_cuoi = time.monotonic()
-    so_lan_soft_lien_tiep = 0
 
     print(
         f"[WATCHDOG] BẬT | IM_LẶNG={RX_WATCHDOG_IM_LANG_S:.0f}s | "
-        f"HARD_SAU={RX_WATCHDOG_HARD_O_LAN}_LẦN"
+        "SELF_HEAL=PING->RX/RECONFIG/RECONNECT"
     )
 
     while True:
+
+        # Heartbeat của service phải gắn với tiến triển thật của main loop.
+        # Nếu main loop deadlock/hang, dòng này không còn chạy; thread watchdog
+        # sẽ ngừng sd_notify và systemd tự restart service.
+        systemd_wdt.progress()
 
         t_rx_call_us = now_us()
 
@@ -1184,10 +1494,48 @@ def main():
             )
             t_ack_end_us = None
 
-        packet = rfm9x.receive(
-            timeout=0.005,
-            with_header=True,
-        )
+        try:
+            packet = rfm9x.receive(
+                timeout=0.005,
+                with_header=True,
+            )
+        except (BridgeError, OSError) as rx_error:
+            # UART/radio vừa báo lỗi: phục hồi ngay, không chờ 15 s.
+            print(
+                f"[CẢNH BÁO] RX bridge lỗi: {rx_error} -> TỰ PHỤC HỒI"
+            )
+            packet = None
+            try:
+                hanh_dong = rfm9x.ensure_ready()
+                print(
+                    f"[WATCHDOG] TỰ PHỤC HỒI thành công | ACTION={hanh_dong}"
+                )
+            except Exception as recover_error:  # noqa: BLE001
+                print(
+                    f"[CẢNH BÁO] TỰ PHỤC HỒI nhanh lỗi: {recover_error} "
+                    "-> HARD RESET E22"
+                )
+                try:
+                    rfm9x.reset_radio()
+                    print(
+                        "[WATCHDOG] HARD RESET + RECONFIG + START_RX thành công"
+                    )
+                except Exception as hard_error:  # noqa: BLE001
+                    print(
+                        f"[CẢNH BÁO] HARD RESET lỗi: {hard_error} "
+                        "-> reconnect UART/STM32"
+                    )
+                    try:
+                        rfm9x.reconnect()
+                        print("[WATCHDOG] STM32/E22 reconnect thành công")
+                    except Exception as reconnect_error:  # noqa: BLE001
+                        print(
+                            f"[LỖI] WATCHDOG reconnect thất bại: "
+                            f"{reconnect_error}"
+                        )
+            thoi_diem_rx_cuoi = time.monotonic()
+            time.sleep(0.02)
+            continue
 
         now = time.monotonic()
         t_packet_rx_us = (
@@ -1197,57 +1545,64 @@ def main():
         )
 
         if packet is not None:
-            # Bat ky packet hop le o tang radio deu chung minh RX dang song.
+            # Bất kỳ packet RF hợp lệ nào đều chứng minh RX đang sống.
             thoi_diem_rx_cuoi = now
-            so_lan_soft_lien_tiep = 0
         else:
             im_lang_s = now - thoi_diem_rx_cuoi
 
             if im_lang_s >= RX_WATCHDOG_IM_LANG_S:
-                so_lan_soft_lien_tiep += 1
-
-                if so_lan_soft_lien_tiep < RX_WATCHDOG_HARD_O_LAN:
-                    try:
-                        print(
-                            f"[WATCHDOG] RX IM LẶNG {im_lang_s:.1f}s "
-                            f"-> SOFT RE-ARM RX "
-                            f"(LAN={so_lan_soft_lien_tiep})"
-                        )
-                        phuc_hoi_rx_mem(rfm9x)
-                    except Exception as error:  # noqa: BLE001 - watchdog phai song qua loi driver
-                        print(
-                            f"[CẢNH BÁO] WATCHDOG soft re-arm lỗi: {error}"
-                        )
-
-                else:
-                    print("[WATCHDOG] RX vẫn im -> HARD RESET E22 qua STM32")
+                # Không còn suy luận "im sóng = radio chết".
+                # Health path:
+                #   PING STM32
+                #     -> START_RX nếu E22 còn cấu hình
+                #     -> CONFIG + START_RX nếu STM32 vừa reboot
+                #     -> reconnect UART + PING + CONFIG + START_RX nếu UART lỗi
+                try:
+                    hanh_dong = rfm9x.ensure_ready()
+                    print(
+                        f"[WATCHDOG] TỰ PHỤC HỒI RX | "
+                        f"IM_LẶNG={im_lang_s:.1f}s | ACTION={hanh_dong}"
+                    )
+                except Exception as recover_error:  # noqa: BLE001
+                    print(
+                        f"[CẢNH BÁO] WATCHDOG health recovery lỗi: "
+                        f"{recover_error} -> HARD RESET E22"
+                    )
                     try:
                         rfm9x.reset_radio()
-                        print("[WATCHDOG] HARD RESET E22 thành công -> RX trở lại")
-                    except Exception as reset_error:  # noqa: BLE001
                         print(
-                            f"[CẢNH BÁO] HARD RESET E22 lỗi: {reset_error} -> "
-                            "thử reconnect UART/STM32"
+                            "[WATCHDOG] HARD RESET + RECONFIG + START_RX "
+                            "thành công"
+                        )
+                    except Exception as hard_error:  # noqa: BLE001
+                        print(
+                            f"[CẢNH BÁO] HARD RESET lỗi: {hard_error} "
+                            "-> reconnect UART/STM32"
                         )
                         try:
                             rfm9x.reconnect()
                             print("[WATCHDOG] STM32/E22 reconnect thành công")
                         except Exception as reconnect_error:  # noqa: BLE001
                             print(
-                                f"[LỖI] WATCHDOG reconnect thất bại: {reconnect_error}"
+                                f"[LỖI] WATCHDOG reconnect thất bại: "
+                                f"{reconnect_error}"
                             )
-                    so_lan_soft_lien_tiep = 0
 
-                # Bat dau mot cua so watchdog moi sau moi lan phuc hoi.
+                # Mở cửa sổ health mới sau mỗi lần kiểm tra/phục hồi.
                 thoi_diem_rx_cuoi = time.monotonic()
 
-            # Nhuong CPU rat ngan khi khong co packet. Radio van o RX nen khong
-            # lam thay doi kien truc hay timing ARQ khi packet da den.
+            # Nhường CPU rất ngắn khi không có packet.
             time.sleep(RX_IDLE_YIELD_S)
 
         if packet is not None:
 
             rssi_goi, snr_goi = lay_rssi_snr(rfm9x)
+
+            # KENH THAT SU->DU: report measurement-only tu DU.
+            mau_kenh_su_du = parse_bao_cao_kenh_su_du(packet)
+            if mau_kenh_su_du is not None:
+                ghi_csv_kenh_su_du(mau_kenh_su_du)
+                continue
 
             # GPS/VI TRI SU/DU -> rBS. Packet rieng, khong gate VOICE.
             bao_cao_gps = phan_tich_bao_cao_gps(packet)
@@ -1257,6 +1612,13 @@ def main():
                 if bao_cao_gps["la_dinh_ky"]:
                     # Giữ telemetry/CSV để đo khoảng cách và chất lượng link,
                     # nhưng không còn điều khiển P_TX/SF tự động.
+                    ten_tb = "SU" if bao_cao_gps["nguon"] == MA_GPS_SU else "DU"
+                    print(
+                        f"[CHẨN ĐOÁN GPS ĐỊNH KỲ] NHẬN 0x18 từ {ten_tb} "
+                        f"| STT={bao_cao_gps['so_thu_tu_bao_cao']} "
+                        f"| SIZE={len(packet)}B | {chuoi_rssi_snr(rssi_goi, snr_goi)}"
+                    )
+                    gps_manager.in_bao_cao_dinh_ky(du_lieu_gps)
                     continue
 
                 thong_ke_phien_gps = None

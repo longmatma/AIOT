@@ -40,6 +40,7 @@
 #define TYPE_USER_RESPONSE  0x13
 #define TYPE_USER_CONFIRM   0x14
 #define TYPE_SESSION_READY  0x15
+#define TYPE_VI_TRI_DINH_KY_SU 0x18
 
 // TYPE noi bo dua sang main.cpp.
 #define TYPE_AUDIO_END           0x04
@@ -58,11 +59,44 @@
 #define SIZE_VOICE_RELAY   180
 #define SIZE_FEC_RELAY     188
 #define SIZE_END_RELAY       5
+#define SIZE_GPS_REPORT_SU   44
 
 
 // RX task va PLAY_REPORT task cung dung mot SX1278.
 // Mutex ngan hai task cham SPI/radio cung luc.
 static SemaphoreHandle_t LoRa_Mutex = nullptr;
+
+// =====================================================
+// SNAPSHOT KENH THAT SU -> DU
+// DU chi "nghe ke" beacon 0x18 SU->rBS. Khong doi kien truc voice relay.
+// =====================================================
+struct MauKenhSUDU
+{
+    bool pending;
+    uint64_t stt_su;
+    int16_t rssi_x10;
+    int16_t snr_x10;
+    int8_t pt_su_dbm;
+    uint8_t sf_su;
+};
+
+static MauKenhSUDU mau_kenh_su_du = {};
+static portMUX_TYPE KenhSUDU_Mux = portMUX_INITIALIZER_UNLOCKED;
+
+static uint64_t DU_Doc_U64_BE(const uint8_t *p)
+{
+    uint64_t v = 0;
+    for (int i = 0; i < 8; ++i)
+        v = (v << 8) | (uint64_t)p[i];
+    return v;
+}
+
+static void DU_Ghi_I16_BE(uint8_t *p, int16_t v)
+{
+    uint16_t u = (uint16_t)v;
+    p[0] = (uint8_t)((u >> 8) & 0xFF);
+    p[1] = (uint8_t)(u & 0xFF);
+}
 
 // =====================================================
 // KHOI TAO LORA RX
@@ -242,6 +276,44 @@ bool Nhan_GoiTin_LoRa(
             LoRa_Mutex
         );
 
+        return false;
+    }
+
+    // =====================================================
+    // DO KENH THAT SU -> DU BANG BEACON DINH KY CUA SU
+    // Packet 44B nay van dich rBS, DU chi nghe ke o PHY de lay RSSI/SNR.
+    // Sau khi ghi snapshot, packet bi bo tai DU nhu cu; voice/session khong doi.
+    // =====================================================
+    if (
+        packetSize == SIZE_GPS_REPORT_SU
+        && raw_packet[0] == ID_TRAM_RBS
+        && raw_packet[1] == ID_TRAM_SU
+        && raw_packet[2] == TYPE_VI_TRI_DINH_KY_SU
+    )
+    {
+        uint64_t stt_su = DU_Doc_U64_BE(&raw_packet[4]);
+        int8_t pt_su_dbm = (int8_t)raw_packet[29];
+        uint8_t sf_su = (uint8_t)(((raw_packet[3] >> 4) & 0x0F) + 6);
+
+        portENTER_CRITICAL(&KenhSUDU_Mux);
+        mau_kenh_su_du.pending = true;
+        mau_kenh_su_du.stt_su = stt_su;
+        mau_kenh_su_du.rssi_x10 = (int16_t)(rssi_packet_dbm * 10);
+        mau_kenh_su_du.snr_x10 = (int16_t)lroundf(snr_packet_db * 10.0f);
+        mau_kenh_su_du.pt_su_dbm = pt_su_dbm;
+        mau_kenh_su_du.sf_su = sf_su;
+        portEXIT_CRITICAL(&KenhSUDU_Mux);
+
+        Serial.printf(
+            "[DU KENH THAT] NGHE SU 0x18 | STT=%llu | RSSI=%d dBm | SNR=%.1f dB | P_TX_SU=%d dBm | SF=%u\n",
+            (unsigned long long)stt_su,
+            rssi_packet_dbm,
+            snr_packet_db,
+            pt_su_dbm,
+            sf_su
+        );
+
+        xSemaphoreGive(LoRa_Mutex);
         return false;
     }
 
@@ -644,6 +716,82 @@ bool Gui_USER_RESPONSE_RBS(
     );
 
     return ok == 1;
+}
+
+
+// =====================================================
+// GUI SNAPSHOT KENH SU -> DU VE rBS
+// Physical 20B:
+// [0] DST=rBS, [1] SRC=DU, [2] TYPE=0x19, [3] VER=1
+// [4..11] STT beacon SU64
+// [12..13] RSSI_x10 int16
+// [14..15] SNR_x10 int16
+// [16] P_TX_SU_dBm int8
+// [17] SF_SU uint8
+// [18..19] reserved
+// =====================================================
+bool Gui_BaoCao_Kenh_SU_DU_DangCho()
+{
+    if (LoRa_Mutex == nullptr)
+        return false;
+
+    MauKenhSUDU mau = {};
+    portENTER_CRITICAL(&KenhSUDU_Mux);
+    if (!mau_kenh_su_du.pending)
+    {
+        portEXIT_CRITICAL(&KenhSUDU_Mux);
+        return false;
+    }
+    mau = mau_kenh_su_du;
+    portEXIT_CRITICAL(&KenhSUDU_Mux);
+
+    // Measurement la best-effort, khong duoc cuop radio neu dang co packet den.
+    if (digitalRead(LORA_DIO0) == HIGH)
+        return false;
+    if (xSemaphoreTake(LoRa_Mutex, 0) != pdTRUE)
+        return false;
+    if (digitalRead(LORA_DIO0) == HIGH)
+    {
+        xSemaphoreGive(LoRa_Mutex);
+        return false;
+    }
+
+    uint8_t p[SIZE_BAO_CAO_KENH_SU_DU] = {};
+    p[0] = ID_TRAM_RBS;
+    p[1] = ID_TRAM_DU;
+    p[2] = TYPE_BAO_CAO_KENH_SU_DU;
+    p[3] = 1;
+    for (int i = 0; i < 8; ++i)
+        p[4 + i] = (uint8_t)((mau.stt_su >> (56 - 8 * i)) & 0xFF);
+    DU_Ghi_I16_BE(&p[12], mau.rssi_x10);
+    DU_Ghi_I16_BE(&p[14], mau.snr_x10);
+    p[16] = (uint8_t)mau.pt_su_dbm;
+    p[17] = mau.sf_su;
+
+    LoRa.idle();
+    LoRa.beginPacket();
+    LoRa.write(p, sizeof(p));
+    int ok = LoRa.endPacket();
+    LoRa.receive();
+    xSemaphoreGive(LoRa_Mutex);
+
+    if (ok == 1)
+    {
+        portENTER_CRITICAL(&KenhSUDU_Mux);
+        // Chi xoa neu pending van la cung snapshot; neu RX da cap nhat mau moi thi giu lai.
+        if (mau_kenh_su_du.pending && mau_kenh_su_du.stt_su == mau.stt_su)
+            mau_kenh_su_du.pending = false;
+        portEXIT_CRITICAL(&KenhSUDU_Mux);
+
+        Serial.printf(
+            "[DU KENH THAT] REPORT -> rBS | STT_SU=%llu | RSSI_SU_DU=%.1f dBm | P_TX_SU=%d dBm\n",
+            (unsigned long long)mau.stt_su,
+            ((float)mau.rssi_x10) / 10.0f,
+            mau.pt_su_dbm
+        );
+        return true;
+    }
+    return false;
 }
 
 

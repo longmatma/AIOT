@@ -6,6 +6,9 @@
 #include <LoRa.h>
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
+#include "esp_task_wdt.h"
+#include "esp_system.h"
+#include "esp_idf_version.h"
 
 #include "nhan_lora.h"
 #include "giai_ma_speex.h"
@@ -81,6 +84,39 @@ volatile bool cho_phep_phat_audio = false;
 TaskHandle_t Task_PlayReport_Handle = nullptr;
 volatile uint64_t play_report_session_id = 0;
 
+// =====================================================
+// AUDIO PLAYBACK V2 - HIGH RESOLUTION TIMER / DOUBLE BUFFER
+//
+// Khong con busy-wait 125 us trong PWM_OUT.
+// esp_timer danh nhip 8 kHz; callback chi:
+//   - lay 1 sample tu double buffer noi bo,
+//   - cap nhat duty PWM,
+//   - doi slot sau 160 sample,
+//   - notify audio task khi 1 slot duoc giai phong.
+//
+// Audio task block cho scheduler/IDLE0 chay binh thuong.
+// Hai slot 160 sample giup lien tuc giua cac frame 20 ms.
+// =====================================================
+
+TaskHandle_t Task_Audio_Handle = nullptr;
+esp_timer_handle_t Audio_Sample_Timer = nullptr;
+
+static constexpr uint16_t AUDIO_TIMER_FRAME_SAMPLES = 160;
+static constexpr uint64_t AUDIO_TIMER_PERIOD_US =
+    1000000ULL / AUDIO_SAMPLE_RATE;
+
+static int16_t Audio_Timer_Frame[2][AUDIO_TIMER_FRAME_SAMPLES];
+
+static volatile uint16_t Audio_Timer_Count[2] = {0, 0};
+static volatile bool Audio_Timer_Ready[2] = {false, false};
+static volatile uint8_t Audio_Timer_Active_Slot = 0;
+static volatile uint16_t Audio_Timer_Sample_Index = 0;
+static volatile bool Audio_Timer_Playing = false;
+static volatile bool Audio_Timer_First_Sample = false;
+
+static portMUX_TYPE Audio_Timer_Mux =
+    portMUX_INITIALIZER_UNLOCKED;
+
 // Session cua cau vua phat xong, dung cho AUTO_ACK/NACK.
 // Tach khoi session_id_hien_tai de khong nham neu session moi den som.
 volatile uint64_t du_last_played_session_id = 0;
@@ -89,6 +125,323 @@ volatile uint64_t du_last_played_session_id = 0;
 // HMI DU DA TACH SANG hmi_du.cpp / hmi_du.h
 // main.cpp khong con quan ly GPIO nut/LED hay transaction ACK/NACK.
 // =====================================================
+
+
+// =====================================================
+// SELF-HEALING V1 - DU ESP32-S3
+//
+// DU có nhiều task FreeRTOS nên KHÔNG đăng ký trực tiếp từng task
+// vào Task Watchdog. Một task SUPERVISOR sẽ:
+//   1) nhận heartbeat từ LoRa_RX / Giai_Ma / PWM_OUT,
+//   2) theo dõi timer audio khi đang phát,
+//   3) tự đăng ký chính nó vào ESP Task Watchdog.
+//
+// Nếu một task quan trọng mất heartbeat:
+//   -> Supervisor ghi log lỗi,
+//   -> gọi esp_restart() để khởi tạo lại toàn bộ DU.
+//
+// Nếu bản thân Supervisor / scheduler bị treo:
+//   -> Supervisor không feed Task Watchdog,
+//   -> watchdog phần cứng của ESP32 tự reset.
+//
+// DU_WDT_SELF_TEST chỉ dùng để kiểm thử.
+// Production phải để = 0.
+// =====================================================
+
+#define DU_WDT_TIMEOUT_S                 12U
+#define DU_WDT_SELF_TEST                  0U
+#define DU_WDT_SELF_TEST_DELAY_MS      10000U
+
+#define DU_SUPERVISOR_PERIOD_MS          500U
+#define DU_STARTUP_GRACE_MS             8000U
+
+#define DU_HB_LORA_TIMEOUT_MS           5000U
+#define DU_HB_DECODE_TIMEOUT_MS         5000U
+#define DU_HB_AUDIO_TASK_TIMEOUT_MS     5000U
+
+// Khi Audio_Timer_Playing=true, callback 8 kHz phải còn tiến triển.
+// Cho dư 1 giây để tránh false-positive khi scheduler bận.
+#define DU_AUDIO_TIMER_STALL_MS         1000U
+
+static volatile uint32_t du_hb_lora_ms = 0;
+static volatile uint32_t du_hb_decode_ms = 0;
+static volatile uint32_t du_hb_audio_task_ms = 0;
+
+// Callback timer chỉ tăng counter; không gọi millis()/Serial trong callback 8 kHz.
+static volatile uint32_t du_audio_timer_pulse_count = 0;
+
+static TaskHandle_t Task_Supervisor_Handle = nullptr;
+static uint32_t du_supervisor_boot_ms = 0;
+static bool du_wdt_self_test_arm = false;
+
+
+static inline void DU_Heartbeat_LoRa()
+{
+    du_hb_lora_ms = millis();
+}
+
+
+static inline void DU_Heartbeat_Decode()
+{
+    du_hb_decode_ms = millis();
+}
+
+
+static inline void DU_Heartbeat_AudioTask()
+{
+    du_hb_audio_task_ms = millis();
+}
+
+
+static void DU_Fatal_Reboot(const char *ly_do)
+{
+    Serial.printf(
+        "[DU SELF-HEAL FATAL] %s -> REBOOT SAU 1 GIAY\n",
+        ly_do != nullptr ? ly_do : "UNKNOWN"
+    );
+
+    Serial.flush();
+    delay(1000);
+    ESP.restart();
+
+    // Chỉ là fallback nếu reset chưa xảy ra ngay.
+    while (true)
+    {
+        delay(1000);
+    }
+}
+
+
+static void DU_WDT_Init_For_Supervisor()
+{
+#if ESP_IDF_VERSION_MAJOR >= 5
+    esp_task_wdt_config_t cfg = {};
+    cfg.timeout_ms = DU_WDT_TIMEOUT_S * 1000U;
+    cfg.idle_core_mask = 0;
+    cfg.trigger_panic = true;
+
+    esp_err_t err =
+        esp_task_wdt_init(&cfg);
+
+    if (err == ESP_ERR_INVALID_STATE)
+    {
+        // Arduino core có thể đã init TWDT trước đó.
+        (void)esp_task_wdt_reconfigure(&cfg);
+    }
+#else
+    (void)esp_task_wdt_init(
+        DU_WDT_TIMEOUT_S,
+        true
+    );
+#endif
+
+    if (esp_task_wdt_status(NULL) != ESP_OK)
+    {
+        (void)esp_task_wdt_add(NULL);
+    }
+
+    du_supervisor_boot_ms = millis();
+
+#if DU_WDT_SELF_TEST
+    const esp_reset_reason_t reset_reason =
+        esp_reset_reason();
+
+    if (
+        reset_reason == ESP_RST_TASK_WDT
+        || reset_reason == ESP_RST_WDT
+        || reset_reason == ESP_RST_INT_WDT
+    )
+    {
+        du_wdt_self_test_arm = false;
+
+        Serial.println(
+            "[DU WDT] SELF_TEST PASS: reboot do watchdog, KHONG lap lai."
+        );
+    }
+    else
+    {
+        du_wdt_self_test_arm = true;
+
+        Serial.println(
+            "[DU WDT] SELF_TEST armed: se gia lap treo Supervisor sau 10s."
+        );
+    }
+#else
+    du_wdt_self_test_arm = false;
+#endif
+
+    (void)esp_task_wdt_reset();
+
+    Serial.printf(
+        "[DU WDT] BAT | TIMEOUT=%us | SELF_TEST=%u | RESET_REASON=%d\n",
+        (unsigned int)DU_WDT_TIMEOUT_S,
+        (unsigned int)DU_WDT_SELF_TEST,
+        (int)esp_reset_reason()
+    );
+}
+
+
+static bool DU_Heartbeat_QuaHan(
+    uint32_t bay_gio,
+    uint32_t heartbeat,
+    uint32_t timeout_ms)
+{
+    return (
+        heartbeat != 0U
+        &&
+        (uint32_t)(bay_gio - heartbeat) > timeout_ms
+    );
+}
+
+
+static void TacVu_DU_Supervisor(void *tham_so)
+{
+    (void)tham_so;
+
+    DU_WDT_Init_For_Supervisor();
+
+    uint32_t audio_pulse_truoc =
+        du_audio_timer_pulse_count;
+
+    uint32_t audio_pulse_doi_lan_cuoi_ms =
+        millis();
+
+    while (1)
+    {
+        uint32_t bay_gio =
+            millis();
+
+#if DU_WDT_SELF_TEST
+        if (
+            du_wdt_self_test_arm
+            &&
+            (uint32_t)(
+                bay_gio
+                -
+                du_supervisor_boot_ms
+            )
+                >= DU_WDT_SELF_TEST_DELAY_MS
+        )
+        {
+            du_wdt_self_test_arm = false;
+
+            Serial.println(
+                "[DU WDT TEST] GIA LAP TREO SUPERVISOR: dung feed watchdog..."
+            );
+            Serial.flush();
+
+            // Supervisor đã subscribe TWDT.
+            // Cố tình không feed để xác minh watchdog reset toàn DU.
+            while (true)
+            {
+                vTaskDelay(
+                    pdMS_TO_TICKS(1000)
+                );
+            }
+        }
+#endif
+
+        // Cho các task đủ thời gian khởi động trước khi bắt lỗi heartbeat.
+        if (
+            (uint32_t)(
+                bay_gio
+                -
+                du_supervisor_boot_ms
+            )
+                >= DU_STARTUP_GRACE_MS
+        )
+        {
+            if (
+                DU_Heartbeat_QuaHan(
+                    bay_gio,
+                    du_hb_lora_ms,
+                    DU_HB_LORA_TIMEOUT_MS
+                )
+            )
+            {
+                DU_Fatal_Reboot(
+                    "LoRa_RX mat heartbeat"
+                );
+            }
+
+            if (
+                DU_Heartbeat_QuaHan(
+                    bay_gio,
+                    du_hb_decode_ms,
+                    DU_HB_DECODE_TIMEOUT_MS
+                )
+            )
+            {
+                DU_Fatal_Reboot(
+                    "Giai_Ma mat heartbeat"
+                );
+            }
+
+            if (
+                DU_Heartbeat_QuaHan(
+                    bay_gio,
+                    du_hb_audio_task_ms,
+                    DU_HB_AUDIO_TASK_TIMEOUT_MS
+                )
+            )
+            {
+                DU_Fatal_Reboot(
+                    "PWM_OUT mat heartbeat"
+                );
+            }
+
+            // Theo dõi riêng callback timer khi audio thực sự đang phát.
+            // Nếu timer còn chạy thì pulse counter phải thay đổi rất nhanh.
+            if (Audio_Timer_Playing)
+            {
+                uint32_t pulse_hien_tai =
+                    du_audio_timer_pulse_count;
+
+                if (
+                    pulse_hien_tai
+                    != audio_pulse_truoc
+                )
+                {
+                    audio_pulse_truoc =
+                        pulse_hien_tai;
+
+                    audio_pulse_doi_lan_cuoi_ms =
+                        bay_gio;
+                }
+                else if (
+                    (uint32_t)(
+                        bay_gio
+                        -
+                        audio_pulse_doi_lan_cuoi_ms
+                    )
+                        > DU_AUDIO_TIMER_STALL_MS
+                )
+                {
+                    DU_Fatal_Reboot(
+                        "Audio timer 8kHz dung tien trinh"
+                    );
+                }
+            }
+            else
+            {
+                audio_pulse_truoc =
+                    du_audio_timer_pulse_count;
+
+                audio_pulse_doi_lan_cuoi_ms =
+                    bay_gio;
+            }
+        }
+
+        // Supervisor khỏe -> feed watchdog.
+        (void)esp_task_wdt_reset();
+
+        vTaskDelay(
+            pdMS_TO_TICKS(
+                DU_SUPERVISOR_PERIOD_MS
+            )
+        );
+    }
+}
 
 
 // =====================================================
@@ -475,6 +828,8 @@ void TacVu_LoRaRX(void *thamSo)
 
     while (1)
     {
+        DU_Heartbeat_LoRa();
+
         memset(
             goi_tin,
             0,
@@ -673,6 +1028,8 @@ void TacVu_LoRaRX(void *thamSo)
             }
         }
 
+        DU_Heartbeat_LoRa();
+
         vTaskDelay(
             pdMS_TO_TICKS(1)
         );
@@ -693,17 +1050,22 @@ void TacVu_GiaiMa(void *thamSo)
 
     while (1)
     {
+        DU_Heartbeat_Decode();
+
         if (
             xQueueReceive(
                 HangDoi_GoiTinNhan,
                 goi_tin,
-                portMAX_DELAY
+                pdMS_TO_TICKS(250)
             )
             != pdTRUE
         )
         {
+            DU_Heartbeat_Decode();
             continue;
         }
+
+        DU_Heartbeat_Decode();
 
         uint8_t packet_type =
             goi_tin[2]
@@ -1441,33 +1803,380 @@ void TacVu_BaoPlay(void *thamSo)
 
 
 // =====================================================
+// AUDIO TIMER V2 - CALLBACK 8 kHz
+//
+// Callback cua esp_timer chay trong ESP_TIMER task, KHONG phai ISR.
+// Vi vay co the goi ledcWrite() va xTaskNotify().
+// Callback phai rat ngan: khong malloc, khong Serial, khong block.
+// =====================================================
+
+static void Audio_Sample_Timer_Callback(void *arg)
+{
+    (void)arg;
+
+    uint8_t slot;
+    uint16_t index;
+    uint16_t count;
+    int16_t sample = 0;
+
+    bool co_sample = false;
+    bool la_mau_dau = false;
+    bool frame_vua_xong = false;
+    uint8_t slot_vua_xong = 0;
+
+    portENTER_CRITICAL(&Audio_Timer_Mux);
+
+    if (Audio_Timer_Playing)
+    {
+        slot =
+            Audio_Timer_Active_Slot;
+
+        index =
+            Audio_Timer_Sample_Index;
+
+        count =
+            Audio_Timer_Count[slot];
+
+        if (
+            Audio_Timer_Ready[slot]
+            &&
+            index < count
+        )
+        {
+            sample =
+                Audio_Timer_Frame[slot][index];
+
+            co_sample =
+                true;
+
+            Audio_Timer_Sample_Index =
+                index + 1;
+
+            if (Audio_Timer_First_Sample)
+            {
+                Audio_Timer_First_Sample =
+                    false;
+
+                la_mau_dau =
+                    true;
+            }
+
+            if (
+                Audio_Timer_Sample_Index
+                >=
+                count
+            )
+            {
+                slot_vua_xong =
+                    slot;
+
+                frame_vua_xong =
+                    true;
+
+                Audio_Timer_Ready[slot] =
+                    false;
+
+                uint8_t slot_ke =
+                    slot ^ 1U;
+
+                if (Audio_Timer_Ready[slot_ke])
+                {
+                    Audio_Timer_Active_Slot =
+                        slot_ke;
+
+                    Audio_Timer_Sample_Index =
+                        0;
+                }
+                else
+                {
+                    // Het du lieu san sang.
+                    // Timer van ton tai, nhung callback se khong lay sample nua.
+                    // Audio task se nap slot moi hoac dung timer khi het cau.
+                    Audio_Timer_Playing =
+                        false;
+
+                    Audio_Timer_Sample_Index =
+                        0;
+                }
+            }
+        }
+    }
+
+    portEXIT_CRITICAL(&Audio_Timer_Mux);
+
+
+    if (co_sample)
+    {
+        // Heartbeat cực nhẹ cho đường timer 8 kHz.
+        du_audio_timer_pulse_count++;
+
+        int pwm_val =
+            128
+            +
+            (sample / 128);
+
+        if (pwm_val < 0)
+        {
+            pwm_val = 0;
+        }
+
+        if (pwm_val > 255)
+        {
+            pwm_val = 255;
+        }
+
+        ledcWrite(
+            PWM_CHANNEL,
+            pwm_val
+        );
+    }
+
+
+    // Moc PLAY that: sample dau tien da duoc day vao PWM.
+    if (la_mau_dau)
+    {
+        play_report_session_id =
+            session_id_hien_tai;
+
+        du_last_played_session_id =
+            session_id_hien_tai;
+
+        if (Task_PlayReport_Handle != nullptr)
+        {
+            xTaskNotifyGive(
+                Task_PlayReport_Handle
+            );
+        }
+    }
+
+
+    // Bao audio task slot nao vua duoc phat xong.
+    // Callback esp_timer la task context nen dung xTaskNotify binh thuong.
+    if (
+        frame_vua_xong
+        &&
+        Task_Audio_Handle != nullptr
+    )
+    {
+        xTaskNotify(
+            Task_Audio_Handle,
+            (1UL << slot_vua_xong),
+            eSetBits
+        );
+    }
+}
+
+
+// =====================================================
+// COPY 1 PCM FRAME TU RINGBUFFER -> TIMER SLOT
+// =====================================================
+
+static bool Nap_Audio_Timer_Slot(
+    uint8_t slot,
+    TickType_t timeout_ticks)
+{
+    if (slot > 1)
+    {
+        return false;
+    }
+
+    size_t kich_thuoc =
+        0;
+
+    uint8_t *pcm_data =
+        (uint8_t *)
+        xRingbufferReceive(
+            Audio_Buffer,
+            &kich_thuoc,
+            timeout_ticks
+        );
+
+    if (pcm_data == nullptr)
+    {
+        return false;
+    }
+
+    size_t so_mau =
+        kich_thuoc / sizeof(int16_t);
+
+    if (
+        so_mau
+        >
+        AUDIO_TIMER_FRAME_SAMPLES
+    )
+    {
+        so_mau =
+            AUDIO_TIMER_FRAME_SAMPLES;
+    }
+
+    // Copy vao RAM noi bo nho gon (320B/slot).
+    // Sau copy co the tra ngay item cho RingBuffer.
+    memcpy(
+        Audio_Timer_Frame[slot],
+        pcm_data,
+        so_mau * sizeof(int16_t)
+    );
+
+    if (
+        so_mau
+        <
+        AUDIO_TIMER_FRAME_SAMPLES
+    )
+    {
+        memset(
+            &Audio_Timer_Frame[slot][so_mau],
+            0,
+            (
+                AUDIO_TIMER_FRAME_SAMPLES
+                -
+                so_mau
+            )
+            *
+            sizeof(int16_t)
+        );
+    }
+
+    vRingbufferReturnItem(
+        Audio_Buffer,
+        (void *)pcm_data
+    );
+
+
+    // Publish metadata sau khi data da copy xong.
+    portENTER_CRITICAL(&Audio_Timer_Mux);
+
+    Audio_Timer_Count[slot] =
+        (uint16_t)so_mau;
+
+    Audio_Timer_Ready[slot] =
+        so_mau > 0;
+
+    portEXIT_CRITICAL(&Audio_Timer_Mux);
+
+    return so_mau > 0;
+}
+
+
+// =====================================================
+// KHOI DONG LAI TIMER NEU CALLBACK TAM DUNG DO CHUA CO SLOT KE
+// =====================================================
+
+static void Audio_Timer_Resume_If_Needed()
+{
+    portENTER_CRITICAL(&Audio_Timer_Mux);
+
+    if (!Audio_Timer_Playing)
+    {
+        if (Audio_Timer_Ready[0])
+        {
+            Audio_Timer_Active_Slot =
+                0;
+
+            Audio_Timer_Sample_Index =
+                0;
+
+            Audio_Timer_Playing =
+                true;
+        }
+        else if (Audio_Timer_Ready[1])
+        {
+            Audio_Timer_Active_Slot =
+                1;
+
+            Audio_Timer_Sample_Index =
+                0;
+
+            Audio_Timer_Playing =
+                true;
+        }
+    }
+
+    portEXIT_CRITICAL(&Audio_Timer_Mux);
+}
+
+
+// =====================================================
+// KIEM TRA DOUBLE BUFFER DA PHAT HET
+// =====================================================
+
+static bool Audio_Timer_All_Empty()
+{
+    bool empty;
+
+    portENTER_CRITICAL(&Audio_Timer_Mux);
+
+    empty =
+        !Audio_Timer_Ready[0]
+        &&
+        !Audio_Timer_Ready[1]
+        &&
+        !Audio_Timer_Playing;
+
+    portEXIT_CRITICAL(&Audio_Timer_Mux);
+
+    return empty;
+}
+
+
+// =====================================================
 // TASK 3
-// PHÁT ÂM THANH
+// PHAT AM THANH V2 - HIGH RESOLUTION TIMER 8 kHz
+//
+// Khong busy-wait.
+// PWM_OUT chu yeu block cho notification, nen IDLE0 co thoi gian chay.
 // =====================================================
 
 void TacVu_PhatAmThanh(void *thamSo)
 {
-    size_t kich_thuoc_lay_duoc;
+    (void)thamSo;
+
+    // Tao high-resolution periodic timer dung 1 lan.
+    esp_timer_create_args_t timer_args = {};
+    timer_args.callback =
+        &Audio_Sample_Timer_Callback;
+
+    timer_args.arg =
+        nullptr;
+
+    timer_args.dispatch_method =
+        ESP_TIMER_TASK;
+
+    timer_args.name =
+        "du_audio_8k";
+
+    esp_err_t timer_err =
+        esp_timer_create(
+            &timer_args,
+            &Audio_Sample_Timer
+        );
+
+    if (
+        timer_err != ESP_OK
+        ||
+        Audio_Sample_Timer == nullptr
+    )
+    {
+        Serial.printf(
+            "[DU AUDIO ERROR] Khong tao duoc esp_timer | ERR=%d\n",
+            (int)timer_err
+        );
+
+        DU_Fatal_Reboot(
+            "Khong tao duoc esp_timer audio"
+        );
+        return;
+    }
 
     bool dang_phat_loa =
         false;
 
-    int dem_khung_thoai =
-        0;
-
-
-    // 8 kHz -> 125 us / sample
-    const uint32_t CHU_KY_MAU_US =
-        1000000UL / AUDIO_SAMPLE_RATE;
-
 
     while (1)
     {
+        DU_Heartbeat_AudioTask();
+
         // =================================================
-        // CHƯA CÓ END_AUDIO
-        //
-        // Không lấy dữ liệu ra khỏi RingBuffer.
-        // Nhờ vậy toàn bộ câu được tích lại trước khi phát.
+        // CHUA CO END_AUDIO
         // =================================================
 
         if (!cho_phep_phat_audio)
@@ -1481,195 +2190,311 @@ void TacVu_PhatAmThanh(void *thamSo)
 
 
         // =================================================
-        // ĐÃ CÓ END_AUDIO -> PHÁT LIÊN TỤC
+        // CHUAN BI DOUBLE BUFFER
         // =================================================
 
-        uint8_t *pcm_data =
-            (uint8_t *)
-            xRingbufferReceive(
-                Audio_Buffer,
-                &kich_thuoc_lay_duoc,
+        portENTER_CRITICAL(&Audio_Timer_Mux);
+
+        Audio_Timer_Ready[0] =
+            false;
+
+        Audio_Timer_Ready[1] =
+            false;
+
+        Audio_Timer_Count[0] =
+            0;
+
+        Audio_Timer_Count[1] =
+            0;
+
+        Audio_Timer_Active_Slot =
+            0;
+
+        Audio_Timer_Sample_Index =
+            0;
+
+        Audio_Timer_Playing =
+            false;
+
+        Audio_Timer_First_Sample =
+            true;
+
+        portEXIT_CRITICAL(&Audio_Timer_Mux);
+
+
+        // END_AUDIO chi mo gate sau khi toan bo cau da buffer,
+        // nen slot dau tien phai co san neu cau co audio.
+        bool co_slot_0 =
+            Nap_Audio_Timer_Slot(
+                0,
                 pdMS_TO_TICKS(50)
             );
 
-
-        if (pcm_data != NULL)
+        if (!co_slot_0)
         {
-            bool day_la_mau_audio_dau_tien =
-                false;
-
-            // =============================================
-            // BẬT AUDIO OUTPUT
-            // =============================================
-
-            if (!dang_phat_loa)
-            {
-                pinMode(
-                    CHAN_AUDIO_OUT,
-                    OUTPUT
-                );
-
-
-                ledcAttachPin(
-                    CHAN_AUDIO_OUT,
-                    PWM_CHANNEL
-                );
-
-
-                dang_phat_loa =
-                    true;
-
-                day_la_mau_audio_dau_tien =
-                    true;
-
-                Serial.println(
-                    "[DU AUDIO] PLAY"
-                );
-            }
-
-
-            int16_t *pcm16 =
-                (int16_t *)pcm_data;
-
-
-            int so_mau =
-                kich_thuoc_lay_duoc / 2;
-
-
-            uint32_t thoi_gian_mau_tiep_theo =
-                esp_timer_get_time();
-
-
-            for (
-                int i = 0;
-                i < so_mau;
-                i++
-            )
-            {
-                int pwm_val =
-                    128
-                    +
-                    (pcm16[i] / 128);
-
-
-                if (pwm_val < 0)
-                {
-                    pwm_val = 0;
-                }
-
-
-                if (pwm_val > 255)
-                {
-                    pwm_val = 255;
-                }
-
-
-                ledcWrite(
-                    PWM_CHANNEL,
-                    pwm_val
-                );
-
-                // Day la moc PLAY thuc te: first PWM sample da ra GPIO.
-                // Bao report task NGAY SAU moc nay, khong block audio.
-                if (day_la_mau_audio_dau_tien)
-                {
-                    play_report_session_id =
-                        session_id_hien_tai;
-
-                    du_last_played_session_id =
-                        session_id_hien_tai;
-
-                    if (Task_PlayReport_Handle != nullptr)
-                    {
-                        xTaskNotifyGive(
-                            Task_PlayReport_Handle
-                        );
-                    }
-
-                    day_la_mau_audio_dau_tien =
-                        false;
-                }
-
-
-                thoi_gian_mau_tiep_theo +=
-                    CHU_KY_MAU_US;
-
-
-                while (
-                    esp_timer_get_time()
-                    <
-                    thoi_gian_mau_tiep_theo
-                )
-                {
-                    // busy wait
-                }
-            }
-
-
-            vRingbufferReturnItem(
-                Audio_Buffer,
-                (void *)pcm_data
-            );
-
-
-            dem_khung_thoai++;
-
-
-            if (
-                dem_khung_thoai
-                >= 50
-            )
-            {
-                vTaskDelay(
-                    pdMS_TO_TICKS(1)
-                );
-
-                dem_khung_thoai =
-                    0;
-            }
-        }
-
-
-        // =================================================
-        // BUFFER ĐÃ PHÁT HẾT
-        // =================================================
-
-        else
-        {
-            if (dang_phat_loa)
-            {
-                ledcDetachPin(
-                    CHAN_AUDIO_OUT
-                );
-
-
-                pinMode(
-                    CHAN_AUDIO_OUT,
-                    INPUT
-                );
-
-
-                dang_phat_loa =
-                    false;
-            }
-
-
-            dem_khung_thoai =
-                0;
-
-
-            // Quay về chế độ buffer cho câu tiếp theo.
+            // Khong co PCM de phat.
             cho_phep_phat_audio =
                 false;
 
-
             Serial.println(
-                "[DU AUDIO] PHAT XONG -> CHO CAU TIEP"
+                "[DU AUDIO] BUFFER RONG SAU END_AUDIO"
             );
 
-            // HMI module tu tao AUTO_ACK va mo quyen NACK cho session vua phat xong.
-            HMI_DU_Bao_Phat_Xong(du_last_played_session_id);
+            continue;
         }
+
+
+        // Prefill slot 1 neu con frame.
+        // Khong block: toan bo cau da nam trong RingBuffer.
+        bool con_du_lieu_vao =
+            Nap_Audio_Timer_Slot(
+                1,
+                0
+            );
+
+
+        // =================================================
+        // BAT AUDIO OUTPUT
+        // =================================================
+
+        if (!dang_phat_loa)
+        {
+            pinMode(
+                CHAN_AUDIO_OUT,
+                OUTPUT
+            );
+
+            ledcAttachPin(
+                CHAN_AUDIO_OUT,
+                PWM_CHANNEL
+            );
+
+            // Midpoint PWM truoc sample dau de tranh click DC lon.
+            ledcWrite(
+                PWM_CHANNEL,
+                128
+            );
+
+            dang_phat_loa =
+                true;
+        }
+
+
+        portENTER_CRITICAL(&Audio_Timer_Mux);
+
+        Audio_Timer_Active_Slot =
+            0;
+
+        Audio_Timer_Sample_Index =
+            0;
+
+        Audio_Timer_Playing =
+            true;
+
+        Audio_Timer_First_Sample =
+            true;
+
+        portEXIT_CRITICAL(&Audio_Timer_Mux);
+
+
+        Serial.println(
+            "[DU AUDIO] PLAY V2 TIMER 8KHZ"
+        );
+
+
+        // Xoa notification cu neu co.
+        uint32_t notify_bits =
+            0;
+
+        xTaskNotifyWait(
+            0,
+            0xFFFFFFFFUL,
+            &notify_bits,
+            0
+        );
+
+
+        timer_err =
+            esp_timer_start_periodic(
+                Audio_Sample_Timer,
+                AUDIO_TIMER_PERIOD_US
+            );
+
+        if (timer_err != ESP_OK)
+        {
+            Serial.printf(
+                "[DU AUDIO ERROR] esp_timer_start_periodic FAIL | ERR=%d\n",
+                (int)timer_err
+            );
+
+            portENTER_CRITICAL(&Audio_Timer_Mux);
+            Audio_Timer_Playing = false;
+            portEXIT_CRITICAL(&Audio_Timer_Mux);
+
+            cho_phep_phat_audio =
+                false;
+
+            continue;
+        }
+
+
+        // =================================================
+        // REFILL SLOT TRONG KHI TIMER DANG PHAT
+        // =================================================
+        //
+        // Moi slot = 20 ms audio. Audio task co gan 20 ms de copy
+        // frame tiep theo vao slot vua duoc giai phong.
+        //
+        // Het RingBuffer => con_du_lieu_vao = false.
+        // Cho 2 slot cuoi phat het roi dung timer.
+        // =================================================
+
+        bool input_exhausted =
+            !con_du_lieu_vao;
+
+        while (1)
+        {
+            DU_Heartbeat_AudioTask();
+
+            notify_bits =
+                0;
+
+            xTaskNotifyWait(
+                0,
+                0xFFFFFFFFUL,
+                &notify_bits,
+                pdMS_TO_TICKS(100)
+            );
+
+            DU_Heartbeat_AudioTask();
+
+
+            // Slot 0 vua phat xong.
+            if (
+                notify_bits & 0x01UL
+            )
+            {
+                if (!input_exhausted)
+                {
+                    if (
+                        !Nap_Audio_Timer_Slot(
+                            0,
+                            0
+                        )
+                    )
+                    {
+                        input_exhausted =
+                            true;
+                    }
+                }
+            }
+
+
+            // Slot 1 vua phat xong.
+            if (
+                notify_bits & 0x02UL
+            )
+            {
+                if (!input_exhausted)
+                {
+                    if (
+                        !Nap_Audio_Timer_Slot(
+                            1,
+                            0
+                        )
+                    )
+                    {
+                        input_exhausted =
+                            true;
+                    }
+                }
+            }
+
+
+            // Neu callback dung tam thoi do slot ke chua san sang,
+            // sau khi refill thi cho phep chay lai.
+            Audio_Timer_Resume_If_Needed();
+
+
+            if (
+                input_exhausted
+                &&
+                Audio_Timer_All_Empty()
+            )
+            {
+                break;
+            }
+        }
+
+
+        // =================================================
+        // DUNG TIMER SAU KHI PHAT HET CAU
+        // =================================================
+
+        esp_timer_stop(
+            Audio_Sample_Timer
+        );
+
+        portENTER_CRITICAL(&Audio_Timer_Mux);
+        Audio_Timer_Playing = false;
+        portEXIT_CRITICAL(&Audio_Timer_Mux);
+
+
+        // Dua PWM ve midpoint truoc khi detach.
+        ledcWrite(
+            PWM_CHANNEL,
+            128
+        );
+
+        ledcDetachPin(
+            CHAN_AUDIO_OUT
+        );
+
+        pinMode(
+            CHAN_AUDIO_OUT,
+            INPUT
+        );
+
+        dang_phat_loa =
+            false;
+
+
+        // Quay ve che do buffer cho cau tiep theo.
+        cho_phep_phat_audio =
+            false;
+
+
+        Serial.println(
+            "[DU AUDIO] PHAT XONG V2 -> CHO CAU TIEP"
+        );
+
+
+        // HMI module tu tao AUTO_ACK va mo quyen NACK
+        // cho session vua phat xong.
+        HMI_DU_Bao_Phat_Xong(
+            du_last_played_session_id
+        );
+    }
+}
+
+
+// =====================================================
+// TASK BAO CAO KENH THAT SU -> DU
+// Nhan_LoRa chi luu snapshot RSSI cua beacon SU. Task nay gui snapshot ve rBS
+// voi uu tien thap, khong chen vao voice/audio/HMI.
+// =====================================================
+void TacVu_BaoCao_Kenh_SU_DU(void *tham_so)
+{
+    (void)tham_so;
+    vTaskDelay(pdMS_TO_TICKS(1500));
+
+    while (1)
+    {
+        bool radio_dang_ban = HMI_DU_Radio_Dang_Ban() || cho_phep_phat_audio;
+        if (!radio_dang_ban)
+            Gui_BaoCao_Kenh_SU_DU_DangCho();
+
+        vTaskDelay(pdMS_TO_TICKS(25));
     }
 }
 
@@ -1844,10 +2669,9 @@ void setup()
         );
 
 
-        while (1)
-        {
-            delay(1000);
-        }
+        DU_Fatal_Reboot(
+            "Khong tim thay PSRAM"
+        );
     }
 
 
@@ -1895,10 +2719,9 @@ void setup()
         );
 
 
-        while (1)
-        {
-            delay(1000);
-        }
+        DU_Fatal_Reboot(
+            "Cap phat PSRAM audio that bai"
+        );
     }
 
 
@@ -1944,10 +2767,9 @@ void setup()
         );
 
 
-        while (1)
-        {
-            delay(1000);
-        }
+        DU_Fatal_Reboot(
+            "Tao Queue that bai"
+        );
     }
 
 
@@ -1965,10 +2787,9 @@ void setup()
         );
 
 
-        while (1)
-        {
-            delay(1000);
-        }
+        DU_Fatal_Reboot(
+            "Tao Audio Buffer that bai"
+        );
     }
 
 
@@ -1976,73 +2797,167 @@ void setup()
     // TASK PLAY REPORT
     // =================================================
 
-    xTaskCreatePinnedToCore(
-        TacVu_BaoPlay,
-        "PLAY_REPORT",
-        4096,
-        NULL,
-        3,
-        &Task_PlayReport_Handle,
-        1
-    );
+    BaseType_t ok_play_report =
+        xTaskCreatePinnedToCore(
+            TacVu_BaoPlay,
+            "PLAY_REPORT",
+            4096,
+            NULL,
+            3,
+            &Task_PlayReport_Handle,
+            1
+        );
+
+    if (ok_play_report != pdPASS)
+    {
+        DU_Fatal_Reboot(
+            "Tao task PLAY_REPORT that bai"
+        );
+    }
 
 
     // =================================================
     // TASK AUDIO
     // =================================================
 
-    xTaskCreatePinnedToCore(
-        TacVu_PhatAmThanh,
-        "PWM_OUT",
-        8192,
-        NULL,
-        3,
-        NULL,
-        0
-    );
+    BaseType_t ok_audio =
+        xTaskCreatePinnedToCore(
+            TacVu_PhatAmThanh,
+            "PWM_OUT",
+            8192,
+            NULL,
+            3,
+            &Task_Audio_Handle,
+            0
+        );
+
+    if (ok_audio != pdPASS)
+    {
+        DU_Fatal_Reboot(
+            "Tao task PWM_OUT that bai"
+        );
+    }
 
 
     // =================================================
     // TASK LORA RX
     // =================================================
 
-    xTaskCreatePinnedToCore(
-        TacVu_LoRaRX,
-        "LoRa_RX",
-        8192,
-        NULL,
-        4,
-        NULL,
-        1
-    );
+    BaseType_t ok_lora =
+        xTaskCreatePinnedToCore(
+            TacVu_LoRaRX,
+            "LoRa_RX",
+            8192,
+            NULL,
+            4,
+            NULL,
+            1
+        );
+
+    if (ok_lora != pdPASS)
+    {
+        DU_Fatal_Reboot(
+            "Tao task LoRa_RX that bai"
+        );
+    }
 
 
     // =================================================
     // TASK AES + SPEEX
     // =================================================
 
-    xTaskCreatePinnedToCore(
-        TacVu_GiaiMa,
-        "Giai_Ma",
-        10240,
-        NULL,
-        2,
-        NULL,
-        1
-    );
+    BaseType_t ok_decode =
+        xTaskCreatePinnedToCore(
+            TacVu_GiaiMa,
+            "Giai_Ma",
+            10240,
+            NULL,
+            2,
+            NULL,
+            1
+        );
+
+    if (ok_decode != pdPASS)
+    {
+        DU_Fatal_Reboot(
+            "Tao task Giai_Ma that bai"
+        );
+    }
+
+
+    // Bao cao kenh SU->DU: uu tien thap, chi gui snapshot da nghe ke.
+    BaseType_t ok_kenh =
+        xTaskCreatePinnedToCore(
+            TacVu_BaoCao_Kenh_SU_DU,
+            "KENH_SU_DU",
+            4096,
+            NULL,
+            1,
+            NULL,
+            0
+        );
+
+    if (ok_kenh != pdPASS)
+    {
+        DU_Fatal_Reboot(
+            "Tao task KENH_SU_DU that bai"
+        );
+    }
 
 
     // GPS beacon khoi tao SAU CUNG.
     // Luc nay queue/audio/RX/decode/HMI deu da san sang; telemetry chi la best-effort.
-    xTaskCreatePinnedToCore(
-        TacVu_BaoCao_ViTri_DinhKy_DU,
-        "GPS_DINH_KY",
-        4096,
-        NULL,
-        1,
-        NULL,
-        0
-    );
+    BaseType_t ok_gps =
+        xTaskCreatePinnedToCore(
+            TacVu_BaoCao_ViTri_DinhKy_DU,
+            "GPS_DINH_KY",
+            4096,
+            NULL,
+            1,
+            NULL,
+            0
+        );
+
+    if (ok_gps != pdPASS)
+    {
+        DU_Fatal_Reboot(
+            "Tao task GPS_DINH_KY that bai"
+        );
+    }
+
+
+    // Khởi tạo heartbeat sau khi toàn bộ task đã được tạo.
+    // Mỗi task sẽ cập nhật ngay khi scheduler chạy.
+    uint32_t hb_ban_dau =
+        millis();
+
+    du_hb_lora_ms =
+        hb_ban_dau;
+
+    du_hb_decode_ms =
+        hb_ban_dau;
+
+    du_hb_audio_task_ms =
+        hb_ban_dau;
+
+
+    BaseType_t ok_supervisor =
+        xTaskCreatePinnedToCore(
+            TacVu_DU_Supervisor,
+            "DU_SUPERVISOR",
+            4096,
+            NULL,
+            5,
+            &Task_Supervisor_Handle,
+            0
+        );
+
+    if (ok_supervisor != pdPASS)
+    {
+        DU_Fatal_Reboot(
+            "Tao task DU_SUPERVISOR that bai"
+        );
+    }
 
 
     Serial.println(

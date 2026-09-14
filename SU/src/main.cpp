@@ -1,4 +1,7 @@
 #include <Arduino.h>
+#include "esp_task_wdt.h"
+#include "esp_system.h"
+#include "esp_idf_version.h"
 #include <Wire.h>
 #include <U8g2lib.h>
 #include "driver/adc.h"
@@ -20,6 +23,129 @@ extern U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2;
 // ========================================================
 
 #define MAX_KHUNG_THOAI 3000
+
+
+// ========================================================
+// SELF-HEALING V1 - ESP32-S3 TASK WATCHDOG (SU)
+//
+// - Watchdog thật LUÔN hoạt động.
+// - SU_WDT_SELF_TEST chỉ dùng để cố tình ngừng feed sau 10 s
+//   nhằm kiểm chứng ESP32 có tự reboot hay không.
+// - Production phải để SU_WDT_SELF_TEST = 0.
+//
+// Timeout 12 s được chọn lớn hơn nhiều so với:
+//   * ACK wait <= ~1.05 s / packet
+//   * SESSION wait <= ~3.6 s tổng
+// và watchdog được feed thêm trong các vòng gửi dài.
+// Vì vậy không tăng delay và tránh reset giả khi thoại dài.
+// ========================================================
+#define SU_WDT_TIMEOUT_S              12U
+#define SU_WDT_SELF_TEST               0U
+#define SU_WDT_SELF_TEST_DELAY_MS   10000U
+static bool su_wdt_self_test_arm = false;
+static uint32_t su_wdt_boot_ms = 0;
+
+
+static void SU_WDT_Feed()
+{
+    // Nếu task chưa được subscribe thì reset() chỉ trả lỗi; bỏ qua an toàn.
+    (void)esp_task_wdt_reset();
+}
+
+
+static void SU_WDT_Init()
+{
+#if ESP_IDF_VERSION_MAJOR >= 5
+    esp_task_wdt_config_t cfg = {};
+    cfg.timeout_ms = SU_WDT_TIMEOUT_S * 1000U;
+    cfg.idle_core_mask = 0;       // chỉ watchdog task SU, không ép IDLE task
+    cfg.trigger_panic = true;
+
+    esp_err_t err = esp_task_wdt_init(&cfg);
+
+    if (err == ESP_ERR_INVALID_STATE)
+    {
+        // Arduino core đã khởi tạo TWDT -> chỉ đổi timeout/config.
+        (void)esp_task_wdt_reconfigure(&cfg);
+    }
+#else
+    // Arduino-ESP32 / ESP-IDF 4.x
+    (void)esp_task_wdt_init(SU_WDT_TIMEOUT_S, true);
+#endif
+
+    // setup()/loop() chạy trên cùng Arduino loopTask.
+    // Chỉ add nếu task hiện tại chưa nằm trong TWDT.
+    if (esp_task_wdt_status(NULL) != ESP_OK)
+    {
+        (void)esp_task_wdt_add(NULL);
+    }
+
+    su_wdt_boot_ms = millis();
+
+#if SU_WDT_SELF_TEST
+    const esp_reset_reason_t reset_reason = esp_reset_reason();
+
+    // Nếu lần boot hiện tại chính là hậu quả của watchdog thì bài test đã PASS.
+    // Không arm lại -> tránh reset-loop.
+    if (
+        reset_reason == ESP_RST_TASK_WDT
+        || reset_reason == ESP_RST_WDT
+        || reset_reason == ESP_RST_INT_WDT
+    )
+    {
+        su_wdt_self_test_arm = false;
+        Serial.println(
+            "[SU WDT] SELF_TEST PASS: reboot do watchdog, KHONG lap lai."
+        );
+    }
+    else
+    {
+        su_wdt_self_test_arm = true;
+        Serial.println(
+            "[SU WDT] SELF_TEST armed: se gia lap treo sau 10s."
+        );
+    }
+#else
+    su_wdt_self_test_arm = false;
+#endif
+
+    SU_WDT_Feed();
+
+    Serial.printf(
+        "[SU WDT] BAT | TIMEOUT=%us | SELF_TEST=%u | RESET_REASON=%d\n",
+        (unsigned int)SU_WDT_TIMEOUT_S,
+        (unsigned int)SU_WDT_SELF_TEST,
+        (int)esp_reset_reason()
+    );
+}
+
+
+static void SU_WDT_SelfTest_Check()
+{
+#if SU_WDT_SELF_TEST
+    if (
+        su_wdt_self_test_arm
+        &&
+        (millis() - su_wdt_boot_ms) >= SU_WDT_SELF_TEST_DELAY_MS
+    )
+    {
+        su_wdt_self_test_arm = false;
+
+        Serial.println(
+            "[SU WDT TEST] GIA LAP TREO: dung feed watchdog, cho ESP32 tu reboot..."
+        );
+        Serial.flush();
+
+        // Cố tình KHÔNG feed watchdog.
+        // delay() vẫn nhường CPU nhưng loopTask đã được TWDT theo dõi,
+        // nên sau timeout ESP32 sẽ reset.
+        while (true)
+        {
+            delay(1000);
+        }
+    }
+#endif
+}
 
 
 // ========================================================
@@ -185,6 +311,7 @@ static bool Gui_Packet_Co_ACK(
         lan++
     )
     {
+        SU_WDT_Feed();
         if (lan > 0)
         {
             su_oled_retransmissions++;
@@ -208,13 +335,16 @@ static bool Gui_Packet_Co_ACK(
         );
         Dat_LED_SU(false);
 
-        if (
+        bool ack_ok =
             Cho_READY_RBS(
                 ACK_TIMEOUT_SU_MS,
                 ack_kind,
                 ack_seq
-            )
-        )
+            );
+
+        SU_WDT_Feed();
+
+        if (ack_ok)
         {
             return true;
         }
@@ -244,8 +374,13 @@ void setup()
         115200
     );
 
+    delay(100);
+    SU_WDT_Init();
+    SU_WDT_Feed();
+
     // GPS NEO-6M doc lien tuc trong task rieng, khong block audio/PTT.
     KhoiTao_GPS_SU();
+    SU_WDT_Feed();
 
     moc_gui_vi_tri_su_tiep_theo_ms =
         millis() + TRE_BAO_CAO_VI_TRI_SU_LUC_KHOI_DONG_MS;
@@ -253,6 +388,7 @@ void setup()
 
     // Nut PTT + LED duoc khoi tao trong module HMI rieng.
     KhoiTao_HMI_SU();
+    SU_WDT_Feed();
 
 
     // ====================================================
@@ -266,6 +402,7 @@ void setup()
 
 
     KhoiTao_OLED();
+    SU_WDT_Feed();
 
 
     Ve_GiaoDien_OLED(
@@ -279,6 +416,7 @@ void setup()
     // ====================================================
 
     KhoiTao_ThuAm_DMA();
+    SU_WDT_Feed();
 
 
     adc_digi_stop();
@@ -309,6 +447,7 @@ void setup()
     // ====================================================
 
     KhoiTao_MayEp_Speex();
+    SU_WDT_Feed();
 
 
     // ====================================================
@@ -316,6 +455,7 @@ void setup()
     // ====================================================
 
     KhoiTao_LoRa();
+    SU_WDT_Feed();
 
 
     // ====================================================
@@ -340,9 +480,9 @@ void setup()
         );
 
 
-        while (1)
-        {
-        }
+        Serial.println("[SU SELF-HEAL] RAM init fail -> reboot sau 1s");
+        delay(1000);
+        ESP.restart();
     }
 
 
@@ -400,6 +540,9 @@ static void XuLy_BaoCao_ViTri_DinhKy_SU()
 
 void loop()
 {
+    SU_WDT_SelfTest_Check();
+    SU_WDT_Feed();
+
     bool nut_dang_bam = Nut_PTT_Dang_Bam_SU();
 
 
@@ -510,6 +653,7 @@ void loop()
 
 
                     tong_so_khung_da_ghi++;
+                    SU_WDT_Feed();
 
                     // Log nhe de xac nhan ADC/Speex van dang thu,
                     // khong cap nhat OLED trong luc DMA hoat dong.
@@ -679,6 +823,8 @@ void loop()
             lan++
         )
         {
+            SU_WDT_Feed();
+
             Serial.printf(
                 "[SU SESSION] REQUEST %u/%u | SESSION=%016llX\n",
                 (unsigned int)(lan + 1),
@@ -693,13 +839,16 @@ void loop()
 
             session_fail_remote = false;
 
-            if (
+            bool ready_ok =
                 Cho_SESSION_READY_RBS(
                     SESSION_TIMEOUT_SU_MS,
                     session_id_tx,
                     session_fail_remote
-                )
-            )
+                );
+
+            SU_WDT_Feed();
+
+            if (ready_ok)
             {
                 session_ready = true;
                 break;
@@ -755,6 +904,8 @@ void loop()
             i += MAX_FRAME_PER_PACKET
         )
         {
+            SU_WDT_Feed();
+
             uint32_t con_lai =
                 tong_so_khung_da_ghi - i;
 
@@ -901,6 +1052,8 @@ void loop()
                 break;
             }
 
+            SU_WDT_Feed();
+
 
             // =============================================
             // ĐỦ 8 DATA HOẶC ĐẾN PACKET CUỐI
@@ -950,6 +1103,8 @@ void loop()
                     break;
                 }
 
+                SU_WDT_Feed();
+
 
                 data_count_group =
                     0;
@@ -997,12 +1152,17 @@ void loop()
 
             // Sau AUDIO_END, SU vao RX va cho tin PLAY_STARTED da duoc
             // rBS forward tu DU. Timer van chay tren CHINH dong ho SU.
-            if (
+            SU_WDT_Feed();
+
+            bool play_started_ok =
                 Cho_PLAY_STARTED_RBS(
                     PLAY_REPORT_TIMEOUT_MS,
                     session_id_tx
-                )
-            )
+                );
+
+            SU_WDT_Feed();
+
+            if (play_started_ok)
             {
                 e2e_observed_ms =
                     millis() - e2e_ptt_release_ms;
@@ -1092,6 +1252,7 @@ void loop()
 
         XuLy_BaoCao_ViTri_DinhKy_SU();
 
+        SU_WDT_Feed();
         delay(5);
     }
 }

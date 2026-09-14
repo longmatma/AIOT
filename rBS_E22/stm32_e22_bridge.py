@@ -181,14 +181,65 @@ class STM32E22Bridge:
         self.listen()
 
     def reconnect(self) -> None:
+        """Mở lại UART và khôi phục đầy đủ PING -> CONFIG -> START_RX."""
         self.connect()
 
+    def ping(self) -> None:
+        """Kiểm tra firmware STM32 bridge còn phản hồi hay không."""
+        self._command(
+            CMD_PING,
+            b"",
+            timeout=0.8,
+            expected=(EVT_ACK, EVT_STATUS),
+        )
+
+    def ensure_ready(self) -> str:
+        """Tự phục hồi khi STM32/E22 vừa reset hoặc mất trạng thái RX.
+
+        Trả về:
+            "RX_REARM"  : STM32 còn sống, E22 đã cấu hình và START_RX lại được.
+            "RECONFIG"  : STM32 còn sống nhưng E22 mất cấu hình (điển hình sau
+                           khi STM32/IWDG reboot); đã CONFIG + START_RX lại.
+            "RECONNECT" : UART/PING hoặc phục hồi tại chỗ lỗi; đã mở lại UART
+                           và chạy đầy đủ PING -> CONFIG -> START_RX.
+
+        Hàm này chỉ nên được gateway gọi khi RX im bất thường hoặc khi UART/radio
+        vừa báo lỗi; không gọi trong đường truyền packet bình thường.
+        """
+        try:
+            self.ping()
+        except Exception:
+            self.reconnect()
+            return "RECONNECT"
+
+        try:
+            self.listen()
+            return "RX_REARM"
+        except Exception:
+            # Trường hợp thường gặp sau STM32 reboot:
+            # E22_Radio_Init() đã chạy nhưng s_configured=0, nên START_RX_FAIL.
+            try:
+                self.configure_radio()
+                self.listen()
+                return "RECONFIG"
+            except Exception:
+                self.reconnect()
+                return "RECONNECT"
+
     def reset_radio(self) -> None:
-        """Reset cứng E22 qua STM32 rồi trở lại RX với cấu hình đã lưu."""
+        """Hard-reset E22 rồi ép CONFIG + START_RX bằng cấu hình Pi đang giữ.
+
+        Firmware STM32 có ResetAndRestore(), nhưng nếu chính STM32 vừa reboot thì
+        biến s_configured đã về 0. Khi đó ResetAndRestore() có thể ACK mà E22 vẫn
+        chưa được cấu hình. Vì vậy phía Pi luôn cấu hình lại sau hard reset.
+        """
         self._command(CMD_RADIO_RESET, b"", timeout=1.5, expected=(EVT_ACK,))
         self._rx_queue.clear()
         self._event_queue.clear()
         self._rx_buffer.clear()
+        time.sleep(0.05)
+        self.configure_radio()
+        self.listen()
 
     def close(self) -> None:
         if self._ser is not None:

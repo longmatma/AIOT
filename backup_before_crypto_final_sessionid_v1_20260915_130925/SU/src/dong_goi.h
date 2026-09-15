@@ -54,9 +54,6 @@
 
 #define FEC_DATA_PER_GROUP        8
 
-// Khoi tao SESSION_ID ben vung tu NVS tai boot.
-bool KhoiTao_Session_ID_BenVung();
-
 uint64_t Tao_Session_Moi();
 
 void Tao_GoiTin_SessionStart(

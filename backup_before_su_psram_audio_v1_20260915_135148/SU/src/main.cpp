@@ -2,7 +2,6 @@
 #include "esp_task_wdt.h"
 #include "esp_system.h"
 #include "esp_idf_version.h"
-#include "esp_heap_caps.h"
 #include <Wire.h>
 #include <U8g2lib.h>
 #include "driver/adc.h"
@@ -23,7 +22,7 @@ extern U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2;
 // CẤU HÌNH
 // ========================================================
 
-#define MAX_KHUNG_THOAI 15000
+#define MAX_KHUNG_THOAI 3000
 
 
 // ========================================================
@@ -258,23 +257,6 @@ static bool su_telemetry_post_pending = false;
 // ========================================================
 
 uint8_t *Kho_Chua_AmThanh;
-
-// ========================================================
-// SU AUDIO PSRAM V1
-//
-// Kho_Chua_AmThanh chua cac frame Speex da nen:
-//   MAX_KHUNG_THOAI * 20 byte = 3000 * 20 = 60000 byte.
-//
-// Uu tien cap phat tu PSRAM neu PSRAM dang kha dung.
-// Neu board/config khong expose PSRAM, firmware fallback ve
-// internal RAM de khong lam brick thiet bi; log se canh bao ro.
-//
-// Khong thay packet/codec/AES/FEC/ARQ.
-// Khong tang MAX_KHUNG_THOAI o patch nay.
-// ========================================================
-static bool su_audio_buffer_in_psram = false;
-static size_t su_audio_buffer_bytes =
-    (size_t)MAX_KHUNG_THOAI * (size_t)SPEEX_BYTES_PER_FRAME;
 
 uint32_t tong_so_khung_da_ghi = 0;
 
@@ -517,114 +499,32 @@ void setup()
 
 
     // ====================================================
-    // SU AUDIO PSRAM V1
-    // PSRAM-FIRST, SAFE FALLBACK
+    // CẤP PHÁT RAM
     // ====================================================
 
-    const size_t psram_total =
-        heap_caps_get_total_size(
-            MALLOC_CAP_SPIRAM
+    Kho_Chua_AmThanh =
+        (uint8_t *)
+        heap_caps_malloc(
+            MAX_KHUNG_THOAI * 20,
+            MALLOC_CAP_8BIT
         );
 
-    const size_t psram_free_before =
-        heap_caps_get_free_size(
-            MALLOC_CAP_SPIRAM
-        );
-
-    const size_t internal_free_before =
-        heap_caps_get_free_size(
-            MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT
-        );
-
-    Serial.printf(
-        "[SU PSRAM] TOTAL=%u | FREE BEFORE=%u | AUDIO NEED=%u bytes\n",
-        (unsigned int)psram_total,
-        (unsigned int)psram_free_before,
-        (unsigned int)su_audio_buffer_bytes
-    );
 
     if (
-        psram_total > 0
-        &&
-        psram_free_before >= su_audio_buffer_bytes
+        Kho_Chua_AmThanh
+        == NULL
     )
     {
-        Kho_Chua_AmThanh =
-            (uint8_t *)
-            heap_caps_malloc(
-                su_audio_buffer_bytes,
-                MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT
-            );
-
-        if (Kho_Chua_AmThanh != NULL)
-        {
-            su_audio_buffer_in_psram = true;
-        }
-    }
-
-    // Fallback an toan:
-    // Neu SU thuc te khong co PSRAM, hoac PlatformIO chua expose PSRAM,
-    // van giu he thong chay nhu baseline cu de test/diagnose.
-    if (Kho_Chua_AmThanh == NULL)
-    {
         Serial.println(
-            "[SU PSRAM WARN] KHONG CAP PHAT DUOC PSRAM -> FALLBACK INTERNAL RAM"
+            "LOI: Chip khong du RAM!"
         );
 
-        Kho_Chua_AmThanh =
-            (uint8_t *)
-            heap_caps_malloc(
-                su_audio_buffer_bytes,
-                MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT
-            );
 
-        su_audio_buffer_in_psram = false;
-    }
-
-    if (Kho_Chua_AmThanh == NULL)
-    {
-        Serial.println(
-            "[SU ERROR] CAP PHAT AUDIO BUFFER THAT BAI!"
-        );
-
-        Serial.printf(
-            "[SU MEM] PSRAM_FREE=%u | INTERNAL_FREE=%u\n",
-            (unsigned int)
-            heap_caps_get_free_size(
-                MALLOC_CAP_SPIRAM
-            ),
-            (unsigned int)
-            heap_caps_get_free_size(
-                MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT
-            )
-        );
-
-        Serial.println(
-            "[SU SELF-HEAL] audio buffer init fail -> reboot sau 1s"
-        );
-
+        Serial.println("[SU SELF-HEAL] RAM init fail -> reboot sau 1s");
         delay(1000);
         ESP.restart();
     }
 
-    Serial.printf(
-        "[SU AUDIO BUFFER] %s | SIZE=%u bytes | MAX_AUDIO=%u ms\n",
-        su_audio_buffer_in_psram ? "PSRAM" : "INTERNAL_RAM",
-        (unsigned int)su_audio_buffer_bytes,
-        (unsigned int)(MAX_KHUNG_THOAI * 20U)
-    );
-
-    Serial.printf(
-        "[SU PSRAM] FREE AFTER=%u | INTERNAL FREE AFTER=%u\n",
-        (unsigned int)
-        heap_caps_get_free_size(
-            MALLOC_CAP_SPIRAM
-        ),
-        (unsigned int)
-        heap_caps_get_free_size(
-            MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT
-        )
-    );
 
     Serial.println(
         "[SU] Khoi tao thanh cong!"
@@ -756,9 +656,8 @@ void loop()
         adc_digi_start();
 
 
-        Serial.printf(
-            ">> BAT DAU GHI AM -> SPEEX BUFFER %s...\n",
-            su_audio_buffer_in_psram ? "PSRAM" : "INTERNAL_RAM"
+        Serial.println(
+            ">> BAT DAU GHI AM VAO RAM..."
         );
     }
 

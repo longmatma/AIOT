@@ -1,7 +1,6 @@
 #include "dong_goi.h"
 #include "ma_hoa.h"
 #include "esp_system.h"
-#include <Preferences.h>
 #include <string.h>
 
 // =====================================================
@@ -13,151 +12,30 @@ uint64_t session_id_hien_tai = 0;
 
 
 // =====================================================
-// CRYPTO FINAL SESSION-ID V1
-//
-// AES-GCM yeu cau: KHONG DUOC reuse cung KEY + IV.
-//
-// Session key phu thuoc SESSION_ID, con IV = SESSION_ID || nonce32.
-// Vi vay SESSION_ID phai tranh lap qua reboot.
-//
-// Co che:
-//   HIGH32 = persistent monotonic counter trong NVS.
-//   LOW32  = esp_random().
-//
-// De giam wear flash:
-//   - moi lan reserve 4096 counter truoc khi dung;
-//   - ghi high-water mark vao NVS TRUOC;
-//   - neu mat dien, ID chua dung bi bo qua, KHONG bi reuse;
-//   - chi ghi NVS 1 lan/boot + moi 4096 session.
-// =====================================================
-
-static constexpr uint32_t SESSION_COUNTER_BLOCK = 4096UL;
-
-static uint32_t session_counter_next = 0;
-static uint32_t session_counter_end = 0;
-static bool session_allocator_ready = false;
-
-
-static bool Reserve_Session_Counter_Block()
-{
-    Preferences prefs;
-
-    if (!prefs.begin("vedc_crypto", false))
-    {
-        Serial.println(
-            "[SU CRYPTO FATAL] KHONG MO DUOC NVS namespace vedc_crypto"
-        );
-        return false;
-    }
-
-    uint32_t persisted_end =
-        prefs.getUInt("sid_hi", 0UL);
-
-    if (
-        persisted_end
-        >
-        (0xFFFFFFFFUL - SESSION_COUNTER_BLOCK)
-    )
-    {
-        prefs.end();
-
-        Serial.println(
-            "[SU CRYPTO FATAL] SESSION COUNTER DA GAN TRAN 32-BIT"
-        );
-        return false;
-    }
-
-    const uint32_t new_end =
-        persisted_end + SESSION_COUNTER_BLOCK;
-
-    size_t written =
-        prefs.putUInt(
-            "sid_hi",
-            new_end
-        );
-
-    prefs.end();
-
-    if (written != sizeof(uint32_t))
-    {
-        Serial.println(
-            "[SU CRYPTO FATAL] GHI NVS sid_hi THAT BAI"
-        );
-        return false;
-    }
-
-    session_counter_next =
-        persisted_end + 1UL;
-
-    session_counter_end =
-        new_end;
-
-    session_allocator_ready =
-        true;
-
-    Serial.printf(
-        "[SU CRYPTO] SESSION-ID BLOCK RESERVED | COUNTER=%u..%u | SIZE=%u\n",
-        (unsigned int)session_counter_next,
-        (unsigned int)session_counter_end,
-        (unsigned int)SESSION_COUNTER_BLOCK
-    );
-
-    return true;
-}
-
-
-bool KhoiTao_Session_ID_BenVung()
-{
-    if (session_allocator_ready)
-        return true;
-
-    return Reserve_Session_Counter_Block();
-}
-
-
-// =====================================================
 // SESSION MỚI
 // =====================================================
 
 uint64_t Tao_Session_Moi()
 {
-    if (
-        !session_allocator_ready
-        ||
-        session_counter_next == 0
-        ||
-        session_counter_next > session_counter_end
-    )
-    {
-        if (!Reserve_Session_Counter_Block())
-        {
-            Serial.println(
-                "[SU CRYPTO FATAL] KHONG CAP DUOC SESSION-ID -> REBOOT"
-            );
-            Serial.flush();
-            delay(200);
-            ESP.restart();
-            return 0;
-        }
-    }
+    uint64_t phan_cao =
+        ((uint64_t)esp_random()) << 32;
 
-    const uint32_t counter32 =
-        session_counter_next++;
-
-    const uint32_t random32 =
-        esp_random();
+    uint64_t phan_thap =
+        (uint64_t)esp_random();
 
     session_id_hien_tai =
-        (((uint64_t)counter32) << 32)
-        |
-        (uint64_t)random32;
+        phan_cao | phan_thap;
+
+    if (session_id_hien_tai == 0)
+    {
+        session_id_hien_tai = 1;
+    }
 
     so_thu_tu_goi = 0;
 
     Serial.printf(
-        "[SU] NEW SESSION = %016llX | SID_COUNTER=%u\n",
-        (unsigned long long)session_id_hien_tai,
-        (unsigned int)counter32
+        "[SU] NEW SESSION = %016llX\n",
+        (unsigned long long)session_id_hien_tai
     );
 
     return session_id_hien_tai;

@@ -456,6 +456,41 @@ bool da_co_session = false;
 
 
 // =====================================================
+// STAGE 3B1A - SECURITY COUNTERS THEO SESSION
+//
+// Khong dung RSSI/SNR/H.
+// Replay heuristic:
+// - chi xet packet DA GCM OK;
+// - packet cu cach highest <= 16: bo qua de tranh nham ARQ;
+// - packet cu hon 16 packet: REPLAY_SUSPECT.
+// =====================================================
+static uint16_t sec_voice_gcm_fail = 0;
+static uint16_t sec_fec_gcm_fail = 0;
+static uint16_t sec_replay_suspect = 0;
+static uint16_t sec_voice_gcm_ok = 0;
+static uint16_t sec_fec_gcm_ok = 0;
+static uint32_t sec_highest_auth_seq = 0;
+static bool sec_have_highest_auth_seq = false;
+
+static void Sec_Inc_U16(uint16_t &v)
+{
+    if (v < 0xFFFFU)
+        ++v;
+}
+
+static void Sec_Reset_Session()
+{
+    sec_voice_gcm_fail = 0;
+    sec_fec_gcm_fail = 0;
+    sec_replay_suspect = 0;
+    sec_voice_gcm_ok = 0;
+    sec_fec_gcm_ok = 0;
+    sec_highest_auth_seq = 0;
+    sec_have_highest_auth_seq = false;
+}
+
+
+// =====================================================
 // CHỐNG PACKET TRÙNG TRONG CÙNG SESSION
 // =====================================================
 
@@ -1154,6 +1189,30 @@ void TacVu_GiaiMa(void *thamSo)
                 continue;
             }
 
+            const uint8_t session_meta =
+                goi_tin[3];
+
+            const uint8_t profile_moi =
+                (session_meta >> 6) & 0x03U;
+
+            // bits5..0 hien chi cho phep payload length = 8.
+            if (
+                (session_meta & 0x3FU) != 8U
+                ||
+                !Profile_BaoMat_HopLe(
+                    profile_moi
+                )
+            )
+            {
+                Serial.printf(
+                    "[DU CRYPTO DROP] SESSION META/PROFILE sai | META=0x%02X | PROFILE=%u\n",
+                    (unsigned int)session_meta,
+                    (unsigned int)profile_moi
+                );
+
+                continue;
+            }
+
             if (
                 da_co_session
                 &&
@@ -1161,6 +1220,21 @@ void TacVu_GiaiMa(void *thamSo)
                     == session_id_hien_tai
             )
             {
+                if (
+                    profile_moi
+                    != Lay_Profile_BaoMat()
+                )
+                {
+                    Serial.printf(
+                        "[DU CRYPTO DROP] CUNG SESSION NHUNG DOI PROFILE | SESSION=%016llX | CU=%u | MOI=%u\n",
+                        (unsigned long long)session_moi,
+                        (unsigned int)Lay_Profile_BaoMat(),
+                        (unsigned int)profile_moi
+                    );
+
+                    continue;
+                }
+
                 HMI_DU_TamDung_Beacon(1500UL);
 
                 Serial.printf(
@@ -1178,6 +1252,34 @@ void TacVu_GiaiMa(void *thamSo)
             // flush bằng PLC trước khi reset.
             Flush_FEC_Group(
                 "NEW_SESSION"
+            );
+
+            if (
+                !Dat_Profile_BaoMat(
+                    profile_moi
+                )
+            )
+            {
+                Serial.printf(
+                    "[DU CRYPTO DROP] Khong dat duoc PROFILE=%u\n",
+                    (unsigned int)profile_moi
+                );
+
+                continue;
+            }
+
+            Serial.printf(
+                "[DU CRYPTO] SESSION PROFILE=%s(%u) | AES=%u | REKEY_EVERY=%u packet\n",
+                Ten_Profile_BaoMat(
+                    profile_moi
+                ),
+                (unsigned int)profile_moi,
+                (unsigned int)So_Bit_AES_Theo_Profile(
+                    profile_moi
+                ),
+                (unsigned int)ChuKy_DoiKhoa_Theo_Profile(
+                    profile_moi
+                )
             );
 
             session_id_hien_tai =
@@ -1199,6 +1301,7 @@ void TacVu_GiaiMa(void *thamSo)
 
             Reset_FEC_Group();
             Reset_ThongKe_OLED_DU();
+            Sec_Reset_Session();
 
             HienThi_DU_DangNhan(
                 0,
@@ -1327,9 +1430,13 @@ void TacVu_GiaiMa(void *thamSo)
                     group_start
                 );
 
+                Sec_Inc_U16(sec_fec_gcm_fail);
+
                 // Không dùng parity không xác thực.
                 continue;
             }
+
+            Sec_Inc_U16(sec_fec_gcm_ok);
 
             if (
                 !fec_group.active
@@ -1545,6 +1652,8 @@ void TacVu_GiaiMa(void *thamSo)
                     ] =
                         recovered_frames;
 
+                    Sec_Inc_U16(sec_voice_gcm_ok);
+
                     Serial.printf(
                         "[DU FEC RECOVER + VOICE GCM OK] SEQ=%u | SLOT=%d\n",
                         recovered_seq,
@@ -1553,6 +1662,8 @@ void TacVu_GiaiMa(void *thamSo)
                 }
                 else
                 {
+                    Sec_Inc_U16(sec_voice_gcm_fail);
+
                     Serial.printf(
                         "[DU FEC RECOVER BUT VOICE GCM FAIL] SEQ=%u | SLOT=%d\n",
                         recovered_seq,
@@ -1681,9 +1792,40 @@ void TacVu_GiaiMa(void *thamSo)
                 seq
             );
 
+            Sec_Inc_U16(sec_voice_gcm_fail);
+
             // Không dùng LAST/frame/group metadata từ packet GCM fail.
             // FEC packet đã authenticated sẽ cung cấp metadata group/final.
             continue;
+        }
+
+        Sec_Inc_U16(sec_voice_gcm_ok);
+
+        if (
+            sec_have_highest_auth_seq
+            &&
+            seq < sec_highest_auth_seq
+            &&
+            (sec_highest_auth_seq - seq) > 16U
+        )
+        {
+            Sec_Inc_U16(sec_replay_suspect);
+
+            Serial.printf(
+                "[DU SECURITY] REPLAY_SUSPECT | SEQ=%u | HIGHEST=%u\n",
+                seq,
+                sec_highest_auth_seq
+            );
+        }
+
+        if (
+            !sec_have_highest_auth_seq
+            ||
+            seq > sec_highest_auth_seq
+        )
+        {
+            sec_highest_auth_seq = seq;
+            sec_have_highest_auth_seq = true;
         }
 
         uint32_t group_start =
@@ -2469,6 +2611,18 @@ void TacVu_PhatAmThanh(void *thamSo)
         );
 
 
+        // Stage 3B1A: chi COPY snapshot vao pending RAM.
+        // Khong TX LoRa trong audio task.
+        Dat_BaoCao_BaoMat_DangCho(
+            du_last_played_session_id,
+            sec_voice_gcm_fail,
+            sec_fec_gcm_fail,
+            sec_replay_suspect,
+            sec_voice_gcm_ok,
+            sec_fec_gcm_ok,
+            sec_have_highest_auth_seq ? sec_highest_auth_seq : 0U
+        );
+
         // HMI module tu tao AUTO_ACK va mo quyen NACK
         // cho session vua phat xong.
         HMI_DU_Bao_Phat_Xong(
@@ -2492,7 +2646,14 @@ void TacVu_BaoCao_Kenh_SU_DU(void *tham_so)
     {
         bool radio_dang_ban = HMI_DU_Radio_Dang_Ban() || cho_phep_phat_audio;
         if (!radio_dang_ban)
-            Gui_BaoCao_Kenh_SU_DU_DangCho();
+        {
+            // Security telemetry uu tien hon measurement-only.
+            // Neu vua gui security thi de report kenh sang vong sau.
+            if (!Gui_BaoCao_BaoMat_DangCho())
+            {
+                Gui_BaoCao_Kenh_SU_DU_DangCho();
+            }
+        }
 
         vTaskDelay(pdMS_TO_TICKS(25));
     }

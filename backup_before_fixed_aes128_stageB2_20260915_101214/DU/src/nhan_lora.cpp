@@ -83,6 +83,28 @@ struct MauKenhSUDU
 static MauKenhSUDU mau_kenh_su_du = {};
 static portMUX_TYPE KenhSUDU_Mux = portMUX_INITIALIZER_UNLOCKED;
 
+
+// =====================================================
+// STAGE 3B1A - SECURITY REPORT PENDING
+//
+// Decoder chi copy snapshot vao RAM.
+// Task telemetry uu tien thap moi TX khi radio ranh.
+// =====================================================
+struct BaoCaoBaoMatPending
+{
+    bool pending;
+    uint64_t session_id;
+    uint16_t voice_gcm_fail;
+    uint16_t fec_gcm_fail;
+    uint16_t replay_suspect;
+    uint16_t voice_gcm_ok;
+    uint16_t fec_gcm_ok;
+    uint32_t highest_seq;
+};
+
+static BaoCaoBaoMatPending bao_cao_bao_mat_pending = {};
+static portMUX_TYPE BaoMatReportMux = portMUX_INITIALIZER_UNLOCKED;
+
 static uint64_t DU_Doc_U64_BE(const uint8_t *p)
 {
     uint64_t v = 0;
@@ -720,17 +742,156 @@ bool Gui_USER_RESPONSE_RBS(
 
 
 // =====================================================
-// TELEMETRY PRE/POST V1
-// XOA MAU KENH PRE CON PENDING KHI SESSION BAT DAU.
-//
-// Khong TX gi ca. Chi xoa snapshot RAM cu de sau session
-// DU cho beacon SU moi va bao cao dung mau POST.
+// STAGE 3B1A - DAT SECURITY SNAPSHOT DANG CHO
 // =====================================================
-void Xoa_BaoCao_Kenh_SU_DU_DangCho()
+void Dat_BaoCao_BaoMat_DangCho(
+    uint64_t session_id,
+    uint16_t voice_gcm_fail,
+    uint16_t fec_gcm_fail,
+    uint16_t replay_suspect,
+    uint16_t voice_gcm_ok,
+    uint16_t fec_gcm_ok,
+    uint32_t highest_seq)
 {
-    portENTER_CRITICAL(&KenhSUDU_Mux);
-    mau_kenh_su_du.pending = false;
-    portEXIT_CRITICAL(&KenhSUDU_Mux);
+    if (session_id == 0)
+        return;
+
+    portENTER_CRITICAL(&BaoMatReportMux);
+
+    bao_cao_bao_mat_pending.pending = true;
+    bao_cao_bao_mat_pending.session_id = session_id;
+    bao_cao_bao_mat_pending.voice_gcm_fail = voice_gcm_fail;
+    bao_cao_bao_mat_pending.fec_gcm_fail = fec_gcm_fail;
+    bao_cao_bao_mat_pending.replay_suspect = replay_suspect;
+    bao_cao_bao_mat_pending.voice_gcm_ok = voice_gcm_ok;
+    bao_cao_bao_mat_pending.fec_gcm_ok = fec_gcm_ok;
+    bao_cao_bao_mat_pending.highest_seq = highest_seq;
+
+    portEXIT_CRITICAL(&BaoMatReportMux);
+}
+
+
+// =====================================================
+// STAGE 3B1A - GUI SECURITY REPORT VE rBS
+//
+// 28B:
+// [0]      DST = rBS
+// [1]      SRC = DU
+// [2]      TYPE = 0x1A
+// [3]      VERSION = 1
+// [4..11]  SESSION_ID64
+// [12..13] VOICE_GCM_FAIL
+// [14..15] FEC_GCM_FAIL
+// [16..17] REPLAY_SUSPECT
+// [18..19] VOICE_GCM_OK
+// [20..21] FEC_GCM_OK
+// [22..25] HIGHEST_AUTH_SEQ
+// [26..27] reserved
+//
+// Best-effort, low priority, SHADOW ONLY.
+// =====================================================
+bool Gui_BaoCao_BaoMat_DangCho()
+{
+    if (LoRa_Mutex == nullptr)
+        return false;
+
+    BaoCaoBaoMatPending mau = {};
+
+    portENTER_CRITICAL(&BaoMatReportMux);
+
+    if (!bao_cao_bao_mat_pending.pending)
+    {
+        portEXIT_CRITICAL(&BaoMatReportMux);
+        return false;
+    }
+
+    mau = bao_cao_bao_mat_pending;
+
+    portEXIT_CRITICAL(&BaoMatReportMux);
+
+    if (digitalRead(LORA_DIO0) == HIGH)
+        return false;
+
+    if (xSemaphoreTake(LoRa_Mutex, 0) != pdTRUE)
+        return false;
+
+    if (digitalRead(LORA_DIO0) == HIGH)
+    {
+        xSemaphoreGive(LoRa_Mutex);
+        return false;
+    }
+
+    uint8_t p[SIZE_BAO_CAO_BAO_MAT] = {};
+
+    p[0] = ID_TRAM_RBS;
+    p[1] = ID_TRAM_DU;
+    p[2] = TYPE_BAO_CAO_BAO_MAT;
+    p[3] = 1;
+
+    for (int i = 0; i < 8; ++i)
+    {
+        p[4 + i] = (uint8_t)(
+            (mau.session_id >> (56 - 8 * i)) & 0xFF
+        );
+    }
+
+    auto ghi_u16_be = [](uint8_t *dst, uint16_t v)
+    {
+        dst[0] = (uint8_t)((v >> 8) & 0xFF);
+        dst[1] = (uint8_t)(v & 0xFF);
+    };
+
+    ghi_u16_be(&p[12], mau.voice_gcm_fail);
+    ghi_u16_be(&p[14], mau.fec_gcm_fail);
+    ghi_u16_be(&p[16], mau.replay_suspect);
+    ghi_u16_be(&p[18], mau.voice_gcm_ok);
+    ghi_u16_be(&p[20], mau.fec_gcm_ok);
+
+    p[22] = (uint8_t)((mau.highest_seq >> 24) & 0xFF);
+    p[23] = (uint8_t)((mau.highest_seq >> 16) & 0xFF);
+    p[24] = (uint8_t)((mau.highest_seq >> 8) & 0xFF);
+    p[25] = (uint8_t)(mau.highest_seq & 0xFF);
+
+    LoRa.idle();
+    LoRa.beginPacket();
+    LoRa.write(p, sizeof(p));
+    int ok = LoRa.endPacket();
+    LoRa.receive();
+
+    xSemaphoreGive(LoRa_Mutex);
+
+    if (ok == 1)
+    {
+        portENTER_CRITICAL(&BaoMatReportMux);
+
+        if (
+            bao_cao_bao_mat_pending.pending
+            &&
+            bao_cao_bao_mat_pending.session_id == mau.session_id
+        )
+        {
+            bao_cao_bao_mat_pending.pending = false;
+        }
+
+        portEXIT_CRITICAL(&BaoMatReportMux);
+
+        Serial.printf(
+            "[DU SECURITY] REPORT -> rBS | SESSION=%016llX | "
+            "VOICE_FAIL=%u | FEC_FAIL=%u | REPLAY=%u | "
+            "VOICE_OK=%u | FEC_OK=%u | HIGHEST_SEQ=%u\n",
+            (unsigned long long)mau.session_id,
+            (unsigned int)mau.voice_gcm_fail,
+            (unsigned int)mau.fec_gcm_fail,
+            (unsigned int)mau.replay_suspect,
+            (unsigned int)mau.voice_gcm_ok,
+            (unsigned int)mau.fec_gcm_ok,
+            (unsigned int)mau.highest_seq
+        );
+
+        return true;
+    }
+
+    return false;
 }
 
 

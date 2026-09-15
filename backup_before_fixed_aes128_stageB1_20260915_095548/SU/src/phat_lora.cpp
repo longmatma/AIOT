@@ -1,4 +1,5 @@
 #include "phat_lora.h"
+#include "ma_hoa.h"
 
 #include <Arduino.h>
 #include <math.h>
@@ -338,13 +339,46 @@ bool Cho_SESSION_READY_RBS(
                 {
                     if (buffer[2] == TYPE_SESSION_READY)
                     {
+                        const uint8_t profile_duoc_chon =
+                            buffer[3] & 0x03U;
+
+                        if (
+                            !Profile_BaoMat_HopLe(
+                                profile_duoc_chon
+                            )
+                            ||
+                            !Dat_Profile_BaoMat(
+                                profile_duoc_chon
+                            )
+                        )
+                        {
+                            Serial.printf(
+                                "[SU CRYPTO DROP] SESSION_READY profile khong hop le=%u | SESSION=%016llX\n",
+                                (unsigned int)profile_duoc_chon,
+                                (unsigned long long)session_id
+                            );
+
+                            LoRa.receive();
+                            continue;
+                        }
+
                         Serial.printf(
                             "[SU SESSION] SESSION_READY OK | SESSION=%016llX\n",
                             (unsigned long long)session_id
                         );
 
-                        Serial.println(
-                            "[SU CRYPTO] FIXED AES-128-GCM | SESSION KEY THEO SESSION_ID"
+                        Serial.printf(
+                            "[SU CRYPTO] PROFILE=%s(%u) | AES=%u | REKEY_EVERY=%u packet\n",
+                            Ten_Profile_BaoMat(
+                                profile_duoc_chon
+                            ),
+                            (unsigned int)profile_duoc_chon,
+                            (unsigned int)So_Bit_AES_Theo_Profile(
+                                profile_duoc_chon
+                            ),
+                            (unsigned int)ChuKy_DoiKhoa_Theo_Profile(
+                                profile_duoc_chon
+                            )
                         );
 
                         LoRa.idle();

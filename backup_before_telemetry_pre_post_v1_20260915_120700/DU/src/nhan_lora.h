@@ -66,9 +66,4 @@ bool Gui_VI_TRI_DINH_KY_DU(
 
 bool Gui_BaoCao_Kenh_SU_DU_DangCho();
 
-// TELEMETRY PRE/POST V1:
-// Xoa mau PRE con pending khi voice session bat dau.
-// Nhu vay report sau session chi dung beacon SU moi (POST).
-void Xoa_BaoCao_Kenh_SU_DU_DangCho();
-
 #endif

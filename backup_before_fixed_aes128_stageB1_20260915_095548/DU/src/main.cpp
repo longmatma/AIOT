@@ -79,141 +79,6 @@ uint8_t *Audio_Buffer_Storage =
 // nhận END_AUDIO từ rBS.
 volatile bool cho_phep_phat_audio = false;
 
-
-// =====================================================
-// LATENCY OPTIMIZATION V1.1
-//
-// 1) SESSION_READY duoc uu tien TX ngay khi DU nhan SESSION_START.
-// 2) GPS_PHIEN khong chen vao cua so handshake/VOICE/FEC.
-//    GPS_PHIEN van duoc GIU, nhung dua sang pending va gui khi radio ranh.
-// 3) GPS dinh ky + report kenh SU-DU bi tam khoa trong luc DU dang
-//    nhan mot session thoai.
-//
-// Timeout 30s chi la fail-safe: neu mat END_AUDIO, telemetry tu mo lai.
-// =====================================================
-static portMUX_TYPE DU_Latency_Mux =
-    portMUX_INITIALIZER_UNLOCKED;
-
-static volatile bool DU_Latency_SessionBusy = false;
-static volatile uint32_t DU_Latency_SessionStartMs = 0;
-
-static bool DU_Latency_GPSPhienPending = false;
-static uint64_t DU_Latency_GPSPhienId = 0;
-
-// Sau session, cho mot beacon SU moi de tao report kenh POST.
-static bool DU_Latency_PostChannelPending = false;
-
-static void DU_Latency_BatDauSession(uint64_t session_id)
-{
-    const uint32_t now_ms = millis();
-
-    portENTER_CRITICAL(&DU_Latency_Mux);
-
-    DU_Latency_SessionBusy = true;
-    DU_Latency_SessionStartMs = now_ms;
-
-    // GPS_PHIEN nay se duoc gui SAU session, khong gui trong handshake.
-    DU_Latency_GPSPhienPending = true;
-    DU_Latency_GPSPhienId = session_id;
-
-    // Channel POST phai den tu beacon SU moi sau session.
-    DU_Latency_PostChannelPending = true;
-
-    portEXIT_CRITICAL(&DU_Latency_Mux);
-
-    // Bo mau PRE con pending trong RAM, KHONG TX.
-    Xoa_BaoCao_Kenh_SU_DU_DangCho();
-
-    Serial.println(
-        "[DU TELEMETRY] LOCK TRONG PHIEN | PRE GIU O rBS | POST PENDING"
-    );
-}
-
-static void DU_Latency_KetThucNhanSession()
-{
-    portENTER_CRITICAL(&DU_Latency_Mux);
-    DU_Latency_SessionBusy = false;
-    portEXIT_CRITICAL(&DU_Latency_Mux);
-}
-
-static bool DU_Latency_DangNhanSession()
-{
-    bool busy = false;
-    uint32_t start_ms = 0;
-
-    portENTER_CRITICAL(&DU_Latency_Mux);
-    busy = DU_Latency_SessionBusy;
-    start_ms = DU_Latency_SessionStartMs;
-    portEXIT_CRITICAL(&DU_Latency_Mux);
-
-    if (
-        busy
-        &&
-        (uint32_t)(millis() - start_ms) > 30000UL
-    )
-    {
-        DU_Latency_KetThucNhanSession();
-
-        Serial.println(
-            "[DU LATENCY] SESSION RX TIMEOUT -> MO LAI TELEMETRY"
-        );
-
-        return false;
-    }
-
-    return busy;
-}
-
-static bool DU_Latency_LayGPSPhienPending(uint64_t &session_id)
-{
-    bool pending = false;
-
-    portENTER_CRITICAL(&DU_Latency_Mux);
-
-    pending = DU_Latency_GPSPhienPending;
-
-    if (pending)
-        session_id = DU_Latency_GPSPhienId;
-
-    portEXIT_CRITICAL(&DU_Latency_Mux);
-
-    return pending;
-}
-
-static void DU_Latency_XoaGPSPhienPending(uint64_t session_id)
-{
-    portENTER_CRITICAL(&DU_Latency_Mux);
-
-    if (
-        DU_Latency_GPSPhienPending
-        &&
-        DU_Latency_GPSPhienId == session_id
-    )
-    {
-        DU_Latency_GPSPhienPending = false;
-    }
-
-    portEXIT_CRITICAL(&DU_Latency_Mux);
-}
-
-static bool DU_Latency_PostChannelDangCho()
-{
-    bool pending = false;
-
-    portENTER_CRITICAL(&DU_Latency_Mux);
-    pending = DU_Latency_PostChannelPending;
-    portEXIT_CRITICAL(&DU_Latency_Mux);
-
-    return pending;
-}
-
-static void DU_Latency_DanhDauPostChannelDaGui()
-{
-    portENTER_CRITICAL(&DU_Latency_Mux);
-    DU_Latency_PostChannelPending = false;
-    portEXIT_CRITICAL(&DU_Latency_Mux);
-}
-
 // Task bao PLAY_STARTED ve rBS, tach khoi core phat audio.
 // Audio task chi notify SAU khi first PWM sample da duoc ghi.
 TaskHandle_t Task_PlayReport_Handle = nullptr;
@@ -588,6 +453,41 @@ uint64_t session_id_hien_tai = 0;
 
 // DU chỉ giải mã VOICE khi đã nhận SESSION_START
 bool da_co_session = false;
+
+
+// =====================================================
+// STAGE 3B1A - SECURITY COUNTERS THEO SESSION
+//
+// Khong dung RSSI/SNR/H.
+// Replay heuristic:
+// - chi xet packet DA GCM OK;
+// - packet cu cach highest <= 16: bo qua de tranh nham ARQ;
+// - packet cu hon 16 packet: REPLAY_SUSPECT.
+// =====================================================
+static uint16_t sec_voice_gcm_fail = 0;
+static uint16_t sec_fec_gcm_fail = 0;
+static uint16_t sec_replay_suspect = 0;
+static uint16_t sec_voice_gcm_ok = 0;
+static uint16_t sec_fec_gcm_ok = 0;
+static uint32_t sec_highest_auth_seq = 0;
+static bool sec_have_highest_auth_seq = false;
+
+static void Sec_Inc_U16(uint16_t &v)
+{
+    if (v < 0xFFFFU)
+        ++v;
+}
+
+static void Sec_Reset_Session()
+{
+    sec_voice_gcm_fail = 0;
+    sec_fec_gcm_fail = 0;
+    sec_replay_suspect = 0;
+    sec_voice_gcm_ok = 0;
+    sec_fec_gcm_ok = 0;
+    sec_highest_auth_seq = 0;
+    sec_have_highest_auth_seq = false;
+}
 
 
 // =====================================================
@@ -1228,11 +1128,6 @@ void TacVu_GiaiMa(void *thamSo)
                     "[DU AUDIO] DA NHAN DU CAU -> BAT DAU PHAT"
                 );
 
-                // END da toi -> khong con nhan VOICE/FEC cua session nay.
-                // Tu day playback se tiep tuc khoa telemetry bang
-                // cho_phep_phat_audio.
-                DU_Latency_KetThucNhanSession();
-
                 // END da toi -> module HMI ket thuc trang thai RX session.
                 HMI_DU_Bao_END_Audio();
 
@@ -1294,11 +1189,25 @@ void TacVu_GiaiMa(void *thamSo)
                 continue;
             }
 
-            if (goi_tin[3] != 8U)
+            const uint8_t session_meta =
+                goi_tin[3];
+
+            const uint8_t profile_moi =
+                (session_meta >> 6) & 0x03U;
+
+            // bits5..0 hien chi cho phep payload length = 8.
+            if (
+                (session_meta & 0x3FU) != 8U
+                ||
+                !Profile_BaoMat_HopLe(
+                    profile_moi
+                )
+            )
             {
                 Serial.printf(
-                    "[DU DROP] SESSION_START META sai | META=0x%02X\n",
-                    (unsigned int)goi_tin[3]
+                    "[DU CRYPTO DROP] SESSION META/PROFILE sai | META=0x%02X | PROFILE=%u\n",
+                    (unsigned int)session_meta,
+                    (unsigned int)profile_moi
                 );
 
                 continue;
@@ -1311,17 +1220,30 @@ void TacVu_GiaiMa(void *thamSo)
                     == session_id_hien_tai
             )
             {
+                if (
+                    profile_moi
+                    != Lay_Profile_BaoMat()
+                )
+                {
+                    Serial.printf(
+                        "[DU CRYPTO DROP] CUNG SESSION NHUNG DOI PROFILE | SESSION=%016llX | CU=%u | MOI=%u\n",
+                        (unsigned long long)session_moi,
+                        (unsigned int)Lay_Profile_BaoMat(),
+                        (unsigned int)profile_moi
+                    );
+
+                    continue;
+                }
+
                 HMI_DU_TamDung_Beacon(1500UL);
 
-                DU_Latency_BatDauSession(session_moi);
-
                 Serial.printf(
-                    "[DU] SESSION LAP LAI = %016llX -> GUI NGAY SESSION_READY\n",
+                    "[DU] SESSION LAP LAI = %016llX -> GUI LAI SESSION_READY\n",
                     (unsigned long long)session_moi
                 );
 
-                // Latency V1.1: READY la control gate cua voice, nen uu tien.
-                // GPS_PHIEN da duoc dua vao pending trong DU_Latency_BatDauSession().
+                DuLieuGPS_DU du_lieu_gps_du = Lay_DuLieu_GPS_DU();
+                Gui_GPS_REPORT_DU(session_moi, du_lieu_gps_du);
                 Gui_SESSION_READY_RBS(session_moi);
                 continue;
             }
@@ -1332,8 +1254,32 @@ void TacVu_GiaiMa(void *thamSo)
                 "NEW_SESSION"
             );
 
-            Serial.println(
-                "[DU CRYPTO] FIXED AES-128-GCM | SESSION KEY THEO SESSION_ID"
+            if (
+                !Dat_Profile_BaoMat(
+                    profile_moi
+                )
+            )
+            {
+                Serial.printf(
+                    "[DU CRYPTO DROP] Khong dat duoc PROFILE=%u\n",
+                    (unsigned int)profile_moi
+                );
+
+                continue;
+            }
+
+            Serial.printf(
+                "[DU CRYPTO] SESSION PROFILE=%s(%u) | AES=%u | REKEY_EVERY=%u packet\n",
+                Ten_Profile_BaoMat(
+                    profile_moi
+                ),
+                (unsigned int)profile_moi,
+                (unsigned int)So_Bit_AES_Theo_Profile(
+                    profile_moi
+                ),
+                (unsigned int)ChuKy_DoiKhoa_Theo_Profile(
+                    profile_moi
+                )
             );
 
             session_id_hien_tai =
@@ -1355,6 +1301,7 @@ void TacVu_GiaiMa(void *thamSo)
 
             Reset_FEC_Group();
             Reset_ThongKe_OLED_DU();
+            Sec_Reset_Session();
 
             HienThi_DU_DangNhan(
                 0,
@@ -1367,12 +1314,13 @@ void TacVu_GiaiMa(void *thamSo)
                 (unsigned long long)session_id_hien_tai
             );
 
-            // Latency V1.1:
-            // SESSION_READY la control gate cho voice -> gui NGAY.
-            // GPS_PHIEN van giu nguyen chuc nang nhung chuyen sang pending,
-            // chi TX sau khi cua so SESSION/VOICE/FEC da ket thuc.
-            DU_Latency_BatDauSession(session_id_hien_tai);
+            // GPS packet rieng: gui snapshot truoc READY de rBS thu duoc
+            // trong cua so bat tay. GPS khong gate session.
+            DuLieuGPS_DU du_lieu_gps_du = Lay_DuLieu_GPS_DU();
+            In_TrangThai_GPS_DU(du_lieu_gps_du);
+            Gui_GPS_REPORT_DU(session_id_hien_tai, du_lieu_gps_du);
 
+            // May DU tu dong xac nhan, nguoi dung KHONG can bam nut.
             Gui_SESSION_READY_RBS(session_id_hien_tai);
 
             continue;
@@ -1482,9 +1430,13 @@ void TacVu_GiaiMa(void *thamSo)
                     group_start
                 );
 
+                Sec_Inc_U16(sec_fec_gcm_fail);
+
                 // Không dùng parity không xác thực.
                 continue;
             }
+
+            Sec_Inc_U16(sec_fec_gcm_ok);
 
             if (
                 !fec_group.active
@@ -1700,6 +1652,8 @@ void TacVu_GiaiMa(void *thamSo)
                     ] =
                         recovered_frames;
 
+                    Sec_Inc_U16(sec_voice_gcm_ok);
+
                     Serial.printf(
                         "[DU FEC RECOVER + VOICE GCM OK] SEQ=%u | SLOT=%d\n",
                         recovered_seq,
@@ -1708,6 +1662,8 @@ void TacVu_GiaiMa(void *thamSo)
                 }
                 else
                 {
+                    Sec_Inc_U16(sec_voice_gcm_fail);
+
                     Serial.printf(
                         "[DU FEC RECOVER BUT VOICE GCM FAIL] SEQ=%u | SLOT=%d\n",
                         recovered_seq,
@@ -1836,9 +1792,40 @@ void TacVu_GiaiMa(void *thamSo)
                 seq
             );
 
+            Sec_Inc_U16(sec_voice_gcm_fail);
+
             // Không dùng LAST/frame/group metadata từ packet GCM fail.
             // FEC packet đã authenticated sẽ cung cấp metadata group/final.
             continue;
+        }
+
+        Sec_Inc_U16(sec_voice_gcm_ok);
+
+        if (
+            sec_have_highest_auth_seq
+            &&
+            seq < sec_highest_auth_seq
+            &&
+            (sec_highest_auth_seq - seq) > 16U
+        )
+        {
+            Sec_Inc_U16(sec_replay_suspect);
+
+            Serial.printf(
+                "[DU SECURITY] REPLAY_SUSPECT | SEQ=%u | HIGHEST=%u\n",
+                seq,
+                sec_highest_auth_seq
+            );
+        }
+
+        if (
+            !sec_have_highest_auth_seq
+            ||
+            seq > sec_highest_auth_seq
+        )
+        {
+            sec_highest_auth_seq = seq;
+            sec_have_highest_auth_seq = true;
         }
 
         uint32_t group_start =
@@ -2624,6 +2611,18 @@ void TacVu_PhatAmThanh(void *thamSo)
         );
 
 
+        // Stage 3B1A: chi COPY snapshot vao pending RAM.
+        // Khong TX LoRa trong audio task.
+        Dat_BaoCao_BaoMat_DangCho(
+            du_last_played_session_id,
+            sec_voice_gcm_fail,
+            sec_fec_gcm_fail,
+            sec_replay_suspect,
+            sec_voice_gcm_ok,
+            sec_fec_gcm_ok,
+            sec_have_highest_auth_seq ? sec_highest_auth_seq : 0U
+        );
+
         // HMI module tu tao AUTO_ACK va mo quyen NACK
         // cho session vua phat xong.
         HMI_DU_Bao_Phat_Xong(
@@ -2645,27 +2644,14 @@ void TacVu_BaoCao_Kenh_SU_DU(void *tham_so)
 
     while (1)
     {
-        bool radio_dang_ban =
-            HMI_DU_Radio_Dang_Ban()
-            || cho_phep_phat_audio
-            || DU_Latency_DangNhanSession();
-
+        bool radio_dang_ban = HMI_DU_Radio_Dang_Ban() || cho_phep_phat_audio;
         if (!radio_dang_ban)
         {
-            bool gui_kenh_ok =
-                Gui_BaoCao_Kenh_SU_DU_DangCho();
-
-            if (
-                gui_kenh_ok
-                &&
-                DU_Latency_PostChannelDangCho()
-            )
+            // Security telemetry uu tien hon measurement-only.
+            // Neu vua gui security thi de report kenh sang vong sau.
+            if (!Gui_BaoCao_BaoMat_DangCho())
             {
-                DU_Latency_DanhDauPostChannelDaGui();
-
-                Serial.println(
-                    "[DU TELEMETRY] POST CHANNEL SU-DU -> rBS"
-                );
+                Gui_BaoCao_Kenh_SU_DU_DangCho();
             }
         }
 
@@ -2694,53 +2680,10 @@ void TacVu_BaoCao_ViTri_DinhKy_DU(void *tham_so)
 
         bool radio_dang_ban =
             HMI_DU_Radio_Dang_Ban()
-            || cho_phep_phat_audio
-            || DU_Latency_DangNhanSession();
+            || cho_phep_phat_audio;
 
-        // TELEMETRY PRE/POST V1:
-        // PRE = periodic idle snapshot da co o rBS.
-        // TRONG PHIEN = khong TX telemetry.
-        // POST = GPS_PHIEN session-bound nay, chi gui khi radio/HMI/playback ranh.
-        uint64_t gps_phien_pending_id = 0;
-
-        if (
-            !radio_dang_ban
-            &&
-            DU_Latency_LayGPSPhienPending(gps_phien_pending_id)
-        )
-        {
-            DuLieuGPS_DU du_lieu_gps_du = Lay_DuLieu_GPS_DU();
-            In_TrangThai_GPS_DU(du_lieu_gps_du);
-
-            if (
-                Gui_GPS_REPORT_DU(
-                    gps_phien_pending_id,
-                    du_lieu_gps_du
-                )
-            )
-            {
-                DU_Latency_XoaGPSPhienPending(
-                    gps_phien_pending_id
-                );
-
-                // POST packet vua gui xong -> khong gui them GPS dinh ky
-                // ngay lap tuc, tranh 2 telemetry packet lien nhau.
-                moc_gui_tiep_theo_ms =
-                    bay_gio_ms
-                    +
-                    CHU_KY_BAO_CAO_VI_TRI_DU_MS;
-
-                Serial.printf(
-                    "[DU TELEMETRY] POST GPS_PHIEN -> rBS | SESSION=%016llX\n",
-                    (unsigned long long)gps_phien_pending_id
-                );
-            }
-        }
-        else if (
-            !radio_dang_ban
-            &&
-            (int32_t)(bay_gio_ms - moc_gui_tiep_theo_ms) >= 0
-        )
+        if (!radio_dang_ban &&
+            (int32_t)(bay_gio_ms - moc_gui_tiep_theo_ms) >= 0)
         {
             DuLieuGPS_DU du_lieu_gps_du = Lay_DuLieu_GPS_DU();
             In_TrangThai_GPS_DU(du_lieu_gps_du);

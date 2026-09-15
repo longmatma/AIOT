@@ -79,141 +79,6 @@ uint8_t *Audio_Buffer_Storage =
 // nhận END_AUDIO từ rBS.
 volatile bool cho_phep_phat_audio = false;
 
-
-// =====================================================
-// LATENCY OPTIMIZATION V1.1
-//
-// 1) SESSION_READY duoc uu tien TX ngay khi DU nhan SESSION_START.
-// 2) GPS_PHIEN khong chen vao cua so handshake/VOICE/FEC.
-//    GPS_PHIEN van duoc GIU, nhung dua sang pending va gui khi radio ranh.
-// 3) GPS dinh ky + report kenh SU-DU bi tam khoa trong luc DU dang
-//    nhan mot session thoai.
-//
-// Timeout 30s chi la fail-safe: neu mat END_AUDIO, telemetry tu mo lai.
-// =====================================================
-static portMUX_TYPE DU_Latency_Mux =
-    portMUX_INITIALIZER_UNLOCKED;
-
-static volatile bool DU_Latency_SessionBusy = false;
-static volatile uint32_t DU_Latency_SessionStartMs = 0;
-
-static bool DU_Latency_GPSPhienPending = false;
-static uint64_t DU_Latency_GPSPhienId = 0;
-
-// Sau session, cho mot beacon SU moi de tao report kenh POST.
-static bool DU_Latency_PostChannelPending = false;
-
-static void DU_Latency_BatDauSession(uint64_t session_id)
-{
-    const uint32_t now_ms = millis();
-
-    portENTER_CRITICAL(&DU_Latency_Mux);
-
-    DU_Latency_SessionBusy = true;
-    DU_Latency_SessionStartMs = now_ms;
-
-    // GPS_PHIEN nay se duoc gui SAU session, khong gui trong handshake.
-    DU_Latency_GPSPhienPending = true;
-    DU_Latency_GPSPhienId = session_id;
-
-    // Channel POST phai den tu beacon SU moi sau session.
-    DU_Latency_PostChannelPending = true;
-
-    portEXIT_CRITICAL(&DU_Latency_Mux);
-
-    // Bo mau PRE con pending trong RAM, KHONG TX.
-    Xoa_BaoCao_Kenh_SU_DU_DangCho();
-
-    Serial.println(
-        "[DU TELEMETRY] LOCK TRONG PHIEN | PRE GIU O rBS | POST PENDING"
-    );
-}
-
-static void DU_Latency_KetThucNhanSession()
-{
-    portENTER_CRITICAL(&DU_Latency_Mux);
-    DU_Latency_SessionBusy = false;
-    portEXIT_CRITICAL(&DU_Latency_Mux);
-}
-
-static bool DU_Latency_DangNhanSession()
-{
-    bool busy = false;
-    uint32_t start_ms = 0;
-
-    portENTER_CRITICAL(&DU_Latency_Mux);
-    busy = DU_Latency_SessionBusy;
-    start_ms = DU_Latency_SessionStartMs;
-    portEXIT_CRITICAL(&DU_Latency_Mux);
-
-    if (
-        busy
-        &&
-        (uint32_t)(millis() - start_ms) > 30000UL
-    )
-    {
-        DU_Latency_KetThucNhanSession();
-
-        Serial.println(
-            "[DU LATENCY] SESSION RX TIMEOUT -> MO LAI TELEMETRY"
-        );
-
-        return false;
-    }
-
-    return busy;
-}
-
-static bool DU_Latency_LayGPSPhienPending(uint64_t &session_id)
-{
-    bool pending = false;
-
-    portENTER_CRITICAL(&DU_Latency_Mux);
-
-    pending = DU_Latency_GPSPhienPending;
-
-    if (pending)
-        session_id = DU_Latency_GPSPhienId;
-
-    portEXIT_CRITICAL(&DU_Latency_Mux);
-
-    return pending;
-}
-
-static void DU_Latency_XoaGPSPhienPending(uint64_t session_id)
-{
-    portENTER_CRITICAL(&DU_Latency_Mux);
-
-    if (
-        DU_Latency_GPSPhienPending
-        &&
-        DU_Latency_GPSPhienId == session_id
-    )
-    {
-        DU_Latency_GPSPhienPending = false;
-    }
-
-    portEXIT_CRITICAL(&DU_Latency_Mux);
-}
-
-static bool DU_Latency_PostChannelDangCho()
-{
-    bool pending = false;
-
-    portENTER_CRITICAL(&DU_Latency_Mux);
-    pending = DU_Latency_PostChannelPending;
-    portEXIT_CRITICAL(&DU_Latency_Mux);
-
-    return pending;
-}
-
-static void DU_Latency_DanhDauPostChannelDaGui()
-{
-    portENTER_CRITICAL(&DU_Latency_Mux);
-    DU_Latency_PostChannelPending = false;
-    portEXIT_CRITICAL(&DU_Latency_Mux);
-}
-
 // Task bao PLAY_STARTED ve rBS, tach khoi core phat audio.
 // Audio task chi notify SAU khi first PWM sample da duoc ghi.
 TaskHandle_t Task_PlayReport_Handle = nullptr;
@@ -1228,11 +1093,6 @@ void TacVu_GiaiMa(void *thamSo)
                     "[DU AUDIO] DA NHAN DU CAU -> BAT DAU PHAT"
                 );
 
-                // END da toi -> khong con nhan VOICE/FEC cua session nay.
-                // Tu day playback se tiep tuc khoa telemetry bang
-                // cho_phep_phat_audio.
-                DU_Latency_KetThucNhanSession();
-
                 // END da toi -> module HMI ket thuc trang thai RX session.
                 HMI_DU_Bao_END_Audio();
 
@@ -1313,15 +1173,13 @@ void TacVu_GiaiMa(void *thamSo)
             {
                 HMI_DU_TamDung_Beacon(1500UL);
 
-                DU_Latency_BatDauSession(session_moi);
-
                 Serial.printf(
-                    "[DU] SESSION LAP LAI = %016llX -> GUI NGAY SESSION_READY\n",
+                    "[DU] SESSION LAP LAI = %016llX -> GUI LAI SESSION_READY\n",
                     (unsigned long long)session_moi
                 );
 
-                // Latency V1.1: READY la control gate cua voice, nen uu tien.
-                // GPS_PHIEN da duoc dua vao pending trong DU_Latency_BatDauSession().
+                DuLieuGPS_DU du_lieu_gps_du = Lay_DuLieu_GPS_DU();
+                Gui_GPS_REPORT_DU(session_moi, du_lieu_gps_du);
                 Gui_SESSION_READY_RBS(session_moi);
                 continue;
             }
@@ -1367,12 +1225,13 @@ void TacVu_GiaiMa(void *thamSo)
                 (unsigned long long)session_id_hien_tai
             );
 
-            // Latency V1.1:
-            // SESSION_READY la control gate cho voice -> gui NGAY.
-            // GPS_PHIEN van giu nguyen chuc nang nhung chuyen sang pending,
-            // chi TX sau khi cua so SESSION/VOICE/FEC da ket thuc.
-            DU_Latency_BatDauSession(session_id_hien_tai);
+            // GPS packet rieng: gui snapshot truoc READY de rBS thu duoc
+            // trong cua so bat tay. GPS khong gate session.
+            DuLieuGPS_DU du_lieu_gps_du = Lay_DuLieu_GPS_DU();
+            In_TrangThai_GPS_DU(du_lieu_gps_du);
+            Gui_GPS_REPORT_DU(session_id_hien_tai, du_lieu_gps_du);
 
+            // May DU tu dong xac nhan, nguoi dung KHONG can bam nut.
             Gui_SESSION_READY_RBS(session_id_hien_tai);
 
             continue;
@@ -2645,29 +2504,9 @@ void TacVu_BaoCao_Kenh_SU_DU(void *tham_so)
 
     while (1)
     {
-        bool radio_dang_ban =
-            HMI_DU_Radio_Dang_Ban()
-            || cho_phep_phat_audio
-            || DU_Latency_DangNhanSession();
-
+        bool radio_dang_ban = HMI_DU_Radio_Dang_Ban() || cho_phep_phat_audio;
         if (!radio_dang_ban)
-        {
-            bool gui_kenh_ok =
-                Gui_BaoCao_Kenh_SU_DU_DangCho();
-
-            if (
-                gui_kenh_ok
-                &&
-                DU_Latency_PostChannelDangCho()
-            )
-            {
-                DU_Latency_DanhDauPostChannelDaGui();
-
-                Serial.println(
-                    "[DU TELEMETRY] POST CHANNEL SU-DU -> rBS"
-                );
-            }
-        }
+            Gui_BaoCao_Kenh_SU_DU_DangCho();
 
         vTaskDelay(pdMS_TO_TICKS(25));
     }
@@ -2694,53 +2533,10 @@ void TacVu_BaoCao_ViTri_DinhKy_DU(void *tham_so)
 
         bool radio_dang_ban =
             HMI_DU_Radio_Dang_Ban()
-            || cho_phep_phat_audio
-            || DU_Latency_DangNhanSession();
+            || cho_phep_phat_audio;
 
-        // TELEMETRY PRE/POST V1:
-        // PRE = periodic idle snapshot da co o rBS.
-        // TRONG PHIEN = khong TX telemetry.
-        // POST = GPS_PHIEN session-bound nay, chi gui khi radio/HMI/playback ranh.
-        uint64_t gps_phien_pending_id = 0;
-
-        if (
-            !radio_dang_ban
-            &&
-            DU_Latency_LayGPSPhienPending(gps_phien_pending_id)
-        )
-        {
-            DuLieuGPS_DU du_lieu_gps_du = Lay_DuLieu_GPS_DU();
-            In_TrangThai_GPS_DU(du_lieu_gps_du);
-
-            if (
-                Gui_GPS_REPORT_DU(
-                    gps_phien_pending_id,
-                    du_lieu_gps_du
-                )
-            )
-            {
-                DU_Latency_XoaGPSPhienPending(
-                    gps_phien_pending_id
-                );
-
-                // POST packet vua gui xong -> khong gui them GPS dinh ky
-                // ngay lap tuc, tranh 2 telemetry packet lien nhau.
-                moc_gui_tiep_theo_ms =
-                    bay_gio_ms
-                    +
-                    CHU_KY_BAO_CAO_VI_TRI_DU_MS;
-
-                Serial.printf(
-                    "[DU TELEMETRY] POST GPS_PHIEN -> rBS | SESSION=%016llX\n",
-                    (unsigned long long)gps_phien_pending_id
-                );
-            }
-        }
-        else if (
-            !radio_dang_ban
-            &&
-            (int32_t)(bay_gio_ms - moc_gui_tiep_theo_ms) >= 0
-        )
+        if (!radio_dang_ban &&
+            (int32_t)(bay_gio_ms - moc_gui_tiep_theo_ms) >= 0)
         {
             DuLieuGPS_DU du_lieu_gps_du = Lay_DuLieu_GPS_DU();
             In_TrangThai_GPS_DU(du_lieu_gps_du);

@@ -66,9 +66,27 @@ bool Gui_VI_TRI_DINH_KY_DU(
 
 bool Gui_BaoCao_Kenh_SU_DU_DangCho();
 
-// TELEMETRY PRE/POST V1:
-// Xoa mau PRE con pending khi voice session bat dau.
-// Nhu vay report sau session chi dung beacon SU moi (POST).
-void Xoa_BaoCao_Kenh_SU_DU_DangCho();
+
+// =====================================================
+// STAGE 3B1A - SECURITY TELEMETRY DU -> rBS
+//
+// SHADOW ONLY:
+// packet nay CHUA co authentication rieng, nen TUYET DOI
+// chua duoc dung de closed-loop doi AES.
+// =====================================================
+#define TYPE_BAO_CAO_BAO_MAT 0x1A
+#define SIZE_BAO_CAO_BAO_MAT 28
+
+void Dat_BaoCao_BaoMat_DangCho(
+    uint64_t session_id,
+    uint16_t voice_gcm_fail,
+    uint16_t fec_gcm_fail,
+    uint16_t replay_suspect,
+    uint16_t voice_gcm_ok,
+    uint16_t fec_gcm_ok,
+    uint32_t highest_seq
+);
+
+bool Gui_BaoCao_BaoMat_DangCho();
 
 #endif

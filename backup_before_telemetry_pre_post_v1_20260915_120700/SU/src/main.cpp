@@ -161,28 +161,6 @@ uint64_t so_thu_tu_bao_cao_vi_tri_su = 0;
 
 
 // ========================================================
-// TELEMETRY PRE/POST V1
-//
-// PRE:
-// - Khong phat them packet khi bam PTT.
-// - Dung snapshot telemetry IDLE gan nhat da gui truoc do.
-//
-// TRONG PHIEN:
-// - trang_thai != NGHI_NGOI -> GPS telemetry bi khoa.
-//
-// POST:
-// - Khi phan voice da ket thuc, dat pending.
-// - Neu HMI van dang cho ACK/NACK/confirm thi tiep tuc cho.
-// - Ngay khi HMI ket thuc, gui 1 beacon GPS SU ngay lap tuc.
-// - Beacon POST nay cung la mau de DU do RSSI/SNR SU->DU.
-//
-// Khong thay packet format, khong them delay vao SESSION/VOICE/FEC.
-// ========================================================
-static uint32_t su_telemetry_last_tx_ms = 0;
-static bool su_telemetry_post_pending = false;
-
-
-// ========================================================
 // PROTOCOL NATIVE 8-FRAME + ARQ + PACKET-FEC
 //
 // 1 VOICE packet = tối đa 8 frame = 160 ms audio.
@@ -549,20 +527,7 @@ static void XuLy_BaoCao_ViTri_DinhKy_SU()
     );
 
     if (gui_thanh_cong)
-    {
         so_thu_tu_bao_cao_vi_tri_su = stt_du_kien;
-        su_telemetry_last_tx_ms = bay_gio_ms;
-
-        if (su_telemetry_post_pending)
-        {
-            su_telemetry_post_pending = false;
-
-            Serial.printf(
-                "[SU TELEMETRY] POST -> rBS | STT=%llu\n",
-                (unsigned long long)stt_du_kien
-            );
-        }
-    }
 
     moc_gui_vi_tri_su_tiep_theo_ms = bay_gio_ms +
         (gui_thanh_cong ? CHU_KY_BAO_CAO_VI_TRI_SU_MS : 500UL);
@@ -592,24 +557,6 @@ void loop()
         trang_thai == NGHI_NGOI
     )
     {
-        // TELEMETRY PRE/POST V1:
-        // Khong TX telemetry moi tai thoi diem PTT.
-        // Dung snapshot IDLE gan nhat lam PRE de khong chen delay vao voice.
-        if (su_telemetry_last_tx_ms != 0)
-        {
-            Serial.printf(
-                "[SU TELEMETRY] PRE SNAPSHOT | AGE=%u ms | STT=%llu | LOCK TRONG PHIEN\n",
-                (unsigned int)(millis() - su_telemetry_last_tx_ms),
-                (unsigned long long)so_thu_tu_bao_cao_vi_tri_su
-            );
-        }
-        else
-        {
-            Serial.println(
-                "[SU TELEMETRY] PRE SNAPSHOT CHUA CO | LOCK TRONG PHIEN"
-            );
-        }
-
         trang_thai =
             DANG_GHI_AM;
 
@@ -1263,17 +1210,6 @@ void loop()
         // =================================================
         // VỀ TRẠNG THÁI NGHỈ
         // =================================================
-
-        // TELEMETRY PRE/POST V1:
-        // Dat POST pending NGAY khi voice/session da ket thuc.
-        // XuLy_BaoCao... van tu cho neu HMI dang cho phan hoi,
-        // nen packet POST khong chen vao control cua session.
-        su_telemetry_post_pending = true;
-        moc_gui_vi_tri_su_tiep_theo_ms = millis();
-
-        Serial.println(
-            "[SU TELEMETRY] POST PENDING | CHO HMI/RADIO RANH"
-        );
 
         trang_thai =
             NGHI_NGOI;

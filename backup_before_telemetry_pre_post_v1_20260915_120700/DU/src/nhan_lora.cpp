@@ -720,21 +720,6 @@ bool Gui_USER_RESPONSE_RBS(
 
 
 // =====================================================
-// TELEMETRY PRE/POST V1
-// XOA MAU KENH PRE CON PENDING KHI SESSION BAT DAU.
-//
-// Khong TX gi ca. Chi xoa snapshot RAM cu de sau session
-// DU cho beacon SU moi va bao cao dung mau POST.
-// =====================================================
-void Xoa_BaoCao_Kenh_SU_DU_DangCho()
-{
-    portENTER_CRITICAL(&KenhSUDU_Mux);
-    mau_kenh_su_du.pending = false;
-    portEXIT_CRITICAL(&KenhSUDU_Mux);
-}
-
-
-// =====================================================
 // GUI SNAPSHOT KENH SU -> DU VE rBS
 // Physical 20B:
 // [0] DST=rBS, [1] SRC=DU, [2] TYPE=0x19, [3] VER=1

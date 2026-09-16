@@ -66,7 +66,7 @@ RingbufHandle_t Audio_Buffer;
 // PSRAM cho các phần khác của hệ thống.
 // =====================================================
 
-#define AUDIO_BUFFER_SIZE_PSRAM (2 * 1024 * 1024)
+#define AUDIO_BUFFER_SIZE_PSRAM (6 * 1024 * 1024)
 
 StaticRingbuffer_t *Audio_Buffer_Struct =
     nullptr;

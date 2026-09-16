@@ -15,7 +15,7 @@ static uint32_t moc_tat_led_ack_ms = 0;
 // Bao ve khoi truong hop mat ACK/NACK lam SU cho phan hoi mai mai.
 // MAX_KHUNG_THOAI hien tai cho phep cau noi toi da xap xi 60 giay,
 // nen 75 giay chi la watchdog du phong; khong tac dong khi ACK den binh thuong.
-static constexpr uint32_t THOI_GIAN_CHO_PHAN_HOI_TOI_DA_MS = 75000UL;
+static constexpr uint32_t THOI_GIAN_CHO_PHAN_HOI_TOI_DA_MS = 360000UL;
 static uint32_t moc_bat_dau_cho_phan_hoi_ms = 0;
 
 

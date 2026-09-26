@@ -23,8 +23,8 @@
 // =====================================================
 
 #define AES_GCM_AAD_LEN              8
-#define AES_GCM_VOICE_LEN          160
-#define AES_GCM_FEC_LEN            168
+#define AES_GCM_VOICE_LEN           90
+#define AES_GCM_FEC_LEN             98
 #define AES_GCM_TAG_LEN              8
 #define AES_GCM_IV_LEN              12
 
@@ -308,28 +308,28 @@ inline bool GiaiMa_GCM(
 
 inline bool MaHoa_GCM_FEC(
     const uint8_t *header,
-    const uint8_t *parity_vao_168,
-    uint8_t *parity_ma_hoa_168,
+    const uint8_t *parity_vao,
+    uint8_t *parity_ma_hoa,
     uint8_t *fec_auth_tag,
     uint64_t session_id,
     uint32_t fec_nonce)
 {
     return MaHoa_GCM_Len(
-        header, parity_vao_168, parity_ma_hoa_168, fec_auth_tag,
+        header, parity_vao, parity_ma_hoa, fec_auth_tag,
         AES_GCM_FEC_LEN, session_id, fec_nonce
     );
 }
 
 inline bool GiaiMa_GCM_FEC(
     const uint8_t *header,
-    const uint8_t *parity_ma_hoa_168,
-    uint8_t *parity_ra_168,
+    const uint8_t *parity_ma_hoa,
+    uint8_t *parity_ra,
     const uint8_t *fec_auth_tag,
     uint64_t session_id,
     uint32_t fec_nonce)
 {
     return GiaiMa_GCM_Len(
-        header, parity_ma_hoa_168, parity_ra_168, fec_auth_tag,
+        header, parity_ma_hoa, parity_ra, fec_auth_tag,
         AES_GCM_FEC_LEN, session_id, fec_nonce
     );
 }

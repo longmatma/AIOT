@@ -2,6 +2,7 @@
 #define PHAT_LORA_H
 
 #include <Arduino.h>
+#include "node_config.h"
 #include "gps_su.h"
 
 void KhoiTao_LoRa();
@@ -22,6 +23,52 @@ bool Cho_READY_RBS(
     uint8_t expected_kind,
     uint32_t expected_seq
 );
+
+// V2A.1: block ACK cho cum 1..2 VOICE, co the kem 1 FEC parity.
+// Physical 8B: TYPE=0x1A, payload=base_seq32.
+// flags:
+//   bits5..4 = expected VOICE count (1..2)
+//   bit3     = FEC da nhan
+//   bit2     = block nay co FEC
+//   bits1..0 = VOICE bitmap
+bool Cho_BLOCK_ACK_RBS(
+    uint32_t timeout_ms,
+    uint32_t expected_base_seq,
+    uint8_t expected_count,
+    bool expected_fec,
+    uint8_t &bitmap_out,
+    bool &fec_ok_out
+);
+
+// V2B.1 SUPERFRAME beacon/ACK VOICE. Physical 13B:
+//   byte0 DST=SU, byte1 SRC=rBS, byte2 TYPE=0x1B
+//   byte3 SCHEDULE_VERSION
+//   byte4..7  FRAME_ID32
+//   byte8..11 ACK_BASE_SEQ32 (0xFFFFFFFF neu chua co ACK)
+//   byte12    ACK_FLAGS V2B.1:
+//             bits7..6 count (1..3), bits2..0 VOICE bitmap.
+//             FEC 4+1 la best-effort, khong lam dieu kien ACK/retry VOICE.
+// rx_ms_out la millis() ngay khi beacon duoc parse xong; SU dung moc nay de
+// can UL slot bang timer cuc bo, khong dung thoi gian Python.
+bool Cho_SUPERFRAME_V2B(
+    uint32_t timeout_ms,
+    uint8_t expected_schedule_version,
+    uint32_t &frame_id_out,
+    uint32_t &ack_base_seq_out,
+    uint8_t &ack_count_out,
+    uint8_t &ack_bitmap_out,
+    bool &ack_fec_expected_out,
+    bool &ack_fec_ok_out,
+    uint8_t &schedule_mode_out,
+    uint8_t &transition_target_out,
+    uint8_t &jam_policy_out,
+    uint8_t &fec_grant_pair_out,
+    uint32_t &rx_ms_out
+);
+
+// V2C2: beacon broadcast cũng được dùng để khóa telemetry ngoài slot.
+bool V2C1_NetworkBusy();
+void V2C1_Poll_Beacon_Idle();
 
 
 // SESSION control plane

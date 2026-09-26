@@ -12,7 +12,10 @@ static constexpr uint8_t CHAN_LED_DU = 16;
 
 // LED pulse theo packet that.
 static constexpr uint32_t DU_PACKET_PULSE_MS = 70UL;
-static constexpr uint32_t DU_DATA_GAP_TIMEOUT_MS = 300UL;
+// V2C4.7: DUAL cap nhat moi pair theo superframe ~300 ms. Nguong 300 ms
+// qua sat bien, chi can jitter vai ms la LED bi coi nhu "mat data" va sang dung.
+// Cho phep 3 superframe truoc khi bao gap that su.
+static constexpr uint32_t DU_DATA_GAP_TIMEOUT_MS = 900UL;
 
 // ============================================================
 // NACK PRIORITY V1

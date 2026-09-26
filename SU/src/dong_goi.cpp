@@ -164,6 +164,12 @@ uint64_t Tao_Session_Moi()
 }
 
 
+uint32_t Lay_Seq_Voice_TiepTheo()
+{
+    return so_thu_tu_goi;
+}
+
+
 // =====================================================
 // SESSION_START = 12 BYTE
 // =====================================================
@@ -188,29 +194,30 @@ void Tao_GoiTin_SessionStart(
 
 
 // =====================================================
-// VOICE = 176 BYTE
+// VOICE = 106 BYTE (toi da 15 frame x 6B @ Speex 2.15 kbps)
 //
 // Byte 0      DST
 // Byte 1      SRC
 //
 // Byte 2:
-//   bit 7..5 = frame_count - 1 (0..7 => 1..8 frame)
 //   bit 4    = LAST_AUDIO
 //   bit 3..0 = TYPE_VOICE = 0x01
+//   bit 7..5 = 0 (V2C0: frame_count chuyen sang byte3)
 //
-// Byte 3      LENGTH = 168
+// Byte 3      FRAME_COUNT = 1..15
 // Byte 4..7   SEQ32
-// Byte 8..167 ciphertext 160B
-// Byte 168..175 GCM tag 8B
+// Byte 8..97   ciphertext 90B
+// Byte 98..105 GCM tag 8B
 //
 // AAD = byte 0..7
 // IV  = SESSION_ID64 || SEQ32
 // =====================================================
 
 void Tao_GoiTin_Voice(
-    const uint8_t payload_160[VOICE_PLAINTEXT_BYTES],
+    const uint8_t payload_voice[VOICE_PLAINTEXT_BYTES],
     uint8_t so_frame,
     bool la_packet_cuoi,
+    bool codec_hq,
     uint8_t *goi_tin_ra)
 {
     if (so_frame < 1 || so_frame > MAX_FRAME_PER_PACKET)
@@ -239,15 +246,17 @@ void Tao_GoiTin_Voice(
     goi_tin_ra[1] =
         ID_TRAM_SU;
 
+    // V2C0: VOICE frame_count toi 15 khong con vua 3 bit o byte2.
+    // Byte2 chi giu TYPE + LAST; byte3 mang frame_count truc tiep.
     goi_tin_ra[2] =
         TYPE_VOICE_SU
         |
-        ((so_frame - 1) << COUNT_SHIFT_SU)
+        (la_packet_cuoi ? FLAG_LAST_SU : 0x00)
         |
-        (la_packet_cuoi ? FLAG_LAST_SU : 0x00);
+        (codec_hq ? FLAG_CODEC_HQ_SU : 0x00);
 
     goi_tin_ra[3] =
-        VOICE_LENGTH_SU;
+        so_frame;
 
     goi_tin_ra[4] =
         (seq >> 24) & 0xFF;
@@ -263,9 +272,9 @@ void Tao_GoiTin_Voice(
 
     MaHoa_GCM(
         goi_tin_ra,
-        payload_160,
+        payload_voice,
         &goi_tin_ra[8],
-        &goi_tin_ra[168],
+        &goi_tin_ra[8 + VOICE_PLAINTEXT_BYTES],
         session_id_hien_tai,
         seq
     );
@@ -273,21 +282,21 @@ void Tao_GoiTin_Voice(
 
 
 // =====================================================
-// FEC = 184 BYTE
+// FEC = 114 BYTE
 //
 // KHÔNG XOR PLAINTEXT.
 //
-// Mỗi VOICE có protected block 168B:
-//   byte 8..167   = ciphertext 160B
-//   byte 168..175 = ORIGINAL VOICE GCM TAG 8B
+// Mỗi VOICE có protected block 98B:
+//   byte 8..97 = ciphertext 90B
+//   byte 98..105 = ORIGINAL VOICE GCM TAG 8B
 //
-// parity_168 = XOR protected block của tối đa 8 VOICE.
+// parity = XOR protected block của tối đa 4 VOICE trong STREAM V1.
 //
-// Sau đó parity_168 tự được AES-GCM bảo vệ:
+// Sau đó parity tự được AES-GCM bảo vệ:
 //
 // Byte 0..7    FEC header / AAD
-// Byte 8..175  encrypted parity 168B
-// Byte 176..183 FEC GCM tag 8B
+// Byte 8..105  encrypted parity 98B
+// Byte 106..113 FEC GCM tag 8B
 //
 // Khi DU khôi phục 1 VOICE:
 //   recover ciphertext + original VOICE tag
@@ -300,7 +309,7 @@ void Tao_GoiTin_Voice(
 // =====================================================
 
 void Tao_GoiTin_FEC(
-    const uint8_t parity_168[FEC_PARITY_BYTES],
+    const uint8_t parity_block[FEC_PARITY_BYTES],
     uint32_t group_start_seq,
     uint8_t data_count,
     bool group_has_last,
@@ -361,9 +370,9 @@ void Tao_GoiTin_FEC(
 
     MaHoa_GCM_FEC(
         goi_tin_ra,
-        parity_168,
+        parity_block,
         &goi_tin_ra[8],
-        &goi_tin_ra[176],
+        &goi_tin_ra[8 + FEC_PARITY_BYTES],
         session_id_hien_tai,
         fec_nonce
     );

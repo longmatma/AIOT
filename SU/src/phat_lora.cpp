@@ -1,4 +1,5 @@
 #include "phat_lora.h"
+#include "node_config.h"
 
 #include <Arduino.h>
 #include <math.h>
@@ -20,15 +21,21 @@
 // ID / TYPE ACK
 // =====================================================
 
-static const uint8_t ID_SU_READY  = 0x01;
-static const uint8_t ID_RBS_READY = 0x03;
+static const uint8_t ID_SU_READY  = V2C_SU_ID;
+static const uint8_t ID_RBS_READY = V2C_RBS_ID;
 static const uint8_t TYPE_READY   = 0x03;
 static const uint8_t TYPE_PLAY_STARTED = 0x12;
 static const uint8_t TYPE_USER_RESPONSE = 0x13;
 static const uint8_t TYPE_USER_CONFIRM  = 0x14;
 static const uint8_t TYPE_SESSION_READY  = 0x15;
 static const uint8_t TYPE_SESSION_FAIL   = 0x16;
-static const uint8_t ID_DU_CTRL = 0x02;
+static const uint8_t TYPE_BLOCK_ACK_V2A   = 0x1A;
+static const uint8_t TYPE_SUPERFRAME_V2B   = 0x1C; // V2C1 dual broadcast
+// V2C4.6: phai dong bo voi rBS V2C4 schedule v7. Ban cu hard-code v5 o
+// KiemTra_USER_RESPONSE_RBS() lam SU IDLE bo qua beacon v7, NetworkBusy het
+// lease va JOIN bi nham thanh bootstrap tu do.
+static const uint8_t V2C_ACTIVE_SCHEDULE_VERSION = 7U;
+static const uint8_t ID_DU_CTRL = V2C_DU_ID;
 
 // Giữ fix timing đã ổn định.
 static const uint32_t POST_READY_TX_GUARD_MS = 8;
@@ -42,6 +49,9 @@ static const int8_t CONG_SUAT_SU_DBM = CONG_SUAT_PHAT_SU_DBM;
 static const uint8_t SF_SU = HE_SO_TRAI_PHO_SU;
 
 
+
+// V2C1: trong khi superframe dual dang chay, telemetry dinh ky phai nhuong kenh.
+static volatile uint32_t v2c1_network_busy_until_ms = 0;
 // =====================================================
 // KHỞI TẠO
 // =====================================================
@@ -168,7 +178,7 @@ bool Cho_READY_RBS(
 
         if (packetSize > 0)
         {
-            // Relay mới có thể dài 180B.
+            // STREAM V1 relay rBS->DU toi 108B; buffer 256B van du.
             // Buffer 256B để xả trọn packet rBS->DU nghe ké.
             uint8_t buffer[256];
 
@@ -271,6 +281,268 @@ bool Cho_READY_RBS(
 
 
 // =====================================================
+// V2A.1 BLOCK ACK CHO 1 CUM 1..2 VOICE + OPTIONAL FEC
+//
+// Physical packet = 8B:
+//   byte0 DST = SU
+//   byte1 SRC = rBS
+//   byte2 identifier = TYPE_BLOCK_ACK_V2A (0x1A)
+//   byte3 flags:
+//       bits5..4 expected_count (1..2)
+//       bit3     FEC da nhan
+//       bit2     block co FEC
+//       bits1..0 VOICE bitmap
+//   byte4..7 block_base_seq32 (luon chan trong V2A/V2A.1)
+// =====================================================
+bool Cho_BLOCK_ACK_RBS(
+    uint32_t timeout_ms,
+    uint32_t expected_base_seq,
+    uint8_t expected_count,
+    bool expected_fec,
+    uint8_t &bitmap_out,
+    bool &fec_ok_out)
+{
+    bitmap_out = 0;
+    fec_ok_out = false;
+
+    if (expected_count < 1 || expected_count > 2)
+    {
+        return false;
+    }
+
+    const uint32_t bat_dau = millis();
+
+    Serial.printf(
+        "[SU V2A.1] CHUYEN TX -> RX | CHO BLOCK_ACK BASE=%u | COUNT=%u | FEC=%u...\n",
+        (unsigned int)expected_base_seq,
+        (unsigned int)expected_count,
+        expected_fec ? 1U : 0U
+    );
+
+    LoRa.receive();
+
+    while ((uint32_t)(millis() - bat_dau) < timeout_ms)
+    {
+        int packetSize = LoRa.parsePacket();
+
+        if (packetSize > 0)
+        {
+            uint8_t buffer[256];
+            size_t so_byte_da_doc = 0;
+
+            while (LoRa.available() && so_byte_da_doc < sizeof(buffer))
+            {
+                buffer[so_byte_da_doc++] = (uint8_t)LoRa.read();
+            }
+            while (LoRa.available())
+            {
+                LoRa.read();
+            }
+
+            if (packetSize == 8 && so_byte_da_doc == 8)
+            {
+                const uint8_t dst = buffer[0];
+                const uint8_t src = buffer[1];
+                const uint8_t packet_type = buffer[2];
+                const uint8_t flags = buffer[3];
+                const uint8_t ack_count = (flags >> 4) & 0x03;
+                const bool ack_fec_ok = (flags & 0x08) != 0;
+                const bool ack_fec_expected = (flags & 0x04) != 0;
+                const uint8_t ack_bitmap = flags & 0x03;
+                const uint32_t base_seq =
+                    ((uint32_t)buffer[4] << 24)
+                    | ((uint32_t)buffer[5] << 16)
+                    | ((uint32_t)buffer[6] << 8)
+                    | ((uint32_t)buffer[7]);
+
+                if (
+                    dst == ID_SU_READY
+                    && src == ID_RBS_READY
+                    && packet_type == TYPE_BLOCK_ACK_V2A
+                    && base_seq == expected_base_seq
+                    && ack_count == expected_count
+                    && ack_fec_expected == expected_fec
+                )
+                {
+                    bitmap_out = ack_bitmap;
+                    fec_ok_out = ack_fec_ok;
+
+                    Serial.printf(
+                        "[SU V2A.1 RX] BLOCK_ACK | BASE=%u | COUNT=%u | BITMAP=0x%02X | FEC_EXPECT=%u | FEC_OK=%u\n",
+                        (unsigned int)base_seq,
+                        (unsigned int)ack_count,
+                        (unsigned int)ack_bitmap,
+                        ack_fec_expected ? 1U : 0U,
+                        ack_fec_ok ? 1U : 0U
+                    );
+
+                    LoRa.idle();
+                    delay(POST_READY_TX_GUARD_MS);
+                    return true;
+                }
+            }
+
+            LoRa.receive();
+
+            Serial.printf(
+                "[SU V2A.1 DROP RX] Khong phai BLOCK_ACK dang cho | SIZE=%d\n",
+                packetSize
+            );
+        }
+
+        delay(1);
+    }
+
+    LoRa.idle();
+
+    Serial.printf(
+        "[SU V2A.1 TIMEOUT] BLOCK_ACK BASE=%u | COUNT=%u | FEC=%u\n",
+        (unsigned int)expected_base_seq,
+        (unsigned int)expected_count,
+        expected_fec ? 1U : 0U
+    );
+
+    return false;
+}
+
+
+// =====================================================
+// V2B.1 - CHO SUPERFRAME BEACON + ACK VOICE CUA FRAME TRUOC
+//
+// Physical 13B:
+// byte0 DST=SU, byte1 SRC=rBS, byte2 TYPE=0x1B,
+// byte3 schedule_version,
+// byte4..7 frame_id32,
+// byte8..11 ack_base_seq32 (0xFFFFFFFF neu chua co ACK),
+// byte12 ack_flags V2B.1: bits7..6=count(1..3), bits2..0=VOICE bitmap.
+// FEC la best-effort nen KHONG nam trong dieu kien ACK.
+// =====================================================
+bool Cho_SUPERFRAME_V2B(
+    uint32_t timeout_ms,
+    uint8_t expected_schedule_version,
+    uint32_t &frame_id_out,
+    uint32_t &ack_base_seq_out,
+    uint8_t &ack_count_out,
+    uint8_t &ack_bitmap_out,
+    bool &ack_fec_expected_out,
+    bool &ack_fec_ok_out,
+    uint8_t &schedule_mode_out,
+    uint8_t &transition_target_out,
+    uint8_t &jam_policy_out,
+    uint8_t &fec_grant_pair_out,
+    uint32_t &rx_ms_out)
+{
+    frame_id_out = 0;
+    ack_base_seq_out = 0xFFFFFFFFUL;
+    ack_count_out = 0;
+    ack_bitmap_out = 0;
+    ack_fec_expected_out = false;
+    ack_fec_ok_out = false;
+    schedule_mode_out = 0;
+    transition_target_out = 0;
+    jam_policy_out = 0;
+    fec_grant_pair_out = 0;
+    rx_ms_out = 0;
+
+    const uint32_t bat_dau = millis();
+    LoRa.receive();
+
+    while ((uint32_t)(millis() - bat_dau) < timeout_ms)
+    {
+        const int packetSize = LoRa.parsePacket();
+        if (packetSize <= 0) { delay(1); continue; }
+
+        uint8_t buffer[256];
+        size_t n = 0;
+        while (LoRa.available() && n < sizeof(buffer)) buffer[n++] = (uint8_t)LoRa.read();
+        while (LoRa.available()) LoRa.read();
+
+        // V2C1 physical 19B:
+        // FF,03,1C,ver, frame32, ack1_base32,ack1_flags, ack2_base32,ack2_flags, fec_grant.
+        if (packetSize == 19 && n == 19
+            && buffer[0] == V2C_BROADCAST_ID
+            && buffer[1] == ID_RBS_READY
+            && buffer[2] == TYPE_SUPERFRAME_V2B
+            && buffer[3] == expected_schedule_version)
+        {
+            const uint32_t frame_id =
+                ((uint32_t)buffer[4] << 24) | ((uint32_t)buffer[5] << 16)
+                | ((uint32_t)buffer[6] << 8) | (uint32_t)buffer[7];
+
+            const uint8_t base_off = (V2C_PAIR_INDEX == 1) ? 8U : 13U;
+            const uint8_t flags_off = (V2C_PAIR_INDEX == 1) ? 12U : 17U;
+            const uint32_t ack_base =
+                ((uint32_t)buffer[base_off] << 24) | ((uint32_t)buffer[base_off+1] << 16)
+                | ((uint32_t)buffer[base_off+2] << 8) | (uint32_t)buffer[base_off+3];
+            const uint8_t ack_flags = buffer[flags_off];
+
+            frame_id_out = frame_id;
+            ack_base_seq_out = ack_base;
+            ack_count_out = (ack_flags >> 6) & 0x03;
+            ack_bitmap_out = ack_flags & 0x03;
+            ack_fec_expected_out = false;
+            ack_fec_ok_out = false;
+            const uint8_t schedule_ctl = buffer[18];
+            schedule_mode_out = (schedule_ctl >> 6) & 0x03;
+            transition_target_out = (schedule_ctl >> 4) & 0x03;
+            jam_policy_out = (schedule_ctl >> 2) & 0x03;
+            fec_grant_pair_out = schedule_ctl & 0x03;
+            if (schedule_mode_out < 1U || schedule_mode_out > 3U)
+            {
+                LoRa.receive();
+                continue;
+            }
+            rx_ms_out = millis();
+            v2c1_network_busy_until_ms = rx_ms_out + 900U;
+
+            Serial.printf(
+                "[SU V2C3 SYNC] PAIR=%u | FRAME=%u | MODE=%u | NEXT=%u | ACK_BASE=%s | COUNT=%u | BITMAP=0x%02X | FEC_GRANT=%u | JAM_POLICY=%u\n",
+                (unsigned int)V2C_PAIR_INDEX,
+                (unsigned int)frame_id_out,
+                (unsigned int)schedule_mode_out,
+                (unsigned int)transition_target_out,
+                ack_base == 0xFFFFFFFFUL ? "NONE" : "SET",
+                (unsigned int)ack_count_out,
+                (unsigned int)ack_bitmap_out,
+                (unsigned int)fec_grant_pair_out,
+                (unsigned int)jam_policy_out
+            );
+
+            LoRa.idle();
+            return true;
+        }
+
+        LoRa.receive();
+    }
+
+    LoRa.idle();
+    return false;
+}
+
+bool V2C1_NetworkBusy()
+{
+    return (int32_t)(v2c1_network_busy_until_ms - millis()) > 0;
+}
+
+void V2C1_Poll_Beacon_Idle()
+{
+    // Non-blocking-ish: chỉ thử parse packet đã có sẵn. Không giữ CPU chờ.
+    const int packetSize = LoRa.parsePacket();
+    if (packetSize <= 0) return;
+
+    uint8_t b[32]; size_t n=0;
+    while (LoRa.available() && n < sizeof(b)) b[n++] = (uint8_t)LoRa.read();
+    while (LoRa.available()) LoRa.read();
+    if (packetSize == 19 && n == 19 && b[0] == V2C_BROADCAST_ID
+        && b[1] == ID_RBS_READY && b[2] == TYPE_SUPERFRAME_V2B
+        && b[3] == V2C_ACTIVE_SCHEDULE_VERSION)
+    {
+        v2c1_network_busy_until_ms = millis() + 900U;
+    }
+    LoRa.receive();
+}
+
+// =====================================================
 // CHO SESSION_READY / SESSION_FAIL TU rBS
 //
 // Physical 12B RadioHead-compatible:
@@ -316,6 +588,22 @@ bool Cho_SESSION_READY_RBS(
             while (LoRa.available())
             {
                 LoRa.read();
+            }
+
+            // V2C4.6: handshake co the keo qua nhieu beacon. Khong de lease
+            // NetworkBusy het han trong luc Cho_SESSION_READY dang nuot packet;
+            // neu retry thi SU van biet mang dang active va giu TDMA lock.
+            if (
+                packetSize == 19 && n == 19
+                && buffer[0] == V2C_BROADCAST_ID
+                && buffer[1] == ID_RBS_READY
+                && buffer[2] == TYPE_SUPERFRAME_V2B
+                && buffer[3] == V2C_ACTIVE_SCHEDULE_VERSION
+            )
+            {
+                v2c1_network_busy_until_ms = millis() + 900U;
+                LoRa.receive();
+                continue;
             }
 
             if (packetSize == 12 && n == 12)
@@ -522,11 +810,6 @@ bool KiemTra_USER_RESPONSE_RBS(
 {
     response_code = 0;
 
-    if (expected_session_id == 0)
-    {
-        return false;
-    }
-
     int packetSize = LoRa.parsePacket();
 
     if (packetSize <= 0)
@@ -549,7 +832,17 @@ bool KiemTra_USER_RESPONSE_RBS(
 
     LoRa.receive();
 
-    if (packetSize != 12 || n != 12)
+    if (packetSize == 19 && n == 19
+        && buffer[0] == V2C_BROADCAST_ID
+        && buffer[1] == ID_RBS_READY
+        && buffer[2] == TYPE_SUPERFRAME_V2B
+        && buffer[3] == V2C_ACTIVE_SCHEDULE_VERSION)
+    {
+        v2c1_network_busy_until_ms = millis() + 900U;
+        return false;
+    }
+
+    if (expected_session_id == 0 || packetSize != 12 || n != 12)
     {
         return false;
     }
@@ -772,6 +1065,12 @@ bool Gui_GPS_REPORT_SU(
     uint64_t ma_phien,
     const DuLieuGPS_SU &du_lieu_gps)
 {
+    if (V2C1_NetworkBusy())
+    {
+        // V2C1: defer telemetry, voice/control slot co uu tien.
+        return false;
+    }
+
     return Gui_Goi_ViTri_SU(TYPE_GPS_REPORT, ma_phien, du_lieu_gps, false);
 }
 
@@ -779,5 +1078,11 @@ bool Gui_VI_TRI_DINH_KY_SU(
     uint64_t so_thu_tu_bao_cao,
     const DuLieuGPS_SU &du_lieu_gps)
 {
+    if (V2C1_NetworkBusy())
+    {
+        // V2C1: defer telemetry, voice/control slot co uu tien.
+        return false;
+    }
+
     return Gui_Goi_ViTri_SU(TYPE_VI_TRI_DINH_KY, so_thu_tu_bao_cao, du_lieu_gps, true);
 }

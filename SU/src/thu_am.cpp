@@ -2,12 +2,13 @@
 #include "driver/adc.h"
 
 // =====================================================
-// AUDIO QUALITY V1 - ZERO LATENCY
+// AUDIO QUALITY V2C2.4 - ANTI-ALIAS CLEANUP / ZERO LATENCY
 //
 // - Giu output 8 kHz.
 // - Khong doi Speex/packet/AES/FEC/LoRa.
 // - Khong them buffer.
-// - LPF bac 4 Fc~3.6kHz truoc decimate 32kHz -> 8kHz.
+// - LPF bac 4 Fc~3.3kHz truoc decimate 32kHz -> 8kHz.
+// - Tang guard anti-alias so voi 3.6kHz baseline, giu phu am toi ~3.3kHz.
 // =====================================================
 
 void KhoiTao_ThuAm_DMA()
@@ -40,7 +41,7 @@ void KhoiTao_ThuAm_DMA()
     ESP_ERROR_CHECK(adc_digi_start());
 
     Serial.println(
-        "Khoi tao ADC DMA (32kHz) | LPF4 3.6kHz -> 8kHz THANH CONG!"
+        "Khoi tao ADC DMA (32kHz) | LPF4 3.3kHz -> 8kHz | PROFILE=CLEAR1 THANH CONG!"
     );
 }
 
@@ -77,7 +78,7 @@ bool LayMau_AmThanh(uint8_t *buffer_dich)
     uint16_t *mau_adc_8k =
         (uint16_t *)buffer_dich;
 
-    // Butterworth LPF bac 4, Fs=32kHz, Fc~3.6kHz.
+    // Butterworth LPF bac 4, Fs=32kHz, Fc~3.3kHz.
     // SOS 1
     static float s1_x1 = 0.0f;
     static float s1_x2 = 0.0f;
@@ -90,17 +91,17 @@ bool LayMau_AmThanh(uint8_t *buffer_dich)
     static float s2_y1 = 0.0f;
     static float s2_y2 = 0.0f;
 
-    constexpr float S1_B0 = 0.00718404f;
-    constexpr float S1_B1 = 0.01436808f;
-    constexpr float S1_B2 = 0.00718404f;
-    constexpr float S1_A1 = -0.95050047f;
-    constexpr float S1_A2 = 0.24999081f;
+    constexpr float S1_B0 = 0.00535614f;
+    constexpr float S1_B1 = 0.01071227f;
+    constexpr float S1_B2 = 0.00535614f;
+    constexpr float S1_A1 = -1.02377248f;
+    constexpr float S1_A2 = 0.28401601f;
 
     constexpr float S2_B0 = 1.0f;
     constexpr float S2_B1 = 2.0f;
     constexpr float S2_B2 = 1.0f;
-    constexpr float S2_A1 = -1.21807907f;
-    constexpr float S2_A2 = 0.60187996f;
+    constexpr float S2_A1 = -1.29543384f;
+    constexpr float S2_A2 = 0.62473383f;
 
     for (int i = 0; i < 640; i++)
     {

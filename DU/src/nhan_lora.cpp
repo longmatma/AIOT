@@ -1,4 +1,5 @@
 #include "nhan_lora.h"
+#include "node_config.h"
 
 #include <Arduino.h>
 #include <math.h>
@@ -25,9 +26,9 @@
 // ID
 // =====================================================
 
-#define ID_TRAM_SU   0x01
-#define ID_TRAM_DU   0x02
-#define ID_TRAM_RBS  0x03
+#define ID_TRAM_SU   V2C_SU_ID
+#define ID_TRAM_DU   V2C_DU_ID
+#define ID_TRAM_RBS  V2C_RBS_ID
 
 
 // =====================================================
@@ -52,12 +53,12 @@
 // =====================================================
 
 #define SIZE_SESSION_INNER  12
-#define SIZE_VOICE_INNER   176
-#define SIZE_FEC_INNER     184
+#define SIZE_VOICE_INNER   106
+#define SIZE_FEC_INNER     114
 
 #define SIZE_SESSION_RELAY  16
-#define SIZE_VOICE_RELAY   180
-#define SIZE_FEC_RELAY     188
+#define SIZE_VOICE_RELAY   110
+#define SIZE_FEC_RELAY     118
 #define SIZE_END_RELAY       5
 #define SIZE_GPS_REPORT_SU   44
 
@@ -65,6 +66,142 @@
 // RX task va PLAY_REPORT task cung dung mot SX1278.
 // Mutex ngan hai task cham SPI/radio cung luc.
 static SemaphoreHandle_t LoRa_Mutex = nullptr;
+
+static volatile uint32_t v2c1_network_busy_until_ms = 0;
+
+static bool DU_V2C1_NetworkBusy()
+{
+    return (int32_t)(v2c1_network_busy_until_ms - millis()) > 0;
+}
+
+
+// =====================================================
+// V2C4.7A - TX BOUNDED + RADIO SELF-RECOVERY
+//
+// LoRa.endPacket() cua thu vien Sandeep Mistry la BLOCKING khong timeout.
+// Neu SX1278 mat TX_DONE, task dang gui se giu LoRa_Mutex vo han:
+//   - RX task van song nhung khong lay duoc mutex,
+//   - DU khong nhan SESSION_START moi,
+//   - HMI task co the dung ngay luc LED dang HIGH -> nhin nhu treo mach.
+//
+// Doi sang async TX + poll co timeout. Neu qua timeout, reset/re-config SX1278
+// ngay khi van dang giu mutex, sau do quay ve RX continuous.
+// =====================================================
+
+static constexpr uint32_t DU_LORA_TX_TIMEOUT_MS = 180UL;
+static volatile uint32_t du_lora_tx_timeout_count = 0;
+static volatile bool du_lora_tx_done_flag = false;
+
+// Sandeep Mistry LoRa 0.8.0 de LoRaClass::isTransmitting() o private.
+// Dung public API onTxDone() + endPacket(true) de co TX timeout ma khong
+// sua thu vien LoRa. Callback chi duoc gan trong luc TX; truoc khi quay
+// lai RX se detach de khong lam mat RX_DONE cua parsePacket().
+static void DU_LoRa_OnTxDone()
+{
+    du_lora_tx_done_flag = true;
+}
+
+static bool DU_LoRa_Recover_RX_Unsafe(const char *reason)
+{
+    Serial.printf(
+        "[DU RADIO RECOVER] REASON=%s | HARD_RESET_SX1278\n",
+        reason != nullptr ? reason : "UNKNOWN"
+    );
+
+    // Khoi dong lai SPI theo DUNG pin custom cua board truoc khi LoRa.begin().
+    SPI.end();
+    delay(2);
+    SPI.begin(
+        LORA_SCK,
+        LORA_MISO,
+        LORA_MOSI,
+        LORA_CS
+    );
+
+    LoRa.setSPI(SPI);
+    LoRa.setPins(
+        LORA_CS,
+        LORA_RST,
+        LORA_DIO0
+    );
+
+    if (!LoRa.begin(433E6))
+    {
+        Serial.println(
+            "[DU RADIO RECOVER] FAIL: Khong khoi tao lai duoc SX1278"
+        );
+        return false;
+    }
+
+    LoRa.setSpreadingFactor(HE_SO_TRAI_PHO_DU);
+    LoRa.setSignalBandwidth(500E3);
+    LoRa.setCodingRate4(5);
+    LoRa.enableCrc();
+    LoRa.setTxPower(CONG_SUAT_PHAT_DU_DBM);
+    pinMode(LORA_DIO0, INPUT);
+    LoRa.receive();
+
+    Serial.println(
+        "[DU RADIO RECOVER] OK -> RX_CONTINUOUS"
+    );
+
+    return true;
+}
+
+
+static int DU_LoRa_EndPacket_CoTimeout(const char *tag)
+{
+    du_lora_tx_done_flag = false;
+
+    // Chi bat IRQ DIO0/TX_DONE trong luc TX. Neu de callback ton tai khi RX,
+    // ISR cua thu vien se clear RX_DONE truoc parsePacket() va lam mat goi.
+    LoRa.onTxDone(DU_LoRa_OnTxDone);
+
+    const int start_ok = LoRa.endPacket(true);
+
+    if (start_ok != 1)
+    {
+        LoRa.onTxDone(nullptr);
+        Serial.printf(
+            "[DU RADIO TX] START FAIL | TAG=%s\n",
+            tag != nullptr ? tag : "UNKNOWN"
+        );
+        LoRa.receive();
+        return 0;
+    }
+
+    const uint32_t t0 = millis();
+
+    while (!du_lora_tx_done_flag)
+    {
+        if ((uint32_t)(millis() - t0) > DU_LORA_TX_TIMEOUT_MS)
+        {
+            du_lora_tx_timeout_count++;
+
+            Serial.printf(
+                "[DU RADIO TX TIMEOUT] TAG=%s | AGE=%u ms | COUNT=%u -> RECOVER\n",
+                tag != nullptr ? tag : "UNKNOWN",
+                (unsigned int)(millis() - t0),
+                (unsigned int)du_lora_tx_timeout_count
+            );
+
+            // Tat callback truoc khi re-init de DIO0 khong con ISR cu.
+            LoRa.onTxDone(nullptr);
+            LoRa.idle();
+            (void)DU_LoRa_Recover_RX_Unsafe(tag);
+            return 0;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+
+    // TX_DONE da duoc ISR cua thu vien clear. Detach callback truoc RX de
+    // parsePacket() tu quan ly RX_DONE binh thuong.
+    LoRa.onTxDone(nullptr);
+    LoRa.receive();
+    return 1;
+}
+
 
 // =====================================================
 // SNAPSHOT KENH THAT SU -> DU
@@ -411,6 +548,22 @@ bool Nhan_GoiTin_LoRa(
         return false;
     }
 
+    // V2C1 broadcast beacon: DU khong decode audio, chi dung de khoa telemetry ngoai slot.
+    if (
+        packetSize == 19
+        && raw_packet[0] == V2C_BROADCAST_ID
+        && raw_packet[1] == ID_TRAM_RBS
+        && raw_packet[2] == 0x1C
+        // V2C4.x rBS dung schedule version 7. Khong hard-code version 4 cu;
+        // length/src/dst/type da du de nhan dien beacon scheduler.
+        && raw_packet[3] >= 4
+    )
+    {
+        v2c1_network_busy_until_ms = millis() + 900U;
+        xSemaphoreGive(LoRa_Mutex);
+        return false;
+    }
+
     if (
         packetSize != SIZE_SESSION_RELAY
         && packetSize != SIZE_VOICE_RELAY
@@ -564,8 +717,7 @@ bool Gui_SESSION_READY_RBS(
     LoRa.idle();
     LoRa.beginPacket();
     LoRa.write(packet, sizeof(packet));
-    int ok = LoRa.endPacket();
-    LoRa.receive();
+    int ok = DU_LoRa_EndPacket_CoTimeout("SESSION_READY");
 
     xSemaphoreGive(LoRa_Mutex);
 
@@ -637,10 +789,7 @@ bool Gui_PLAY_STARTED_RBS(
     );
 
     int ok =
-        LoRa.endPacket();
-
-    // Bao xong phai quay lai RX continuous.
-    LoRa.receive();
+        DU_LoRa_EndPacket_CoTimeout("PLAY_STARTED");
 
     xSemaphoreGive(
         LoRa_Mutex
@@ -704,8 +853,7 @@ bool Gui_USER_RESPONSE_RBS(
     LoRa.idle();
     LoRa.beginPacket();
     LoRa.write(packet, sizeof(packet));
-    int ok = LoRa.endPacket();
-    LoRa.receive();
+    int ok = DU_LoRa_EndPacket_CoTimeout("USER_RESPONSE");
     xSemaphoreGive(LoRa_Mutex);
 
     Serial.printf(
@@ -747,6 +895,11 @@ void Xoa_BaoCao_Kenh_SU_DU_DangCho()
 // =====================================================
 bool Gui_BaoCao_Kenh_SU_DU_DangCho()
 {
+    if (DU_V2C1_NetworkBusy())
+    {
+        return false;
+    }
+
     if (LoRa_Mutex == nullptr)
         return false;
 
@@ -786,8 +939,7 @@ bool Gui_BaoCao_Kenh_SU_DU_DangCho()
     LoRa.idle();
     LoRa.beginPacket();
     LoRa.write(p, sizeof(p));
-    int ok = LoRa.endPacket();
-    LoRa.receive();
+    int ok = DU_LoRa_EndPacket_CoTimeout("CHANNEL_REPORT");
     xSemaphoreGive(LoRa_Mutex);
 
     if (ok == 1)
@@ -939,8 +1091,9 @@ static bool Gui_Goi_ViTri_DU(
     LoRa.idle();
     LoRa.beginPacket();
     LoRa.write(goi_tin, sizeof(goi_tin));
-    int ket_qua_tx = LoRa.endPacket();
-    LoRa.receive();
+    int ket_qua_tx = DU_LoRa_EndPacket_CoTimeout(
+        loai_bao_cao == TYPE_VI_TRI_DINH_KY ? "GPS_PERIODIC" : "GPS_SESSION"
+    );
 
     xSemaphoreGive(LoRa_Mutex);
 
@@ -970,6 +1123,11 @@ bool Gui_GPS_REPORT_DU(
     uint64_t ma_phien,
     const DuLieuGPS_DU &du_lieu_gps)
 {
+    if (DU_V2C1_NetworkBusy())
+    {
+        return false;
+    }
+
     return Gui_Goi_ViTri_DU(TYPE_GPS_REPORT, ma_phien, du_lieu_gps, false);
 }
 
@@ -977,5 +1135,10 @@ bool Gui_VI_TRI_DINH_KY_DU(
     uint64_t so_thu_tu_bao_cao,
     const DuLieuGPS_DU &du_lieu_gps)
 {
+    if (DU_V2C1_NetworkBusy())
+    {
+        return false;
+    }
+
     return Gui_Goi_ViTri_DU(TYPE_VI_TRI_DINH_KY, so_thu_tu_bao_cao, du_lieu_gps, true);
 }

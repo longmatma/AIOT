@@ -4,7 +4,7 @@
 // ============================================================
 // PIN HMI SU
 // ============================================================
-static constexpr uint8_t CHAN_NUT_PTT_SU = 7;
+static constexpr uint8_t CHAN_NUT_PTT_SU = 6;
 static constexpr uint8_t CHAN_LED_SU = 16;
 
 // Session gan nhat va feedback cua DU.

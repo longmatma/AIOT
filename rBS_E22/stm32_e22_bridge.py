@@ -76,14 +76,16 @@ CMD_CONFIG_RADIO = 0x02
 CMD_START_RX = 0x03
 CMD_TX_RAW = 0x04
 CMD_RADIO_RESET = 0x05
+CMD_TX_BURST = 0x06
 
 EVT_ACK = 0x80
 EVT_RX_PACKET = 0x81
 EVT_TX_DONE = 0x82
 EVT_ERROR = 0x83
 EVT_STATUS = 0x84
+EVT_BURST_DONE = 0x85
 
-MAX_UART_PAYLOAD = 512
+MAX_UART_PAYLOAD = 600
 
 
 class BridgeError(RuntimeError):
@@ -128,7 +130,7 @@ class STM32E22Bridge:
         iq_inverted: bool = False,
     ):
         self.port = port or os.environ.get("RBS_STM_UART", "/dev/serial0")
-        self.baudrate = int(baudrate or os.environ.get("RBS_STM_BAUD", "115200"))
+        self.baudrate = int(baudrate or os.environ.get("RBS_STM_BAUD", "1000000"))
 
         self.frequency_hz = int(frequency_hz)
         self.bandwidth_hz = int(bandwidth_hz)
@@ -148,6 +150,8 @@ class STM32E22Bridge:
         self._rx_queue: Deque[tuple[bytes, float, float]] = deque(maxlen=64)
         self._event_queue: Deque[_Frame] = deque(maxlen=128)
         self._rx_buffer = bytearray()
+        self._pending_burst_seq: Optional[int] = None
+        self._last_burst_elapsed_ms: Optional[int] = None
 
         self.connect()
 
@@ -160,6 +164,8 @@ class STM32E22Bridge:
         self._rx_queue.clear()
         self._event_queue.clear()
         self._rx_buffer.clear()
+        self._pending_burst_seq = None
+        self._last_burst_elapsed_ms = None
 
         if serial is None:
             raise BridgeError(
@@ -237,6 +243,8 @@ class STM32E22Bridge:
         self._rx_queue.clear()
         self._event_queue.clear()
         self._rx_buffer.clear()
+        self._pending_burst_seq = None
+        self._last_burst_elapsed_ms = None
         time.sleep(0.05)
         self.configure_radio()
         self.listen()
@@ -277,6 +285,125 @@ class STM32E22Bridge:
         # Giữ method này để tương thích gateway cũ.
         return
 
+    def _handle_background_frame(self, frame: _Frame) -> bool:
+        """Consume bridge events that are not application RX packets.
+
+        Returns True if the frame was fully handled here.
+        """
+        if frame.frame_type == EVT_BURST_DONE:
+            if self._pending_burst_seq is None or frame.seq == self._pending_burst_seq:
+                self._pending_burst_seq = None
+                if len(frame.payload) >= 6:
+                    self._last_burst_elapsed_ms = struct.unpack_from("<I", frame.payload, 2)[0]
+                else:
+                    self._last_burst_elapsed_ms = None
+                return True
+        return False
+
+    @staticmethod
+    def build_radiohead_raw(
+        data,
+        *,
+        destination: int,
+        node: int,
+        identifier: int,
+        flags: int,
+    ) -> bytes:
+        payload = bytes(data)
+        raw = bytes((
+            destination & 0xFF,
+            node & 0xFF,
+            identifier & 0xFF,
+            flags & 0xFF,
+        )) + payload
+        if len(raw) > 255:
+            raise BridgeError(f"Packet RF quá dài: {len(raw)} byte")
+        return raw
+
+    def burst_busy(self) -> bool:
+        self.poll_bridge_events()
+        return self._pending_burst_seq is not None
+
+    def poll_bridge_events(self) -> None:
+        """Drain already available UART events without blocking."""
+        if self._ser is None:
+            return
+
+        waiting = self._ser.in_waiting
+        if waiting:
+            self._rx_buffer.extend(self._ser.read(waiting))
+
+        while True:
+            frame = self._extract_one_frame()
+            if frame is None:
+                break
+            if frame.frame_type == EVT_RX_PACKET:
+                self._store_rx_event(frame.payload)
+                continue
+            if self._handle_background_frame(frame):
+                continue
+            self._event_queue.append(frame)
+
+    def wait_burst_done(self, timeout: float = 0.0) -> bool:
+        if self._pending_burst_seq is None:
+            return True
+
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        while True:
+            self.poll_bridge_events()
+            if self._pending_burst_seq is None:
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.0005)
+
+    def send_burst_raw(self, raw_packets, *, guard_ms: int = 3) -> int:
+        """Queue one autonomous STM32 RF burst and return after it is accepted.
+
+        raw_packets must already include the 4-byte RadioHead-compatible header.
+        RF completion is asynchronous and reported by EVT_BURST_DONE.
+        """
+        packets = [bytes(p) for p in raw_packets]
+        if not (1 <= len(packets) <= 6):
+            raise BridgeError("Burst phải có 1..6 packet")
+        if not (0 <= int(guard_ms) <= 20):
+            raise BridgeError("guard_ms phải trong 0..20")
+        if self.burst_busy():
+            raise BridgeError("STM32 burst trước chưa hoàn tất")
+
+        payload = bytearray((len(packets), int(guard_ms)))
+        for raw in packets:
+            if not (1 <= len(raw) <= 255):
+                raise BridgeError(f"Packet burst sai độ dài: {len(raw)}")
+            payload.append(len(raw))
+            payload.extend(raw)
+
+        if len(payload) > MAX_UART_PAYLOAD:
+            raise BridgeError(f"Burst UART quá dài: {len(payload)} byte")
+
+        seq = self._next_seq()
+        self._write_frame(CMD_TX_BURST, seq, bytes(payload))
+        deadline = time.monotonic() + 0.5
+        while time.monotonic() < deadline:
+            frame = self._read_frame(deadline - time.monotonic())
+            if frame is None:
+                continue
+            if frame.frame_type == EVT_RX_PACKET:
+                self._store_rx_event(frame.payload)
+                continue
+            if self._handle_background_frame(frame):
+                continue
+            if frame.frame_type == EVT_ERROR and frame.seq == seq:
+                text = frame.payload.decode("utf-8", errors="replace")
+                raise BridgeError(f"STM32 từ chối burst: {text}")
+            if frame.frame_type == EVT_ACK and frame.seq == seq:
+                self._pending_burst_seq = seq
+                self._last_burst_elapsed_ms = None
+                return seq
+            self._event_queue.append(frame)
+
+        raise BridgeError("Timeout chờ STM32 nhận burst")
+
     # ------------------------------------------------------------------
     # API tương thích RFM9x
     # ------------------------------------------------------------------
@@ -289,18 +416,20 @@ class STM32E22Bridge:
         identifier: int = 0,
         flags: int = 0,
     ) -> bool:
-        payload = bytes(data)
-        raw = bytes(
-            (
-                destination & 0xFF,
-                node & 0xFF,
-                identifier & 0xFF,
-                flags & 0xFF,
-            )
-        ) + payload
+        raw = self.build_radiohead_raw(
+            data,
+            destination=destination,
+            node=node,
+            identifier=identifier,
+            flags=flags,
+        )
 
-        if len(raw) > 255:
-            raise BridgeError(f"Packet RF quá dài: {len(raw)} byte")
+        # V2B.2: a normal single TX (notably the next beacon) must not collide
+        # with an autonomous relay burst. In the nominal 480 ms budget the burst
+        # is already done well before this point, so this is usually non-blocking.
+        if self._pending_burst_seq is not None:
+            if not self.wait_burst_done(timeout=0.080):
+                raise BridgeError("Burst downlink chưa xong trước TX đơn")
 
         seq = self._next_seq()
         self._write_frame(CMD_TX_RAW, seq, raw)
@@ -313,6 +442,9 @@ class STM32E22Bridge:
 
             if frame.frame_type == EVT_RX_PACKET:
                 self._store_rx_event(frame.payload)
+                continue
+
+            if self._handle_background_frame(frame):
                 continue
 
             if frame.frame_type == EVT_TX_DONE and frame.seq == seq:
@@ -347,6 +479,9 @@ class STM32E22Bridge:
                 self.last_rssi = rssi
                 self.last_snr = snr
                 return raw if with_header else raw[4:]
+
+            if self._handle_background_frame(frame):
+                continue
 
             if frame.frame_type == EVT_ERROR:
                 text = frame.payload.decode("utf-8", errors="replace")
@@ -390,6 +525,9 @@ class STM32E22Bridge:
 
             if frame.frame_type == EVT_RX_PACKET:
                 self._store_rx_event(frame.payload)
+                continue
+
+            if self._handle_background_frame(frame):
                 continue
 
             if frame.frame_type == EVT_ERROR and frame.seq == seq:

@@ -1,0 +1,29 @@
+# PlatformIO
+.pio/
+.vscode/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Logs / runtime
+*.log
+*.csv
+
+# Backup
+*.bak
+*.bak_*
+backup_before_*/
+
+# Secrets
+khoa_goc_local.h
+.env
+.env.*
+*.pem
+*.key
+
+# Windows
+Thumbs.db
+Desktop.ini

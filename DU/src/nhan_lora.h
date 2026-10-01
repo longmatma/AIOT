@@ -11,6 +11,11 @@ bool Nhan_GoiTin_LoRa(
     size_t &do_dai_nhan
 );
 
+// V2C5.3A friendly-jam UL window simulation (DU helper only).
+// PREPARED/ARMED/START_SIM/STOP_SIM; KHONG phat RF.
+void DU_Jam53_Prepare(uint64_t session_id);
+void DU_Jam53_Stop(const char *reason);
+
 // DU -> rBS: xac nhan da nhan SESSION_START va da vao dung session.
 // Packet physical 12B = 4B control header + SESSION_ID64.
 bool Gui_SESSION_READY_RBS(

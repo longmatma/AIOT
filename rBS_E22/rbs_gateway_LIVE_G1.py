@@ -1968,17 +1968,19 @@ def gui_superframe_beacon_v2b(rfm9x, frame_id, block):
         identifier=TYPE_SUPERFRAME_V2B,
         flags=V2B_SCHEDULE_VERSION,
     )
-    try:
-        rfm9x.listen()
-    except Exception:
-        pass
+    # V2C5.6G_RBS_BEACON_RX_AUTOREARM
+    # STM32/E22 firmware already returns to RX automatically on TX_DONE
+    # BEFORE EVT_TX_DONE is forwarded to Raspberry Pi. Calling listen()
+    # again here sends a second CMD_START_RX, which clears IRQ state and
+    # incurs the RX-switch delay again close to the SU +12 ms UL slot.
+    # Therefore do not re-arm RX a second time at Pi level.
     tx_ms = (time.monotonic() - t0) * 1000.0
 
     ack_count = (ack_flags >> 6) & 0x03
     ack_bitmap = ack_flags & 0x07
 
     print(
-        f"[rBS V2B.1 BEACON] FRAME={frame_id} | TX={tx_ms:.1f} ms | "
+        f"[rBS V2B.1 BEACON] FRAME={frame_id} | TX={tx_ms:.1f} ms | RX=AUTO_STM32 | "
         f"ACK_BASE={'NONE' if ack_base == V2B_ACK_NONE_BASE else ack_base} | "
         f"COUNT={ack_count} | BITMAP=0x{ack_bitmap:02X}"
     )
@@ -3187,7 +3189,7 @@ V2C5_VOICE_HARD_RELEASE_S = 2.20
 V2C1_FEC_DATA_PER_GROUP = 8
 V2C1_MAX_BURST_ITEMS = 6
 V2C1_BURST_GUARD_MS = 3
-V2C4_SINGLE_DL_GUARD_MS = 10  # same-DU 2-VOICE burst: cho DU doc FIFO + re-arm RX
+V2C4_SINGLE_DL_GUARD_MS = 15  # same-DU 2-VOICE burst: cho DU doc FIFO + re-arm RX
 V2C4_JOIN_DL_GUARD_MS = 10    # DUAL: 1 VOICE + JOIN/READY control, cho node khac re-arm RX
 
 # V2C5 JAM DRY-RUN - RBS ONLY
@@ -3817,15 +3819,15 @@ def _v2c1_send_beacon(radio, st, scheduled_at):
         flags=V2C1_SCHEDULE_VERSION,
     )
     tx_ms = (time.monotonic() - t0) * 1000.0
-    try:
-        radio.listen()
-    except Exception:
-        pass
+    # V2C5.6G1_ACTIVE_BEACON_RX_AUTOREARM
+    # STM32 firmware re-arms RX before forwarding EVT_TX_DONE to Pi.
+    # Do not send a second CMD_START_RX near the first uplink slot.
+    # RX=AUTO_STM32 reports this policy, not measured RX readiness.
 
     a1, f1 = _v2c1_ack_tuple(st["pairs"][1])
     a2, f2 = _v2c1_ack_tuple(st["pairs"][2])
     print(
-        f"[rBS V2C1 BEACON] FRAME={frame_id} | TX={tx_ms:.1f}ms | "
+        f"[rBS V2C1 BEACON] FRAME={frame_id} | TX={tx_ms:.1f}ms | RX=AUTO_STM32 | PATCH=V2C5.6G1 | "
         f"P1_BASE={'NONE' if a1==0xFFFFFFFF else a1} P1_ACK=0x{f1&3:02X} | "
         f"P2_BASE={'NONE' if a2==0xFFFFFFFF else a2} P2_ACK=0x{f2&3:02X} | "
         f"MODE={_v2c2_mode_name(mode)} | "

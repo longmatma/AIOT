@@ -3552,129 +3552,52 @@ def _v2c53b1_dl_safe_mask(st, frame_id, meta, *, burst_accepted=True):
 
 
 
-# ============================================================
-# V2C5.3B2-R2B1 - EXACT NEXT-VOICE MARKER PROBE
-# ============================================================
-V2C53B2R2B1_TYPE_NEXT_P1 = 0x2E
-V2C53B2R2B1_TYPE_NEXT_P2 = 0x2F
-
 
 # ============================================================
-# V2C5.3B2-R2B3 - DUAL ALTERNATE ORDER
-# PATCH_TAG: V2C5.3B2R2B3_DUAL_ALTERNATE_ORDER
+# V2C5.3B-2 - DL PERMISSION DISTRIBUTION (SIM ONLY)
+#
+# Tiny permission packet is prepended to the SAME accepted STM32 DL burst.
+# Physical packet is ONLY the 4-byte RadioHead-compatible header:
+#   DST=0xFF | SRC=rBS | TYPE=0x1D | FLAGS
+# FLAGS: bits7..4=frame low4, bits3..2=mode, bits1..0=DL_SAFE_MASK.
+# No helper/jammer RF TX is enabled by this.
 # ============================================================
-V2C53B2R2B3_DUAL_ALTERNATE_ORDER = True
+V2C53B2_DL_PERMISSION_SIM = True
+V2C53B2_TYPE_DL_PERMISSION = 0x1D
 
 
-def _v2c53b2r2b3_alternate_dual_order(st, frame_id, items, meta):
-    if not V2C53B2R2B3_DUAL_ALTERNATE_ORDER:
-        return False
-
-    mode = int(st.get("mode", V2C2_MODE_DUAL))
+def _v2c53b2_calc_permission_mask(st, meta):
+    if not V2C53B2_DL_PERMISSION_SIM:
+        return 0
     phase = str(st.get("jam_dryrun_phase", "STEADY"))
-
-    if mode != V2C2_MODE_DUAL:
-        return False
-    if phase != "STEADY":
-        return False
-
-    if len(items) != 2 or len(meta) != 2:
-        return False
-    if any(m[0] != "voice" for m in meta):
-        return False
-
-    pair_ids = [int(m[1]) for m in meta]
-    if sorted(pair_ids) != [1, 2]:
-        return False
-
-    by_pair = {}
-    for raw, m in zip(items, meta):
-        by_pair[int(m[1])] = (raw, m)
-
-    if (int(frame_id) & 1) == 0:
-        order = (1, 2)
-        next_pair = 2
-    else:
-        order = (2, 1)
-        next_pair = 1
-
-    items[:] = [by_pair[order[0]][0], by_pair[order[1]][0]]
-    meta[:] = [by_pair[order[0]][1], by_pair[order[1]][1]]
-
-    print(
-        f"[rBS V2C5.3B2R2B3 ORDER] FRAME={int(frame_id)} | "
-        f"ORDER=P{order[0]}>P{order[1]} | NEXT_PAIR={next_pair} | "
-        "ITEMS=2 | EXTRA_PACKET=0 | EXTRA_BYTES=0 | RF_JAM=OFF"
-    )
-    return True
-
-
-def _v2c53b2r2b1_mark_next_voice(st, frame_id, items, meta):
-    phase = str(st.get("jam_dryrun_phase", "STEADY"))
-
     if phase in ("PREPARE", "COMMIT"):
-        print(
-            f"[rBS V2C5.3B2R2B1 MARK] FRAME={int(frame_id)} | "
-            "COUNT=0 | MASK=0x0 | REASON=TRANSITION | EXTRA_PACKET=0 | RF_JAM=OFF"
-        )
-        return 0, 0
-
+        return 0
     if any(m[0] == "control" for m in meta):
-        print(
-            f"[rBS V2C5.3B2R2B1 MARK] FRAME={int(frame_id)} | "
-            "COUNT=0 | MASK=0x0 | REASON=CONTROL_IN_BURST | EXTRA_PACKET=0 | RF_JAM=OFF"
-        )
-        return 0, 0
+        return 0
 
-    if len(items) != len(meta):
-        print(
-            f"[rBS V2C5.3B2R2B1 MARK] FRAME={int(frame_id)} | "
-            f"COUNT=0 | MASK=0x0 | REASON=META_LEN_MISMATCH_{len(items)}_{len(meta)} | "
-            "EXTRA_PACKET=0 | RF_JAM=OFF"
-        )
-        return 0, 0
-
-    count = 0
-    pair_mask = 0
-
-    for i in range(max(0, len(items) - 1)):
-        next_meta = meta[i + 1]
-        if next_meta[0] != "voice":
+    mask = 0
+    for m in meta:
+        if m[0] != "voice":
             continue
+        pi = int(m[1])
+        if pi in (1, 2):
+            mask |= 1 << (pi - 1)
+    return mask & 0x03
 
-        pair_index = int(next_meta[1])
-        if pair_index not in (1, 2):
-            continue
 
-        raw = bytes(items[i])
-        if len(raw) < 4 or raw[2] != TYPE_RELAY:
-            continue
-
-        marker_type = (
-            V2C53B2R2B1_TYPE_NEXT_P1
-            if pair_index == 1
-            else V2C53B2R2B1_TYPE_NEXT_P2
-        )
-
-        marked = bytearray(raw)
-        marked[2] = marker_type
-        items[i] = bytes(marked)
-
-        count += 1
-        pair_mask |= (1 << (pair_index - 1))
-
-        print(
-            f"[rBS V2C5.3B2R2B1 NEXT] FRAME={int(frame_id)} | "
-            f"CARRIER_ITEM={i} | NEXT_ITEM={i+1} | NEXT_PAIR={pair_index} | "
-            f"TYPE=0x{marker_type:02X} | EXTRA_BYTES=0 | RF_JAM=OFF"
-        )
-
-    print(
-        f"[rBS V2C5.3B2R2B1 MARK] FRAME={int(frame_id)} | "
-        f"COUNT={count} | MASK=0x{pair_mask & 0x03:X} | "
-        "REASON=ACTUAL_NEXT_VOICE_ONLY | EXTRA_PACKET=0 | RF_JAM=OFF"
+def _v2c53b2_permission_raw(frame_id, mode, mask):
+    flags = (
+        ((int(frame_id) & 0x0F) << 4)
+        | ((int(mode) & 0x03) << 2)
+        | (int(mask) & 0x03)
     )
-    return count, pair_mask & 0x03
+    return bytes((
+        V2C1_BROADCAST & 0xFF,
+        ID_TRAM_RBS & 0xFF,
+        V2C53B2_TYPE_DL_PERMISSION,
+        flags & 0xFF,
+    ))
+
 
 
 def _v2c1_activate(st):
@@ -4119,14 +4042,27 @@ def _v2c1_downlink(radio, st):
     else:
         burst_guard_ms = V2C1_BURST_GUARD_MS
 
-    # V2C5.3B2-R2B3: alternate clean exact-two-VOICE DUAL order.
-    # items[] and meta[] always move together.
-    _v2c53b2r2b3_alternate_dual_order(st, frame_open, items, meta)
-
-    # V2C5.3B2-R2B1: exact next-VOICE marker; no packet/byte added.
-    v2c53b2r2b1_count, v2c53b2r2b1_mask = _v2c53b2r2b1_mark_next_voice(
-        st, frame_open, items, meta
-    )
+    # V2C5.3B-2: add permission ONLY for the actual clean STEADY
+    # downlink burst. meta remains unchanged so B1 audits original content.
+    v2c53b2_mask = _v2c53b2_calc_permission_mask(st, meta)
+    v2c53b2_permission_added = False
+    if v2c53b2_mask:
+        if len(items) < V2C1_MAX_BURST_ITEMS:
+            v2c53b2_mode = int(st.get("mode", V2C2_MODE_DUAL))
+            items.insert(
+                0,
+                _v2c53b2_permission_raw(
+                    frame_open,
+                    v2c53b2_mode,
+                    v2c53b2_mask,
+                ),
+            )
+            v2c53b2_permission_added = True
+        else:
+            print(
+                f"[rBS V2C5.3B2 DL_PERMISSION SKIP] FRAME={frame_open} | "
+                f"MASK=0x{v2c53b2_mask:X} | REASON=NO_BURST_ROOM | RF_JAM=OFF"
+            )
 
     t0 = time.monotonic()
     try:
@@ -4143,6 +4079,14 @@ def _v2c1_downlink(radio, st):
             st["control_queue"].insert(0, ctrl)
             st["control_keys"].add(ctrl["key"])
         return
+
+    if v2c53b2_permission_added:
+        print(
+            f"[rBS V2C5.3B2 DL_PERMISSION_TX] FRAME={frame_open} | "
+            f"MODE={_v2c2_mode_name(st.get('mode', V2C2_MODE_DUAL))} | "
+            f"DL_SAFE_MASK=0x{v2c53b2_mask:X} | "
+            f"BURST_ITEMS_WITH_PERMISSION={len(items)} | RF_JAM=OFF"
+        )
 
     # V2C5: tai day STM32 da chap nhan burst. Chi IN KE HOACH jam gia lap;
     # khong co lenh radio moi nao duoc gui.
@@ -4765,9 +4709,8 @@ def main_v2c1():
     )
     print("[rBS V2C5.2] LEASE DISTRIBUTION = ON | BITS3..2=PAIR_MASK | PREPARE_COMMIT_MASK=0 | RF_JAM=OFF")
     print("[rBS V2C5.3B1] DL_PERMISSION_SIM=ON | ACTUAL_BURST_META | CONTROL_BLOCK=ON | TRANSITION_BLOCK=ON | RF_JAM=OFF")
-    print("[rBS V2C5.3B2R2B1] NEXTVOICE_MARKER_PROBE=ON | TYPE_P1=0x2E | TYPE_P2=0x2F | EXACT_NEXT_ITEM=ON | EXTRA_PACKET=0 | SU_ACTION=OFF | RF_JAM=OFF")
-    print("[rBS V2C5.3B2R2B3] DUAL_ALTERNATE_ORDER=ON | EVEN=P1>P2/NEXT_P2 | ODD=P2>P1/NEXT_P1 | EXACT_2VOICE_ONLY=ON | EXTRA_PACKET=0 | EXTRA_BYTES=0 | RF_JAM=OFF")
 
+    print("[rBS V2C5.3B2] DL_PERMISSION_DISTRIBUTION_SIM=ON | TYPE=0x1D | FIRST_IN_SAFE_BURST=ON | RF_JAM=OFF")
     systemd_wdt = SystemdServiceWatchdog()
     systemd_wdt.start()
     systemd_wdt.progress()

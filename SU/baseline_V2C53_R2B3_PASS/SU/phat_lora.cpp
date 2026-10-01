@@ -452,427 +452,6 @@ static uint8_t su_jam53b2_permission_mask = 0;
 static uint8_t su_jam53b2_permission_frame_low = 0;
 static constexpr uint32_t SU_JAM53B2_BEACON_FRESH_MS = 260U;
 static constexpr bool SU_JAM53B2_RF_ENABLE = false;
-// V2C5.4_SU_RF_SHADOW_LITE
-
-// ============================================================
-// V2C5.4 - SU RF SHADOW LITE
-// Minimal software-only gate shadow.
-// - no GPIO
-// - no LoRa TX
-// - no per-frame Serial.printf added by this patch
-// - only one summary when the V2C5.3B2 session stops
-// ============================================================
-static bool su_rf_shadow_lite_gate = false;
-static uint32_t su_rf_shadow_lite_on_count = 0;
-static uint32_t su_rf_shadow_lite_off_count = 0;
-// V2C5.5_BENCH_RF_GATE
-static constexpr int V2C55_BENCH_GATE_PIN = 15;
-static bool v2c55_bench_gate_inited = false;
-
-static inline void V2C55_BenchGate_InitOff()
-{
-    if (!v2c55_bench_gate_inited)
-    {
-        pinMode(V2C55_BENCH_GATE_PIN, OUTPUT);
-        v2c55_bench_gate_inited = true;
-    }
-    digitalWrite(V2C55_BENCH_GATE_PIN, LOW);
-}
-
-static inline void V2C55_BenchGate_On()
-{
-    if (!v2c55_bench_gate_inited)
-        V2C55_BenchGate_InitOff();
-    digitalWrite(V2C55_BENCH_GATE_PIN, HIGH);
-}
-
-static inline void V2C55_BenchGate_Off()
-{
-    if (!v2c55_bench_gate_inited)
-        V2C55_BenchGate_InitOff();
-    else
-        digitalWrite(V2C55_BENCH_GATE_PIN, LOW);
-}
-
-// V2C5.6D_SU_SHORT_RF_PULSE
-
-// ============================================================
-// V2C5.6D - SU SHORT RF PULSE (DL FRIENDLY-JAM HELPER)
-//
-// Purpose:
-//   rBS -> DU legitimate downlink
-//   SU emits one very short partial LoRa TX pulse only when
-//   the already-proven SU SHADOW_LITE permission window turns ON.
-//
-// Bench parameters:
-//   PULSE = 350 us
-//   P_JAM = 2 dBm
-//
-// IMPORTANT:
-// - This is NOT a complete LoRa packet.
-// - endPacket(true) starts TX asynchronously.
-// - TX is forcibly aborted after PULSE_US, then normal SU PHY/RX restored.
-// - Existing marker/timing state machine is NOT modified.
-// ============================================================
-static constexpr bool V2C56D_SU_RF_ENABLE = false;
-static constexpr uint32_t V2C56D_SU_PULSE_US = 150U;
-static constexpr int8_t V2C56D_SU_JAM_POWER_DBM = 2;
-static constexpr long V2C56D_SU_NORMAL_PREAMBLE = 8;
-static constexpr long V2C56D_SU_PULSE_PREAMBLE = 4;
-
-static uint32_t v2c56d_su_pulse_ok = 0;
-static uint32_t v2c56d_su_busy_skip = 0;
-static bool v2c56d_su_busy = false;
-
-// V2C5.6F_SU_CLEAN_CW_PULSE
-
-// ============================================================
-// V2C5.6F - SU CLEAN CW PULSE
-//
-// V2C5.6D used LoRa.endPacket(true) and then forcibly aborted an
-// unfinished LoRa packet. On SU that can disturb packet-engine/FIFO/IRQ
-// state before the next legitimate UL block.
-//
-// V2C5.6F does NOT create or abort a LoRa packet.
-// It temporarily switches SX1278 to FSK continuous-data mode with
-// Fdev=0, so the PA emits a short unmodulated carrier.
-// Then it switches cleanly back to LoRa and reapplies the normal PHY.
-//
-// Existing V2C5.6E permission/timing remains unchanged.
-// ============================================================
-
-static constexpr uint8_t V2C56F_REG_OP_MODE       = 0x01;
-static constexpr uint8_t V2C56F_REG_BITRATE_MSB   = 0x02;
-static constexpr uint8_t V2C56F_REG_BITRATE_LSB   = 0x03;
-static constexpr uint8_t V2C56F_REG_FDEV_MSB      = 0x04;
-static constexpr uint8_t V2C56F_REG_FDEV_LSB      = 0x05;
-static constexpr uint8_t V2C56F_REG_PA_CONFIG     = 0x09;
-static constexpr uint8_t V2C56F_REG_IRQ_FLAGS     = 0x12;
-static constexpr uint8_t V2C56F_REG_PACKET_CFG2   = 0x31;
-
-static uint32_t v2c56f_restore_fail = 0;
-static uint32_t v2c56f_cycle_max_us = 0;
-static uint32_t v2c56f_cycle_sum_us = 0;
-static uint32_t v2c56f_cycle_count = 0;
-
-static inline uint8_t V2C56F_ReadReg(uint8_t addr)
-{
-    SPI.beginTransaction(SPISettings(8000000, MSBFIRST, SPI_MODE0));
-    digitalWrite(LORA_CS, LOW);
-    SPI.transfer(addr & 0x7F);
-    uint8_t v = SPI.transfer(0x00);
-    digitalWrite(LORA_CS, HIGH);
-    SPI.endTransaction();
-    return v;
-}
-
-static inline void V2C56F_WriteReg(uint8_t addr, uint8_t value)
-{
-    SPI.beginTransaction(SPISettings(8000000, MSBFIRST, SPI_MODE0));
-    digitalWrite(LORA_CS, LOW);
-    SPI.transfer(addr | 0x80);
-    SPI.transfer(value);
-    digitalWrite(LORA_CS, HIGH);
-    SPI.endTransaction();
-}
-
-static void V2C56F_ApplyNormalLoRa()
-{
-    uint8_t op = V2C56F_ReadReg(V2C56F_REG_OP_MODE);
-    uint8_t lf = op & 0x08;  // 433 MHz => LowFrequencyModeOn
-
-    if ((op & 0x80) == 0)
-    {
-        V2C56F_WriteReg(V2C56F_REG_OP_MODE, lf | 0x00);
-        V2C56F_WriteReg(V2C56F_REG_OP_MODE, 0x80 | lf | 0x00);
-    }
-    else
-    {
-        V2C56F_WriteReg(V2C56F_REG_OP_MODE, 0x80 | lf | 0x00);
-    }
-
-    LoRa.setSpreadingFactor(SF_SU);
-    LoRa.setSignalBandwidth(500E3);
-    LoRa.setCodingRate4(5);
-    LoRa.enableCrc();
-    LoRa.setPreambleLength(V2C56D_SU_NORMAL_PREAMBLE);
-    LoRa.setTxPower(CONG_SUAT_SU_DBM);
-
-    V2C56F_WriteReg(V2C56F_REG_IRQ_FLAGS, 0xFF);
-    LoRa.receive();
-
-    uint8_t verify = V2C56F_ReadReg(V2C56F_REG_OP_MODE);
-    if ((verify & 0x80) == 0)
-        ++v2c56f_restore_fail;
-}
-
-static bool V2C56D_SU_ShortPulse()
-{
-    if (!V2C56D_SU_RF_ENABLE)
-        return false;
-
-    if (v2c56d_su_busy)
-    {
-        ++v2c56d_su_busy_skip;
-        return false;
-    }
-
-    v2c56d_su_busy = true;
-    const uint32_t t0 = micros();
-
-    LoRa.idle();
-
-    const uint8_t op_saved = V2C56F_ReadReg(V2C56F_REG_OP_MODE);
-    const uint8_t lf = op_saved & 0x08;
-    const uint8_t pa_saved = V2C56F_ReadReg(V2C56F_REG_PA_CONFIG);
-
-    // LongRangeMode may only change in SLEEP:
-    // LoRa sleep -> FSK sleep.
-    V2C56F_WriteReg(V2C56F_REG_OP_MODE, 0x80 | lf | 0x00);
-    V2C56F_WriteReg(V2C56F_REG_OP_MODE, lf | 0x00);
-
-    // FSK continuous-data mode, Fdev=0 => DATA does not move RF frequency.
-    // Nominal 100 kbps bit clock: 32 MHz / 100 k = 320 = 0x0140.
-    V2C56F_WriteReg(V2C56F_REG_BITRATE_MSB, 0x01);
-    V2C56F_WriteReg(V2C56F_REG_BITRATE_LSB, 0x40);
-    V2C56F_WriteReg(V2C56F_REG_FDEV_MSB, 0x00);
-    V2C56F_WriteReg(V2C56F_REG_FDEV_LSB, 0x00);
-
-    uint8_t packet_cfg2 = V2C56F_ReadReg(V2C56F_REG_PACKET_CFG2);
-    packet_cfg2 &= (uint8_t)~0x40;  // DataMode=0 -> continuous
-    V2C56F_WriteReg(V2C56F_REG_PACKET_CFG2, packet_cfg2);
-
-    // PA_BOOST, +2 dBm.
-    V2C56F_WriteReg(V2C56F_REG_PA_CONFIG, 0x80);
-
-    // Small settle interval before TX.
-    V2C56F_WriteReg(V2C56F_REG_OP_MODE, lf | 0x01);  // FSK standby
-    delayMicroseconds(300);
-
-    // Short continuous carrier.
-    V2C56F_WriteReg(V2C56F_REG_OP_MODE, lf | 0x03);  // FSK TX
-    delayMicroseconds(V2C56D_SU_PULSE_US);
-
-    // Cleanly stop TX.
-    V2C56F_WriteReg(V2C56F_REG_OP_MODE, lf | 0x01);
-    delayMicroseconds(50);
-    V2C56F_WriteReg(V2C56F_REG_OP_MODE, lf | 0x00);
-
-    // FSK sleep -> LoRa sleep, restore PA, then full normal PHY.
-    V2C56F_WriteReg(V2C56F_REG_OP_MODE, 0x80 | lf | 0x00);
-    V2C56F_WriteReg(V2C56F_REG_PA_CONFIG, pa_saved);
-    V2C56F_ApplyNormalLoRa();
-
-    const uint32_t dt = micros() - t0;
-    ++v2c56f_cycle_count;
-    v2c56f_cycle_sum_us += dt;
-    if (dt > v2c56f_cycle_max_us)
-        v2c56f_cycle_max_us = dt;
-
-    ++v2c56d_su_pulse_ok;
-    v2c56d_su_busy = false;
-    return true;
-}
-
-static void V2C56D_SU_ForceNormal()
-{
-    V2C56F_ApplyNormalLoRa();
-    v2c56d_su_busy = false;
-}
-
-static void V2C56F_SU_Summary(const char *reason)
-{
-    const uint32_t avg =
-        (v2c56f_cycle_count > 0)
-            ? (v2c56f_cycle_sum_us / v2c56f_cycle_count)
-            : 0U;
-
-    Serial.printf(
-        "[SU V2C5.6F CLEAN CW SUMMARY] PAIR=%u | "
-        "CW_OK=%u | RESTORE_FAIL=%u | CYCLE_AVG=%uus | CYCLE_MAX=%uus | "
-        "REASON=%s\n",
-        (unsigned int)V2C_PAIR_INDEX,
-        (unsigned int)v2c56d_su_pulse_ok,
-        (unsigned int)v2c56f_restore_fail,
-        (unsigned int)avg,
-        (unsigned int)v2c56f_cycle_max_us,
-        reason != nullptr ? reason : "UNKNOWN"
-    );
-}
-
-static void V2C56D_SU_ResetStats()
-{
-    v2c56d_su_pulse_ok = 0;
-    v2c56d_su_busy_skip = 0;
-    v2c56d_su_busy = false;
-    v2c56f_restore_fail = 0;
-    v2c56f_cycle_max_us = 0;
-    v2c56f_cycle_sum_us = 0;
-    v2c56f_cycle_count = 0;
-}
-
-static void V2C56D_SU_Summary(const char *reason)
-{
-    Serial.printf(
-        "[SU V2C5.6D RF PULSE SUMMARY] PAIR=%u | PULSE=%uus | P_JAM=%d dBm | "
-        "PULSE_OK=%u | BUSY_SKIP=%u | REASON=%s\n",
-        (unsigned int)V2C_PAIR_INDEX,
-        (unsigned int)V2C56D_SU_PULSE_US,
-        (int)V2C56D_SU_JAM_POWER_DBM,
-        (unsigned int)v2c56d_su_pulse_ok,
-        (unsigned int)v2c56d_su_busy_skip,
-        reason != nullptr ? reason : "UNKNOWN"
-    );
-}
-
-// V2C5.6E_SU_SAFE_PULSE_TIMING
-
-// ============================================================
-// V2C5.6E - SU SAFE PULSE TIMING
-//
-// V2C5.6D emitted the short RF pulse immediately when SHADOW_LITE
-// turned ON. V2C5.6E keeps the same short-pulse backend, pulse
-// width and P_JAM, but delays the pulse non-blockingly.
-//
-// Existing SU helper window observed in the current baseline:
-//   START_SIM ~ AGE_FROM_PERMISSION=10 ms
-//   STOP_SIM  ~ AGE_FROM_PERMISSION=53 ms
-//
-// With delay=22 ms:
-//   expected pulse ~ AGE_FROM_PERMISSION=32 ms
-//
-// OFF / ABORT / session-stop cancels a pending pulse.
-// ============================================================
-static constexpr uint32_t V2C56E_SU_DELAY_AFTER_START_MS = 22U;
-
-static bool v2c56e_su_pending = false;
-static uint32_t v2c56e_su_due_ms = 0;
-static uint32_t v2c56e_su_armed = 0;
-static uint32_t v2c56e_su_fired = 0;
-static uint32_t v2c56e_su_cancelled = 0;
-
-static inline bool V2C56E_SU_TimeReached(uint32_t now, uint32_t deadline)
-{
-    return (int32_t)(now - deadline) >= 0;
-}
-
-static void V2C56E_SU_Reset()
-{
-    v2c56e_su_pending = false;
-    v2c56e_su_due_ms = 0;
-    v2c56e_su_armed = 0;
-    v2c56e_su_fired = 0;
-    v2c56e_su_cancelled = 0;
-}
-
-static void V2C56E_SU_Arm()
-{
-    if (!V2C56D_SU_RF_ENABLE)
-        return;
-
-    v2c56e_su_due_ms = millis() + V2C56E_SU_DELAY_AFTER_START_MS;
-    v2c56e_su_pending = true;
-    ++v2c56e_su_armed;
-}
-
-static void V2C56E_SU_Cancel()
-{
-    if (v2c56e_su_pending)
-    {
-        v2c56e_su_pending = false;
-        v2c56e_su_due_ms = 0;
-        ++v2c56e_su_cancelled;
-    }
-}
-
-static void V2C56E_SU_Service()
-{
-    if (!v2c56e_su_pending)
-        return;
-
-    if (!su_rf_shadow_lite_gate)
-    {
-        V2C56E_SU_Cancel();
-        return;
-    }
-
-    const uint32_t now = millis();
-    if (!V2C56E_SU_TimeReached(now, v2c56e_su_due_ms))
-        return;
-
-    v2c56e_su_pending = false;
-    v2c56e_su_due_ms = 0;
-
-    if (V2C56D_SU_ShortPulse())
-        ++v2c56e_su_fired;
-}
-
-static void V2C56E_SU_Summary(const char *reason)
-{
-    Serial.printf(
-        "[SU V2C5.6E SAFE TIMING SUMMARY] PAIR=%u | DELAY=%ums | "
-        "ARMED=%u | FIRED=%u | CANCELLED=%u | PENDING=%u | REASON=%s\n",
-        (unsigned int)V2C_PAIR_INDEX,
-        (unsigned int)V2C56E_SU_DELAY_AFTER_START_MS,
-        (unsigned int)v2c56e_su_armed,
-        (unsigned int)v2c56e_su_fired,
-        (unsigned int)v2c56e_su_cancelled,
-        v2c56e_su_pending ? 1U : 0U,
-        reason != nullptr ? reason : "UNKNOWN"
-    );
-}
-
-static inline void SU_RFShadowLite_Reset()
-{
-    V2C56E_SU_Cancel();
-    V2C56D_SU_ForceNormal();
-    V2C56D_SU_ResetStats();
-    V2C56E_SU_Reset();
-    V2C55_BenchGate_InitOff();
-    su_rf_shadow_lite_gate = false;
-    su_rf_shadow_lite_on_count = 0;
-    su_rf_shadow_lite_off_count = 0;
-}
-
-static inline void SU_RFShadowLite_On()
-{
-    if (!su_rf_shadow_lite_gate)
-    {
-        su_rf_shadow_lite_gate = true;
-        V2C55_BenchGate_On();
-        V2C56E_SU_Arm();
-        ++su_rf_shadow_lite_on_count;
-    }
-}
-
-static inline void SU_RFShadowLite_Off()
-{
-    if (su_rf_shadow_lite_gate)
-    {
-        V2C56E_SU_Cancel();
-        V2C56D_SU_ForceNormal();
-        V2C55_BenchGate_Off();
-        su_rf_shadow_lite_gate = false;
-        ++su_rf_shadow_lite_off_count;
-    }
-}
-
-static void SU_RFShadowLite_Summary(const char *reason)
-{
-    V2C56E_SU_Summary(reason);
-    V2C56F_SU_Summary(reason);
-    V2C56D_SU_Summary(reason);
-    Serial.printf(
-        "[SU V2C5.4 SHADOW_LITE SUMMARY] PAIR=%u | ON=%u | OFF=%u | ACTIVE=%u | "
-        "REASON=%s | RF_TX=0 | RF_JAM=OFF\\n",
-        (unsigned int)V2C_PAIR_INDEX,
-        (unsigned int)su_rf_shadow_lite_on_count,
-        (unsigned int)su_rf_shadow_lite_off_count,
-        su_rf_shadow_lite_gate ? 1U : 0U,
-        reason != nullptr ? reason : "UNKNOWN"
-    );
-}
-
 
 static bool SU_Jam53B2_TimeReached(uint32_t now, uint32_t deadline)
 {
@@ -886,7 +465,6 @@ static uint8_t SU_Jam53B2_MyBit()
 
 void SU_Jam53B2_Prepare(uint64_t session_id)
 {
-    SU_RFShadowLite_Reset();
     su_jam53b2_session_id = session_id;
     su_jam53b2_state = SU_JAM53B2_PREPARED;
     su_jam53b2_permission_mask = 0;
@@ -903,11 +481,8 @@ void SU_Jam53B2_Stop(const char *reason)
         su_jam53b2_state != SU_JAM53B2_IDLE
         || su_jam53b2_session_id != 0;
 
-    SU_RFShadowLite_Off();
-
     if (had_state)
     {
-        SU_RFShadowLite_Summary(reason);
         Serial.printf(
             "[SU JAM V2C5.3B2 STOP] PAIR=%u | SESSION=%016llX | STATE=%u | REASON=%s | RF_JAM=OFF\n",
             (unsigned int)V2C_PAIR_INDEX,
@@ -999,7 +574,6 @@ static void SU_Jam53B2_OnNextVoiceMarker(uint8_t marker_pair)
 
     if (su_jam53b2_state == SU_JAM53B2_ACTIVE)
     {
-        SU_RFShadowLite_Off();
         Serial.printf(
             "[SU JAM V2C5.3B2R2B2 ABORT_SIM] PAIR=%u | "
             "REASON=NEW_MARKER | RF_JAM=OFF\n",
@@ -1039,7 +613,6 @@ static void SU_Jam53B2_OnNextVoiceMarker(uint8_t marker_pair)
 }
 static void SU_Jam53B2_Service()
 {
-    V2C56E_SU_Service();
     if (
         su_jam53b2_session_id == 0
         || su_jam53b2_state == SU_JAM53B2_IDLE
@@ -1055,7 +628,6 @@ static void SU_Jam53B2_Service()
     )
     {
         su_jam53b2_state = SU_JAM53B2_ACTIVE;
-        SU_RFShadowLite_On();
         Serial.printf(
             "[SU JAM V2C5.3B2R2B2 START_SIM] PAIR=%u | FRAME_LOW=%u | MODE=%u | AGE_FROM_PERMISSION=%ums | RF_JAM=OFF\n",
             (unsigned int)V2C_PAIR_INDEX,
@@ -1071,7 +643,6 @@ static void SU_Jam53B2_Service()
     )
     {
         su_jam53b2_state = SU_JAM53B2_PREPARED;
-        SU_RFShadowLite_Off();
         Serial.printf(
             "[SU JAM V2C5.3B2R2B2 STOP_SIM] PAIR=%u | FRAME_LOW=%u | MODE=%u | AGE_FROM_PERMISSION=%ums | "
             "REASON=WINDOW_END | RF_JAM=OFF\n",

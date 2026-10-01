@@ -54,7 +54,7 @@ extern U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2;
 // tach audio real-time khoi radio de co baseline on dinh truoc khi them slot.
 // ========================================================
 #define SU_STREAMING_V1 1
-#define SU_STREAM_FRAME_QUEUE_DEPTH 48
+#define SU_STREAM_FRAME_QUEUE_DEPTH 128
 
 // ========================================================
 // STREAMING V2C0 - CAPACITY PROFILE 600 ms (BENCH 1 SU + 1 DU)
@@ -87,7 +87,7 @@ extern U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2;
 #define V2C2_MODE_SINGLE1 1U
 #define V2C2_MODE_SINGLE2 2U
 #define V2C2_MODE_DUAL    3U
-#define V2C2_SINGLE_ACTIVE_UL_OFFSET_MS 12U
+#define V2C2_SINGLE_ACTIVE_UL_OFFSET_MS 22U
 #define V2C2_SINGLE_ACTIVE_UL_LATEST_MS 32U
 // V2C4.5 JOIN SLOT FIX:
 // SINGLE HQ transmits two 106B VOICE packets from +12 ms. At SF7/BW500 their
@@ -986,6 +986,119 @@ static SUV2C2ProvisionalAck su_v2c2_provisional_ack = {};
 static uint8_t su_v2b_consecutive_beacon_miss = 0;
 
 
+// ========================================================
+// V2C5.2 - FRIENDLY-JAM LEASE DISTRIBUTION (SIM ONLY)
+//
+// rBS dung bits3..2 cua schedule_ctl lam pair-mask:
+//   bit0 = PAIR1 co lease, bit1 = PAIR2 co lease.
+// SU CHI doi state PREPARED/ARMED de kiem tra giao thuc.
+// KHONG co ham TX nhiem, KHONG doi cong suat, RF_JAM luon OFF.
+// ========================================================
+enum SUJam52State : uint8_t
+{
+    SU_JAM52_IDLE = 0,
+    SU_JAM52_PREPARED = 1,
+    SU_JAM52_ARMED = 2
+};
+
+static SUJam52State su_jam52_state = SU_JAM52_IDLE;
+static uint64_t su_jam52_session_id = 0;
+static uint32_t su_jam52_last_frame = 0;
+static uint8_t su_jam52_last_mask = 0;
+static constexpr bool SU_JAM52_RF_ENABLE = false;
+
+static uint8_t SU_Jam52_MyMaskBit()
+{
+    return (uint8_t)(1U << (V2C_PAIR_INDEX - 1U));
+}
+
+static void SU_Jam52_Prepare(uint64_t session_id)
+{
+    su_jam52_session_id = session_id;
+    su_jam52_state = SU_JAM52_PREPARED;
+    su_jam52_last_mask = 0;
+    Serial.printf(
+        "[SU JAM V2C5.2 PREPARED] PAIR=%u | SESSION=%016llX | WAIT_BEACON_LEASE=1 | RF_JAM=OFF\n",
+        (unsigned int)V2C_PAIR_INDEX,
+        (unsigned long long)session_id
+    );
+}
+
+static void SU_Jam52_Stop(const char *reason)
+{
+    if (su_jam52_state != SU_JAM52_IDLE || su_jam52_session_id != 0)
+    {
+        Serial.printf(
+            "[SU JAM V2C5.2 STOP] PAIR=%u | SESSION=%016llX | REASON=%s | RF_JAM=OFF\n",
+            (unsigned int)V2C_PAIR_INDEX,
+            (unsigned long long)su_jam52_session_id,
+            reason != nullptr ? reason : "UNKNOWN"
+        );
+    }
+    su_jam52_state = SU_JAM52_IDLE;
+    su_jam52_session_id = 0;
+    su_jam52_last_mask = 0;
+}
+
+static void SU_Jam52_OnBeacon(const SUV2BBeaconState &b)
+{
+    if (SU_JAM52_RF_ENABLE)
+    {
+        // Hard fail-safe: V2C5.2 khong co duong phat RF.
+        SU_Jam52_Stop("RF_ENABLE_FORBIDDEN");
+        SU_Jam53B2_Stop("RF_ENABLE_FORBIDDEN");
+        return;
+    }
+
+    if (su_jam52_session_id == 0 || su_jam52_state == SU_JAM52_IDLE)
+        return;
+
+    const uint8_t my_bit = SU_Jam52_MyMaskBit();
+    const bool allowed =
+        !b.synthetic_holdover
+        && b.transition_target == 0U
+        && ((b.jam_policy & my_bit) != 0U);
+
+    const SUJam52State old_state = su_jam52_state;
+    su_jam52_last_frame = b.frame_id;
+    su_jam52_last_mask = b.jam_policy;
+
+    if (allowed)
+    {
+        su_jam52_state = SU_JAM52_ARMED;
+        if (old_state != SU_JAM52_ARMED)
+        {
+            Serial.printf(
+                "[SU JAM V2C5.2 ARMED] PAIR=%u | FRAME=%u | MODE=%u | LEASE_MASK=0x%X | SESSION=%016llX | RF_JAM=OFF\n",
+                (unsigned int)V2C_PAIR_INDEX,
+                (unsigned int)b.frame_id,
+                (unsigned int)b.schedule_mode,
+                (unsigned int)b.jam_policy,
+                (unsigned long long)su_jam52_session_id
+            );
+        }
+    }
+    else
+    {
+        su_jam52_state = SU_JAM52_PREPARED;
+        if (old_state == SU_JAM52_ARMED)
+        {
+            const char *why = b.synthetic_holdover
+                ? "HOLDOVER_NO_LEASE"
+                : (b.transition_target != 0U ? "PREPARE_TRANSITION" : "LEASE_REVOKED");
+            Serial.printf(
+                "[SU JAM V2C5.2 REVOKE] PAIR=%u | FRAME=%u | MODE=%u | LEASE_MASK=0x%X | REASON=%s | RF_JAM=OFF\n",
+                (unsigned int)V2C_PAIR_INDEX,
+                (unsigned int)b.frame_id,
+                (unsigned int)b.schedule_mode,
+                (unsigned int)b.jam_policy,
+                why
+            );
+        }
+    }
+}
+
+
 static void SU_V2B_ResetSync()
 {
     memset(&su_v2b_beacon, 0, sizeof(su_v2b_beacon));
@@ -1055,6 +1168,7 @@ static bool SU_V2B_WaitBeacon(uint32_t timeout_ms)
     su_v2b_beacon.fec_grant_pair = fec_grant_pair;
     su_v2b_beacon.rx_ms = rx_ms;
     su_v2b_beacon.synthetic_holdover = false;
+    SU_Jam52_OnBeacon(su_v2b_beacon);
     return true;
 }
 
@@ -1144,6 +1258,7 @@ static bool SU_V2C2_WaitNextBeaconOrHoldover(
     su_v2b_beacon.fec_grant_pair = 0U;
     su_v2b_beacon.rx_ms = expected_rx_ms;
     su_v2b_beacon.synthetic_holdover = true;
+    SU_Jam52_OnBeacon(su_v2b_beacon);
 
     Serial.printf(
         "[SU V2C2.2 HOLDOVER] FRAME=%u | MODE=%u | FROM_FRAME=%u | PREP_TARGET=%u | FEC=OFF | VALID=1_FRAME\n",
@@ -1653,6 +1768,8 @@ static bool SU_Stream_ThietLapSession(uint64_t &session_id_tx)
 {
     session_id_tx = Tao_Session_Moi();
     HMI_SU_Dat_Session(session_id_tx);
+    SU_Jam52_Prepare(session_id_tx);
+    SU_Jam53B2_Prepare(session_id_tx);
 
     uint8_t goi_session[SIZE_SESSION_PACKET_SU];
     Tao_GoiTin_SessionStart(goi_session);
@@ -1921,7 +2038,7 @@ static void SU_Stream_ChayMotPhien()
     }
 
     Serial.println(
-        ">> STREAM V2C4.6: ADMISSION_LOCK + PROFILE_TRANSITION_SAFE + QUEUE_48 | SINGLE=HQ3950 | DUAL=LQ2150 | JAM=OFF"
+        ">> STREAM V2C5.2: ADMISSION_LOCK + JAM_LEASE_SIM + QUEUE_48 | SINGLE=HQ3950 | DUAL=LQ2150 | RF_JAM=OFF"
     );
 
     uint64_t session_id_tx = 0;
@@ -1931,6 +2048,8 @@ static void SU_Stream_ChayMotPhien()
         Serial.println(
             "[SU STREAM SESSION FAIL] DUNG CAPTURE, BO AUDIO DANG CHO"
         );
+        SU_Jam52_Stop("SESSION_FAIL");
+        SU_Jam53B2_Stop("SESSION_FAIL");
 
         SU_Stream_DungThu();
         xQueueReset(su_stream_frame_queue);
@@ -1950,7 +2069,7 @@ static void SU_Stream_ChayMotPhien()
     );
 
     Serial.printf(
-        "[SU V2C4.6 SESSION READY] PAIR=%u | SU=0x%02X DU=0x%02X | SESSION=%016llX | SINGLE=300ms/HQ8+7 | DUAL=300ms/LQ15 | SCHED=7 PREPARE_COMMIT | HOLDOVER=1 | FEC=8+1 | JAM=OFF\n",
+        "[SU V2C5.2 SESSION READY] PAIR=%u | SU=0x%02X DU=0x%02X | SESSION=%016llX | SINGLE=300ms/HQ8+7 | DUAL=300ms/LQ15 | SCHED=7 PREPARE_COMMIT | HOLDOVER=1 | FEC=8+1 | JAM_LEASE_SIM=ON | RF_JAM=OFF\n",
         (unsigned int)V2C_PAIR_INDEX,
         (unsigned int)V2C_SU_ID,
         (unsigned int)V2C_DU_ID,
@@ -1984,14 +2103,67 @@ static void SU_Stream_ChayMotPhien()
 
     bool gui_that_bai = false;
 
+    // V2C56G2B_SINGLE_BACKLOG_LQ_RESCUE
+    // Chi la audio-profile rescue o SINGLE. KHONG lien quan friendly-jamming.
+    bool v2c56g2b_lq_rescue = false;
+
     while (!gui_that_bai)
     {
         SU_WDT_Feed();
 
-        // V2C4.6: profile cap nhat ca PREPARE. PREPARE->DUAL doi LQ SOM
-        // mot frame; DUAL->SINGLE chi doi HQ sau COMMIT.
+        // V2C4.6 + V2C56G2B:
+        // - Scheduler van quyet dinh HQ/LQ theo SINGLE/PREPARE/DUAL nhu cu.
+        // - Rieng SINGLE cua chinh Pair: neu queue cao, tam capture LQ de tao
+        //   headroom. SINGLE gui 2 packet/300ms; 2 LQ packet co the mang 600ms
+        //   audio, nen backlog co co hoi giam ma KHONG drop frame cu.
+        // - Khi queue xuong thap, tu dong quay lai HQ.
+        // - KHONG sua packet, TDMA, AES/FEC hay friendly-jamming.
         if (su_v2b_beacon.valid)
-            su_stream_encode_hq = SU_V2C46_CaptureShouldUseHQ();
+        {
+            const bool scheduler_hq = SU_V2C46_CaptureShouldUseHQ();
+            const bool single_for_me_rescue =
+                SU_V2C2_ModeIsSingleForMe(su_v2b_beacon.schedule_mode);
+            const UBaseType_t q_now =
+                uxQueueMessagesWaiting(su_stream_frame_queue);
+
+            if (scheduler_hq && single_for_me_rescue)
+            {
+                if (!v2c56g2b_lq_rescue && q_now >= 24U)
+                {
+                    v2c56g2b_lq_rescue = true;
+                    Serial.printf(
+                        "[SU V2C56G2B LQ RESCUE ON] QUEUE=%u | HIGH=24 | LOW=8 | MODE=%u\n",
+                        (unsigned int)q_now,
+                        (unsigned int)su_v2b_beacon.schedule_mode
+                    );
+                }
+                else if (v2c56g2b_lq_rescue && q_now <= 8U)
+                {
+                    v2c56g2b_lq_rescue = false;
+                    Serial.printf(
+                        "[SU V2C56G2B LQ RESCUE OFF] QUEUE=%u | REASON=RECOVERED\n",
+                        (unsigned int)q_now
+                    );
+                }
+
+                su_stream_encode_hq = !v2c56g2b_lq_rescue;
+            }
+            else
+            {
+                if (v2c56g2b_lq_rescue)
+                {
+                    Serial.printf(
+                        "[SU V2C56G2B LQ RESCUE OFF] QUEUE=%u | REASON=SCHEDULER_LQ_OR_TRANSITION | MODE=%u | NEXT=%u\n",
+                        (unsigned int)q_now,
+                        (unsigned int)su_v2b_beacon.schedule_mode,
+                        (unsigned int)su_v2b_beacon.transition_target
+                    );
+                }
+
+                v2c56g2b_lq_rescue = false;
+                su_stream_encode_hq = scheduler_hq;
+            }
+        }
 
         // V2C4 packetization theo CHINH superframe 300 ms:
         // - SINGLE binh thuong: HQ 8+7 frame = 300 ms.
@@ -2188,6 +2360,11 @@ static void SU_Stream_ChayMotPhien()
         (unsigned int)audio_diag.clip_count,
         (unsigned int)audio_diag.frame_size_error_count
     );
+
+    // V2C5.2: het luong VOICE cuc bo -> thu hoi lease truoc AUDIO_END.
+    // START/STOP RF chua duoc trien khai; day chi la state machine gia lap.
+    SU_Jam52_Stop(gui_that_bai ? "ARQ_FAIL" : "LOCAL_AUDIO_END");
+    SU_Jam53B2_Stop(gui_that_bai ? "ARQ_FAIL" : "LOCAL_AUDIO_END");
 
     // V2C2.4: PLAY_STARTED chi con la diagnostic legacy.
     // Khong block sau AUDIO_END nua vi streaming DU da phat tu truoc END;

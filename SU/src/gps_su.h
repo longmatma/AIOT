@@ -11,7 +11,7 @@
 // =====================================================
 #define GPS_SU_UART_RX_PIN 18
 #define GPS_SU_UART_TX_PIN 17
-#define GPS_SU_UART_BAUD   4800
+#define GPS_SU_UART_BAUD   9600
 
 // Fix cu hon nguong nay se khong duoc coi la toa do hop le.
 #define GPS_SU_TUOI_FIX_TOI_DA_MS 5000UL

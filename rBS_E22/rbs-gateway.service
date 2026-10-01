@@ -13,8 +13,9 @@ WorkingDirectory=/home/pi5/rBS_AIOT
 Environment=PYTHONUNBUFFERED=1
 Environment=RBS_STM_UART=/dev/serial0
 Environment=RBS_STM_BAUD=1000000
-Environment=RBS_BUILD_TAG=V2C4_4_JOIN_PROMOTION
+Environment=RBS_BUILD_TAG=V2C5_2_JAM_LEASE_DISTRIBUTION_SIM
 Environment=RBS_SYSTEMD_MAIN_STALL_S=12
+Environment=RBS_JAM_DRYRUN=1
 
 ExecStartPre=/bin/sleep 2
 ExecStart=/home/pi5/rBS_AIOT/.venv/bin/python3 /home/pi5/rBS_AIOT/rbs_gateway.py

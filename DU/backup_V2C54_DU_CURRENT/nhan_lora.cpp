@@ -113,379 +113,6 @@ static constexpr uint32_t DU_JAM53_BEACON_FAILSAFE_MS = 700U;
 
 // HARD LOCK: V2C5.3A chi log START/STOP_SIM, khong co duong phat RF.
 static constexpr bool DU_JAM53_RF_ENABLE = false;
-// V2C5.4_DU_RF_SHADOW_LITE
-
-// ============================================================
-// V2C5.4 - DU RF SHADOW LITE
-// Minimal software-only gate shadow.
-// - no GPIO
-// - no LoRa TX
-// - no extra per-window Serial.printf
-// - one summary at session stop
-// ============================================================
-static bool du_rf_shadow_lite_gate = false;
-static uint32_t du_rf_shadow_lite_on_count = 0;
-static uint32_t du_rf_shadow_lite_off_count = 0;
-// V2C5.5_BENCH_RF_GATE
-static constexpr int V2C55_BENCH_GATE_PIN = 15;
-static bool v2c55_bench_gate_inited = false;
-
-static inline void V2C55_BenchGate_InitOff()
-{
-    if (!v2c55_bench_gate_inited)
-    {
-        pinMode(V2C55_BENCH_GATE_PIN, OUTPUT);
-        v2c55_bench_gate_inited = true;
-    }
-    digitalWrite(V2C55_BENCH_GATE_PIN, LOW);
-}
-
-static inline void V2C55_BenchGate_On()
-{
-    if (!v2c55_bench_gate_inited)
-        V2C55_BenchGate_InitOff();
-    digitalWrite(V2C55_BENCH_GATE_PIN, HIGH);
-}
-
-static inline void V2C55_BenchGate_Off()
-{
-    if (!v2c55_bench_gate_inited)
-        V2C55_BenchGate_InitOff();
-    else
-        digitalWrite(V2C55_BENCH_GATE_PIN, LOW);
-}
-
-// V2C5.6B_RF_MICROBURST
-
-// ============================================================
-// V2C5.6B - DU FRIENDLY-JAM MICROBURST
-// One 1-byte LoRa microburst per granted UL helper window.
-// Existing bounded DU TX timeout/recovery is reused.
-// ============================================================
-static constexpr bool V2C56B_RF_ENABLE = false;
-static constexpr int8_t V2C56B_JAM_POWER_DBM_DEFAULT = 2;
-static constexpr long V2C56B_NORMAL_PREAMBLE = 8;
-static constexpr long V2C56B_MICRO_PREAMBLE = 4;
-
-static int8_t v2c56b_jam_power_dbm = V2C56B_JAM_POWER_DBM_DEFAULT;
-static uint32_t v2c56b_ok = 0;
-static uint32_t v2c56b_fail = 0;
-static uint32_t v2c56b_mutex_skip = 0;
-static uint32_t v2c56b_seq = 0;
-
-// Existing V2C4.7A function, defined later in nhan_lora.cpp.
-static int DU_LoRa_EndPacket_CoTimeout(const char *tag);
-
-static bool V2C56B_DU_Microburst()
-{
-    if (!V2C56B_RF_ENABLE)
-        return false;
-
-    if (LoRa_Mutex == nullptr)
-    {
-        ++v2c56b_mutex_skip;
-        return false;
-    }
-
-    if (xSemaphoreTake(LoRa_Mutex, pdMS_TO_TICKS(2)) != pdTRUE)
-    {
-        ++v2c56b_mutex_skip;
-        return false;
-    }
-
-    const uint8_t b =
-        (uint8_t)(0x5AU ^ (uint8_t)V2C_PAIR_INDEX ^ (uint8_t)(++v2c56b_seq));
-
-    LoRa.idle();
-    LoRa.setTxPower(v2c56b_jam_power_dbm);
-    LoRa.setPreambleLength(V2C56B_MICRO_PREAMBLE);
-    LoRa.beginPacket();
-    LoRa.write(&b, 1);
-    const int ok = DU_LoRa_EndPacket_CoTimeout("V2C56B_MICRO");
-
-    LoRa.setPreambleLength(V2C56B_NORMAL_PREAMBLE);
-    LoRa.setTxPower(CONG_SUAT_PHAT_DU_DBM);
-    LoRa.receive();
-    xSemaphoreGive(LoRa_Mutex);
-
-    if (ok == 1)
-    {
-        ++v2c56b_ok;
-        return true;
-    }
-
-    ++v2c56b_fail;
-    return false;
-}
-
-static void V2C56B_DU_ForceNormal()
-{
-    if (!V2C56B_RF_ENABLE || LoRa_Mutex == nullptr)
-        return;
-
-    if (xSemaphoreTake(LoRa_Mutex, 0) == pdTRUE)
-    {
-        LoRa.idle();
-        LoRa.setPreambleLength(V2C56B_NORMAL_PREAMBLE);
-        LoRa.setTxPower(CONG_SUAT_PHAT_DU_DBM);
-        LoRa.receive();
-        xSemaphoreGive(LoRa_Mutex);
-    }
-}
-
-static void V2C56B_DU_ResetStats()
-{
-    v2c56b_ok = 0;
-    v2c56b_fail = 0;
-    v2c56b_mutex_skip = 0;
-}
-
-static void V2C56B_DU_Summary(const char *reason)
-{
-    Serial.printf(
-        "[DU V2C5.6B RF SUMMARY] PAIR=%u | ENABLE=%u | P_JAM=%d dBm | "
-        "MICRO=1B/PRE4 | OK=%u | FAIL=%u | MUTEX_SKIP=%u | REASON=%s\n",
-        (unsigned int)V2C_PAIR_INDEX,
-        V2C56B_RF_ENABLE ? 1U : 0U,
-        (int)v2c56b_jam_power_dbm,
-        (unsigned int)v2c56b_ok,
-        (unsigned int)v2c56b_fail,
-        (unsigned int)v2c56b_mutex_skip,
-        reason != nullptr ? reason : "UNKNOWN"
-    );
-}
-
-// V2C5.6D_DU_SHORT_RF_PULSE
-
-// ============================================================
-// V2C5.6D - DU SHORT RF PULSE
-//
-// Bench-only refinement after V2C5.6B/6C:
-// - DO NOT wait for a complete LoRa packet.
-// - Start async TX, keep RF on only 350 us, then force STDBY/RX.
-// - This creates only a very short partial LoRa preamble/chirp.
-// - P_JAM remains the V2C5.6B manual value (currently 2 dBm).
-//
-// UL role:
-//   SU -> rBS legitimate packet
-//   DU helper emits one short RF pulse in its permitted window.
-// ============================================================
-static constexpr uint32_t V2C56D_PULSE_US = 350U;
-
-static uint32_t v2c56d_ok = 0;
-static uint32_t v2c56d_mutex_skip = 0;
-
-static bool V2C56D_DU_ShortPulse()
-{
-    if (!V2C56B_RF_ENABLE)
-        return false;
-
-    if (LoRa_Mutex == nullptr)
-    {
-        ++v2c56d_mutex_skip;
-        return false;
-    }
-
-    if (xSemaphoreTake(LoRa_Mutex, pdMS_TO_TICKS(2)) != pdTRUE)
-    {
-        ++v2c56d_mutex_skip;
-        return false;
-    }
-
-    const uint8_t b =
-        (uint8_t)(0xC3U ^ (uint8_t)V2C_PAIR_INDEX ^ (uint8_t)(v2c56d_ok + 1U));
-
-    LoRa.idle();
-    LoRa.setTxPower(v2c56b_jam_power_dbm);
-    LoRa.setPreambleLength(V2C56B_MICRO_PREAMBLE);
-
-    LoRa.beginPacket();
-    LoRa.write(&b, 1);
-
-    // Async TX: do not wait for TX_DONE.
-    (void)LoRa.endPacket(true);
-
-    delayMicroseconds(V2C56D_PULSE_US);
-
-    // Abort incomplete frame and restore project PHY immediately.
-    LoRa.idle();
-    LoRa.setPreambleLength(V2C56B_NORMAL_PREAMBLE);
-    LoRa.setTxPower(CONG_SUAT_PHAT_DU_DBM);
-    LoRa.receive();
-
-    xSemaphoreGive(LoRa_Mutex);
-
-    ++v2c56d_ok;
-    return true;
-}
-
-static void V2C56D_DU_Summary(const char *reason)
-{
-    Serial.printf(
-        "[DU V2C5.6D RF PULSE SUMMARY] PAIR=%u | PULSE=%uus | P_JAM=%d dBm | "
-        "PULSE_OK=%u | MUTEX_SKIP=%u | REASON=%s\n",
-        (unsigned int)V2C_PAIR_INDEX,
-        (unsigned int)V2C56D_PULSE_US,
-        (int)v2c56b_jam_power_dbm,
-        (unsigned int)v2c56d_ok,
-        (unsigned int)v2c56d_mutex_skip,
-        reason != nullptr ? reason : "UNKNOWN"
-    );
-}
-
-static void V2C56D_DU_ResetStats()
-{
-    v2c56d_ok = 0;
-    v2c56d_mutex_skip = 0;
-}
-
-// V2C5.6C_DU_DELAYED_MICROBURST
-
-// ============================================================
-// V2C5.6C - DU DELAYED MICROBURST
-//
-// V2C5.6B fired the 1-byte microburst immediately when the UL helper
-// window opened (~12 ms after beacon), too close to the legitimate
-// packet start. V2C5.6C schedules it non-blockingly 22 ms
-// AFTER START_SIM.
-//
-// Expected bench timing:
-//   START_SIM ~ age 12 ms
-//   RF microburst ~ age 34 ms
-//
-// OFF/ABORT/REVOKE/session-stop cancels a pending burst.
-// ============================================================
-static constexpr uint32_t V2C56C_DELAY_AFTER_START_MS = 22U;
-
-static bool v2c56c_pending = false;
-static uint32_t v2c56c_due_ms = 0;
-static uint32_t v2c56c_armed = 0;
-static uint32_t v2c56c_fired = 0;
-static uint32_t v2c56c_cancelled = 0;
-
-static inline bool V2C56C_TimeReached(uint32_t now, uint32_t deadline)
-{
-    return (int32_t)(now - deadline) >= 0;
-}
-
-static void V2C56C_DU_Reset()
-{
-    v2c56c_pending = false;
-    v2c56c_due_ms = 0;
-    v2c56c_armed = 0;
-    v2c56c_fired = 0;
-    v2c56c_cancelled = 0;
-}
-
-static void V2C56C_DU_Arm()
-{
-    if (!V2C56B_RF_ENABLE)
-        return;
-
-    v2c56c_due_ms = millis() + V2C56C_DELAY_AFTER_START_MS;
-    v2c56c_pending = true;
-    ++v2c56c_armed;
-}
-
-static void V2C56C_DU_Cancel()
-{
-    if (v2c56c_pending)
-    {
-        v2c56c_pending = false;
-        v2c56c_due_ms = 0;
-        ++v2c56c_cancelled;
-    }
-}
-
-static void V2C56C_DU_Service()
-{
-    if (!v2c56c_pending)
-        return;
-
-    if (!du_rf_shadow_lite_gate)
-    {
-        V2C56C_DU_Cancel();
-        return;
-    }
-
-    const uint32_t now = millis();
-    if (!V2C56C_TimeReached(now, v2c56c_due_ms))
-        return;
-
-    v2c56c_pending = false;
-    v2c56c_due_ms = 0;
-
-    if (V2C56D_DU_ShortPulse())
-        ++v2c56c_fired;
-}
-
-static void V2C56C_DU_Summary(const char *reason)
-{
-    Serial.printf(
-        "[DU V2C5.6C DELAY SUMMARY] PAIR=%u | DELAY=%ums | "
-        "ARMED=%u | FIRED=%u | CANCELLED=%u | PENDING=%u | REASON=%s\n",
-        (unsigned int)V2C_PAIR_INDEX,
-        (unsigned int)V2C56C_DELAY_AFTER_START_MS,
-        (unsigned int)v2c56c_armed,
-        (unsigned int)v2c56c_fired,
-        (unsigned int)v2c56c_cancelled,
-        v2c56c_pending ? 1U : 0U,
-        reason != nullptr ? reason : "UNKNOWN"
-    );
-}
-
-static inline void DU_RFShadowLite_Reset()
-{
-    V2C56C_DU_Cancel();
-    V2C56B_DU_ForceNormal();
-    V2C56B_DU_ResetStats();
-    V2C56D_DU_ResetStats();
-    V2C56C_DU_Reset();
-    V2C55_BenchGate_InitOff();
-    du_rf_shadow_lite_gate = false;
-    du_rf_shadow_lite_on_count = 0;
-    du_rf_shadow_lite_off_count = 0;
-}
-
-static inline void DU_RFShadowLite_On()
-{
-    if (!du_rf_shadow_lite_gate)
-    {
-        du_rf_shadow_lite_gate = true;
-        V2C55_BenchGate_On();
-        V2C56C_DU_Arm();
-        ++du_rf_shadow_lite_on_count;
-    }
-}
-
-static inline void DU_RFShadowLite_Off()
-{
-    if (du_rf_shadow_lite_gate)
-    {
-        V2C56C_DU_Cancel();
-        V2C56B_DU_ForceNormal();
-        V2C55_BenchGate_Off();
-        du_rf_shadow_lite_gate = false;
-        ++du_rf_shadow_lite_off_count;
-    }
-}
-
-static void DU_RFShadowLite_Summary(const char *reason)
-{
-    V2C56C_DU_Summary(reason);
-    V2C56D_DU_Summary(reason);
-    V2C56B_DU_Summary(reason);
-    Serial.printf(
-        "[DU V2C5.4 SHADOW_LITE SUMMARY] PAIR=%u | ON=%u | OFF=%u | ACTIVE=%u | "
-        "REASON=%s | RF_TX=0 | RF_JAM=OFF\n",
-        (unsigned int)V2C_PAIR_INDEX,
-        (unsigned int)du_rf_shadow_lite_on_count,
-        (unsigned int)du_rf_shadow_lite_off_count,
-        du_rf_shadow_lite_gate ? 1U : 0U,
-        reason != nullptr ? reason : "UNKNOWN"
-    );
-}
-
 
 static portMUX_TYPE DU_Jam53_Mux = portMUX_INITIALIZER_UNLOCKED;
 static volatile DUJam53State du_jam53_state = DU_JAM53_IDLE;
@@ -497,6 +124,91 @@ static volatile uint8_t du_jam53_last_mode = 0;
 static volatile bool du_jam53_window_valid = false;
 static volatile uint32_t du_jam53_window_start_ms = 0;
 static volatile uint32_t du_jam53_window_stop_ms = 0;
+
+// V2C5.4_DU_RF_SHADOW_GATE
+
+// ============================================================
+// V2C5.4 - DU RF SHADOW GATE
+// Software-only shadow for the existing V2C5.3A UL window.
+// NO GPIO, NO LoRa TX, NO RF helper is called here.
+// ============================================================
+static constexpr bool DU_RF_SHADOW_ENABLE = true;
+static bool du_rf_shadow_gate = false;
+static uint32_t du_rf_shadow_on_ms = 0;
+static uint32_t du_rf_shadow_on_count = 0;
+static uint32_t du_rf_shadow_off_count = 0;
+static uint32_t du_rf_shadow_max_window_ms = 0;
+
+static void DU_RFShadow_Reset()
+{
+    du_rf_shadow_gate = false;
+    du_rf_shadow_on_ms = 0;
+    du_rf_shadow_on_count = 0;
+    du_rf_shadow_off_count = 0;
+    du_rf_shadow_max_window_ms = 0;
+}
+
+static void DU_RFShadow_Set(bool on, const char *reason)
+{
+    if (!DU_RF_SHADOW_ENABLE)
+        return;
+
+    if (du_rf_shadow_gate == on)
+        return;
+
+    const uint32_t now = millis();
+    du_rf_shadow_gate = on;
+
+    if (on)
+    {
+        du_rf_shadow_on_ms = now;
+        du_rf_shadow_on_count++;
+
+        Serial.printf(
+            "[DU V2C5.4 RF_SHADOW] GATE=ON | PAIR=%u | FRAME=%u | MODE=%u | REASON=%s | RF_TX=0 | RF_JAM=OFF\\n",
+            (unsigned int)V2C_PAIR_INDEX,
+            (unsigned int)du_jam53_last_frame,
+            (unsigned int)du_jam53_last_mode,
+            reason != nullptr ? reason : "UNKNOWN"
+        );
+    }
+    else
+    {
+        const uint32_t dur =
+            du_rf_shadow_on_ms != 0U
+                ? (uint32_t)(now - du_rf_shadow_on_ms)
+                : 0U;
+
+        if (dur > du_rf_shadow_max_window_ms)
+            du_rf_shadow_max_window_ms = dur;
+
+        du_rf_shadow_off_count++;
+
+        Serial.printf(
+            "[DU V2C5.4 RF_SHADOW] GATE=OFF | PAIR=%u | FRAME=%u | MODE=%u | DURATION=%ums | REASON=%s | RF_TX=0 | RF_JAM=OFF\\n",
+            (unsigned int)V2C_PAIR_INDEX,
+            (unsigned int)du_jam53_last_frame,
+            (unsigned int)du_jam53_last_mode,
+            (unsigned int)dur,
+            reason != nullptr ? reason : "UNKNOWN"
+        );
+
+        du_rf_shadow_on_ms = 0;
+    }
+}
+
+static void DU_RFShadow_Summary(const char *reason)
+{
+    Serial.printf(
+        "[DU V2C5.4 RF_SHADOW SUMMARY] PAIR=%u | ON=%u | OFF=%u | ACTIVE=%u | MAX_WINDOW=%ums | REASON=%s | RF_TX=0 | RF_JAM=OFF\\n",
+        (unsigned int)V2C_PAIR_INDEX,
+        (unsigned int)du_rf_shadow_on_count,
+        (unsigned int)du_rf_shadow_off_count,
+        du_rf_shadow_gate ? 1U : 0U,
+        (unsigned int)du_rf_shadow_max_window_ms,
+        reason != nullptr ? reason : "UNKNOWN"
+    );
+}
 
 static uint8_t DU_Jam53_MyMaskBit()
 {
@@ -542,7 +254,7 @@ static bool DU_Jam53_BuildWindow(
 
 void DU_Jam53_Prepare(uint64_t session_id)
 {
-    DU_RFShadowLite_Reset();
+    DU_RFShadow_Reset();
     portENTER_CRITICAL(&DU_Jam53_Mux);
     du_jam53_session_id = session_id;
     du_jam53_state = DU_JAM53_PREPARED;
@@ -575,7 +287,9 @@ void DU_Jam53_Stop(const char *reason)
     du_jam53_window_valid = false;
     portEXIT_CRITICAL(&DU_Jam53_Mux);
 
-    DU_RFShadowLite_Off();
+    DU_RFShadow_Set(false, reason != nullptr ? reason : "STOP");
+    if (had_state)
+        DU_RFShadow_Summary(reason != nullptr ? reason : "STOP");
 
     if (was_active)
     {
@@ -589,7 +303,6 @@ void DU_Jam53_Stop(const char *reason)
 
     if (had_state)
     {
-        DU_RFShadowLite_Summary(reason);
         Serial.printf(
             "[DU JAM V2C5.3A STOP] PAIR=%u | SESSION=%016llX | REASON=%s | RF_JAM=OFF\n",
             (unsigned int)V2C_PAIR_INDEX,
@@ -681,7 +394,7 @@ static void DU_Jam53_OnBeacon(
 
     if (abort_active)
     {
-        DU_RFShadowLite_Off();
+        DU_RFShadow_Set(false, revoke_reason != nullptr ? revoke_reason : "ABORT_SIM");
         Serial.printf(
             "[DU JAM V2C5.3A ABORT_SIM] PAIR=%u | FRAME=%u | REASON=%s | RF_JAM=OFF\n",
             (unsigned int)V2C_PAIR_INDEX,
@@ -705,8 +418,6 @@ static void DU_Jam53_OnBeacon(
 
 static void DU_Jam53_Service()
 {
-    V2C56C_DU_Service();
-
     if (DU_JAM53_RF_ENABLE)
     {
         DU_Jam53_Stop("RF_ENABLE_FORBIDDEN");
@@ -784,7 +495,7 @@ static void DU_Jam53_Service()
 
     if (action == ACTION_START)
     {
-        DU_RFShadowLite_On();
+        DU_RFShadow_Set(true, "START_SIM");
         Serial.printf(
             "[DU JAM V2C5.3A START_SIM] PAIR=%u | FRAME=%u | MODE=%u | AGE=%ums | WINDOW=%ums | RF_JAM=OFF\n",
             (unsigned int)V2C_PAIR_INDEX,
@@ -796,7 +507,7 @@ static void DU_Jam53_Service()
     }
     else if (action == ACTION_STOP)
     {
-        DU_RFShadowLite_Off();
+        DU_RFShadow_Set(false, "WINDOW_END");
         Serial.printf(
             "[DU JAM V2C5.3A STOP_SIM] PAIR=%u | FRAME=%u | MODE=%u | AGE=%ums | REASON=WINDOW_END | RF_JAM=OFF\n",
             (unsigned int)V2C_PAIR_INDEX,
@@ -807,6 +518,7 @@ static void DU_Jam53_Service()
     }
     else if (action == ACTION_SKIP)
     {
+        DU_RFShadow_Set(false, "WINDOW_MISSED");
         Serial.printf(
             "[DU JAM V2C5.3A SKIP_SIM] PAIR=%u | FRAME=%u | MODE=%u | REASON=WINDOW_MISSED | RF_JAM=OFF\n",
             (unsigned int)V2C_PAIR_INDEX,
@@ -816,7 +528,7 @@ static void DU_Jam53_Service()
     }
     else if (action == ACTION_TIMEOUT_ABORT)
     {
-        DU_RFShadowLite_Off();
+        DU_RFShadow_Set(false, "BEACON_TIMEOUT_ABORT");
         Serial.printf(
             "[DU JAM V2C5.3A ABORT_SIM] PAIR=%u | FRAME=%u | REASON=BEACON_TIMEOUT_%ums | RF_JAM=OFF\n",
             (unsigned int)V2C_PAIR_INDEX,
@@ -826,6 +538,7 @@ static void DU_Jam53_Service()
     }
     else if (action == ACTION_TIMEOUT_REVOKE)
     {
+        DU_RFShadow_Set(false, "BEACON_TIMEOUT_REVOKE");
         Serial.printf(
             "[DU JAM V2C5.3A REVOKE] PAIR=%u | FRAME=%u | REASON=BEACON_TIMEOUT_%ums | RF_JAM=OFF\n",
             (unsigned int)V2C_PAIR_INDEX,

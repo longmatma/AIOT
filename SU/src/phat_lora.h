@@ -138,4 +138,9 @@ bool Gui_VI_TRI_DINH_KY_SU(
     const DuLieuGPS_SU &du_lieu_gps
 );
 
+
+// V2C5.3B2 downlink permission-window SIM. RF helper remains OFF.
+void SU_Jam53B2_Prepare(uint64_t session_id);
+void SU_Jam53B2_Stop(const char *reason);
+
 #endif

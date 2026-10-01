@@ -900,6 +900,7 @@ static void DU_V2C48_ClearStaleStreamState(const char *reason)
     const uint64_t old_session = session_id_hien_tai;
     const uint64_t requested_new = du_stream_force_abort_new_session;
 
+    DU_Jam53_Stop("FORCE_RELEASE");
     DU_V2C48_DrainAudioRingBuffer();
 
     du_stream_session_busy = false;
@@ -964,6 +965,7 @@ static bool DU_V2C46_ReleaseStaleSessionIfSafe(const char *reason)
         (unsigned int)age
     );
 
+    DU_Jam53_Stop("STALE_RELEASE");
     du_stream_session_busy = false;
     da_co_session = false;
     session_id_hien_tai = 0;
@@ -1581,6 +1583,7 @@ void TacVu_GiaiMa(void *thamSo)
             == TYPE_AUDIO_END
         )
         {
+            DU_Jam53_Stop("END_AUDIO");
 #if DU_STREAMING_V1
             if (!du_stream_end_received)
             {
@@ -1741,6 +1744,9 @@ void TacVu_GiaiMa(void *thamSo)
                     (unsigned long long)session_moi
                 );
 
+                // V2C5.2: session da biet -> PREPARED; beacon moi cap ARMED.
+                DU_Jam53_Prepare(session_moi);
+
                 // Latency V1.1: READY la control gate cua voice, nen uu tien.
                 // GPS_PHIEN da duoc dua vao pending trong DU_Latency_BatDauSession().
                 Gui_SESSION_READY_RBS(session_moi);
@@ -1821,6 +1827,8 @@ void TacVu_GiaiMa(void *thamSo)
 
             session_id_hien_tai =
                 session_moi;
+
+            DU_Jam53_Prepare(session_id_hien_tai);
 
             da_co_session =
                 true;
@@ -3413,6 +3421,7 @@ void TacVu_PhatAmThanh(void *thamSo)
             "[DU V2C4.8 SESSION RELEASE] SESSION=%016llX | READY_FOR_NEXT=1\n",
             (unsigned long long)du_last_played_session_id
         );
+        DU_Jam53_Stop("PLAYBACK_DONE");
         du_stream_session_busy = false;
         da_co_session = false;
         session_id_hien_tai = 0;
@@ -3479,6 +3488,15 @@ void TacVu_BaoCao_ViTri_DinhKy_DU(void *tham_so)
 
     uint32_t moc_gui_tiep_theo_ms = millis();
 
+    // V2C5.3A-fix1 GPS_PHIEN_RETRY_THROTTLE_500MS
+    // GPS_PHIEN pending van duoc uu tien hon GPS dinh ky, nhung neu LoRa dang
+    // ban/network busy thi chi thu lai toi da 1 lan / 500 ms. Tranh spam Serial
+    // va tranh task telemetry quay lai ham TX moi 50 ms.
+    // V2C5.3A-fix2 GPS_LOG_SUCCESS_ONLY_RETRY_2000MS
+    static constexpr uint32_t DU_GPS_PHIEN_RETRY_MS = 2000U;
+    static constexpr uint32_t DU_GPS_PERIODIC_RETRY_MS = 2000U;
+    uint32_t moc_thu_lai_gps_phien_ms = 0U;
+
     while (1)
     {
         uint32_t bay_gio_ms = millis();
@@ -3495,38 +3513,56 @@ void TacVu_BaoCao_ViTri_DinhKy_DU(void *tham_so)
         // TRONG PHIEN = khong TX telemetry.
         // POST = GPS_PHIEN session-bound nay, chi gui khi radio/HMI/playback ranh.
         uint64_t gps_phien_pending_id = 0;
+        const bool co_gps_phien_pending =
+            DU_Latency_LayGPSPhienPending(gps_phien_pending_id);
 
         if (
             !radio_dang_ban
             &&
-            DU_Latency_LayGPSPhienPending(gps_phien_pending_id)
+            co_gps_phien_pending
         )
         {
-            DuLieuGPS_DU du_lieu_gps_du = Lay_DuLieu_GPS_DU();
-            In_TrangThai_GPS_DU(du_lieu_gps_du);
-
-            if (
-                Gui_GPS_REPORT_DU(
-                    gps_phien_pending_id,
-                    du_lieu_gps_du
-                )
-            )
+            // V2C5.3A-fix1:
+            // Neu lan gui truoc bi tu choi do TDMA/network busy, KHONG lap lai
+            // moi 50 ms. Trong thoi gian pending, GPS dinh ky van bi chan nhu cu.
+            if ((int32_t)(bay_gio_ms - moc_thu_lai_gps_phien_ms) >= 0)
             {
-                DU_Latency_XoaGPSPhienPending(
-                    gps_phien_pending_id
-                );
+                DuLieuGPS_DU du_lieu_gps_du = Lay_DuLieu_GPS_DU();
 
-                // POST packet vua gui xong -> khong gui them GPS dinh ky
-                // ngay lap tuc, tranh 2 telemetry packet lien nhau.
-                moc_gui_tiep_theo_ms =
-                    bay_gio_ms
-                    +
-                    CHU_KY_BAO_CAO_VI_TRI_DU_MS;
+                if (
+                    Gui_GPS_REPORT_DU(
+                        gps_phien_pending_id,
+                        du_lieu_gps_du
+                    )
+                )
+                {
+                    // Fix2: chi in full GPS snapshot khi packet da TX thanh cong.
+                    // Neu network/TDMA busy, khong spam Serial.
+                    In_TrangThai_GPS_DU(du_lieu_gps_du);
 
-                Serial.printf(
-                    "[DU TELEMETRY] POST GPS_PHIEN -> rBS | SESSION=%016llX\n",
-                    (unsigned long long)gps_phien_pending_id
-                );
+                    DU_Latency_XoaGPSPhienPending(
+                        gps_phien_pending_id
+                    );
+
+                    moc_thu_lai_gps_phien_ms = 0U;
+
+                    // POST packet vua gui xong -> khong gui them GPS dinh ky
+                    // ngay lap tuc, tranh 2 telemetry packet lien nhau.
+                    moc_gui_tiep_theo_ms =
+                        bay_gio_ms
+                        +
+                        CHU_KY_BAO_CAO_VI_TRI_DU_MS;
+
+                    Serial.printf(
+                        "[DU TELEMETRY] POST GPS_PHIEN -> rBS | SESSION=%016llX\n",
+                        (unsigned long long)gps_phien_pending_id
+                    );
+                }
+                else
+                {
+                    moc_thu_lai_gps_phien_ms =
+                        bay_gio_ms + DU_GPS_PHIEN_RETRY_MS;
+                }
             }
         }
         else if (
@@ -3536,7 +3572,6 @@ void TacVu_BaoCao_ViTri_DinhKy_DU(void *tham_so)
         )
         {
             DuLieuGPS_DU du_lieu_gps_du = Lay_DuLieu_GPS_DU();
-            In_TrangThai_GPS_DU(du_lieu_gps_du);
 
             // V10: chi tang STT SAU KHI TX thanh cong.
             // Beacon bi hoan do radio ban se thu lai cung STT, khong tao
@@ -3551,10 +3586,19 @@ void TacVu_BaoCao_ViTri_DinhKy_DU(void *tham_so)
             );
 
             if (gui_thanh_cong)
+            {
                 so_thu_tu_bao_cao_vi_tri_du = stt_du_kien;
 
+                // Fix2: log full GPS only for a real successful TX.
+                In_TrangThai_GPS_DU(du_lieu_gps_du);
+            }
+
+            // Thanh cong: giu nguyen chu ky GPS dinh ky 5 s.
+            // That bai/network busy: thu lai cham 2 s, khong spam log.
             moc_gui_tiep_theo_ms = bay_gio_ms +
-                (gui_thanh_cong ? CHU_KY_BAO_CAO_VI_TRI_DU_MS : 250UL);
+                (gui_thanh_cong
+                    ? CHU_KY_BAO_CAO_VI_TRI_DU_MS
+                    : DU_GPS_PERIODIC_RETRY_MS);
         }
 
         vTaskDelay(pdMS_TO_TICKS(50));
@@ -3992,10 +4036,11 @@ void setup()
     Serial.println(
         "[DU] Khoi tao thanh cong!"
     );
+    Serial.println("[DU JAM V2C5.3A] UL_WINDOW_SIM=ON | DU_HELPER_ONLY | START_STOP_SIM=ON | RF_JAM=OFF");
 
 #if DU_STREAMING_V12_AUDIO_CHUNK
     Serial.printf(
-        "[DU STREAM V2C4.8] AUDIO CHUNK BAT | PREFILL=%u ms | TIMER_SLOT=%u ms | DOUBLE=%u ms\n",
+        "[DU STREAM V2C5.2] AUDIO CHUNK BAT | PREFILL=%u ms | TIMER_SLOT=%u ms | DOUBLE=%u ms\n",
         (unsigned int)(DU_STREAM_PREFILL_FRAMES * 20U),
         (unsigned int)(AUDIO_TIMER_CHUNK_FRAMES * 20U),
         (unsigned int)(AUDIO_TIMER_CHUNK_FRAMES * 40U)

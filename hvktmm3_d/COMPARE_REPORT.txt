@@ -1,0 +1,22 @@
+So sanh hvktmm3_d.zip (ban da sua) voi hvktmm3_d_update.zip
+
+Cac thay doi can mang sang ban update:
+1. MODIFIED: start_position_monitor_campus.sh
+   - RBS_GPS_CSV: rbs_lien_ket_dinh_ky_v11.csv -> rbs_v2c1_telemetry.csv
+   - RBS_SU_DU_CHANNEL_CSV: rbs_kenh_su_du.csv -> rbs_v2c1_channel.csv
+   - Them RBS_SIONNA_EVE_URL=http://DESKTOP-J4PQ0VJ.local:8765/eve-channel
+
+2. ADDED: sionna_eve_server_v13_cpu_llvm_multinode.py
+   - Server Sionna RT CPU/LLVM
+   - Ho tro rBS, SU1, SU2, DU1, DU2, EVE
+   - Output: RBS_EVE, SU1_EVE, SU2_EVE, DU1_EVE, DU2_EVE
+
+3. ADDED: start_sionna_eve_server_v13_cpu_llvm.ps1
+   - Khoi dong CPU LLVM server tren 0.0.0.0:8765
+   - Su dung LLVM-C.dll va .venv_sionna_gpu_210
+
+4. ADDED: sionna_meshes_cache/ (68 file .ply)
+   - Mesh cache cho Sionna CPU/LLVM.
+
+Khong co file chung nao khac bi thay doi noi dung.
+Bo qua khi so sanh: .venv_sionna_gpu_210 va __pycache__ (moi truong/cache runtime).

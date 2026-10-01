@@ -4661,6 +4661,21 @@ def _v2c1_handle_telemetry(raw, radio):
             "SNR_rBS_dB": radio.last_snr,
         }
         _v2c1_append_csv(V2C1_TELEMETRY_CSV,row)
+
+        # LIVE GPS LOG: theo doi vi tri 4 node truc tiep tren terminal rBS.
+        # Khong thay doi packet/CSV/scheduler; chi in du lieu da nhan duoc qua LoRa.
+        fix_age_ms = int.from_bytes(p[32:36], "big", signed=False)
+        rssi_text = "--" if row["RSSI_rBS_dBm"] is None else f"{float(row['RSSI_rBS_dBm']):.1f}"
+        snr_text = "--" if row["SNR_rBS_dB"] is None else f"{float(row['SNR_rBS_dB']):.1f}"
+        fix_text = "FIX" if gps_valid else "NO_FIX"
+
+        print(
+            f"[rBS GPS LIVE] {label} | {row['Type']} | REF={row['Ref']} | {fix_text} | "
+            f"LAT={row['Lat']:.7f} | LON={row['Lon']:.7f} | "
+            f"ALT={row['Alt_m']:.2f}m | SPEED={row['Speed_m_s']:.2f}m/s | "
+            f"SAT={row['Sat']} | HDOP={row['HDOP']:.2f} | AGE={fix_age_ms}ms | "
+            f"RSSI={rssi_text}dBm | SNR={snr_text}dB"
+        )
         return True
 
     if len(p) == 20 and p[0] == ID_TRAM_RBS and p[2] == TYPE_BAO_CAO_KENH_SU_DU:
